@@ -1,0 +1,18 @@
+[package]
+name = "analyticsdb-engine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+analyticsdb-core = { path = "../analyticsdb-core" }
+analyticsdb-control = { path = "../analyticsdb-control" }
+datafusion.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

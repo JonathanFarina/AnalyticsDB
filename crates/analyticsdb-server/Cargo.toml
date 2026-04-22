@@ -1,0 +1,13 @@
+[package]
+name = "analyticsdb-server"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+analyticsdb-engine = { path = "../analyticsdb-engine" }
+analyticsdb-protocol = { path = "../analyticsdb-protocol" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

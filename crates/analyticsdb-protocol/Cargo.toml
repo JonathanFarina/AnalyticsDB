@@ -1,0 +1,28 @@
+[package]
+name = "analyticsdb-protocol"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+analyticsdb-core = { path = "../analyticsdb-core" }
+analyticsdb-control = { path = "../analyticsdb-control" }
+analyticsdb-engine = { path = "../analyticsdb-engine" }
+anyhow.workspace = true
+arrow-flight.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+pgwire.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio-postgres.workspace = true
+uuid.workspace = true
