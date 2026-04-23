@@ -10,8 +10,10 @@ pub enum Protocol {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionContext {
     pub user: String,
+    pub role: String,
     pub database: String,
     pub schema: String,
+    pub auth_method: String,
     pub protocol: Protocol,
 }
 
@@ -19,8 +21,10 @@ impl Default for SessionContext {
     fn default() -> Self {
         Self {
             user: "postgres".to_string(),
+            role: "postgres".to_string(),
             database: "postgres".to_string(),
             schema: "public".to_string(),
+            auth_method: "embedded-prototype".to_string(),
             protocol: Protocol::Embedded,
         }
     }

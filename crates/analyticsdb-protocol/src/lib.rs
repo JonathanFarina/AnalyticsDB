@@ -1,13 +1,17 @@
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use analyticsdb_control::CatalogRelationKind;
+use analyticsdb_control::{CatalogRelationKind, ControlPlane};
 use analyticsdb_core::{Protocol, QueryRequest, SessionContext};
 use analyticsdb_engine::{PrototypeEngine, QueryExecutionResult};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::flight_service_server::FlightServiceServer;
+use arrow_flight::sql::metadata::SqlInfoData;
+use arrow_flight::sql::metadata::SqlInfoDataBuilder;
 use arrow_flight::sql::server::FlightSqlService as ArrowFlightSqlService;
 use arrow_flight::sql::server::PeekableFlightDataStream;
 use arrow_flight::sql::CommandGetCatalogs;
@@ -15,6 +19,7 @@ use arrow_flight::sql::CommandGetDbSchemas;
 use arrow_flight::sql::CommandGetSqlInfo;
 use arrow_flight::sql::CommandGetTableTypes;
 use arrow_flight::sql::CommandGetTables;
+use arrow_flight::sql::CommandPreparedStatementQuery;
 use arrow_flight::sql::CommandStatementQuery;
 use arrow_flight::sql::CommandStatementUpdate;
 use arrow_flight::sql::ProstMessageExt;
@@ -25,6 +30,7 @@ use arrow_flight::FlightEndpoint;
 use arrow_flight::FlightInfo;
 use arrow_flight::Ticket;
 use async_trait::async_trait;
+use base64::Engine;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::array::Float32Array;
@@ -47,7 +53,11 @@ use futures::Sink;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
+use pgwire::api::auth::AuthSource;
+use pgwire::api::auth::LoginInfo;
+use pgwire::api::auth::Password;
+use pgwire::api::auth::ServerParameterProvider;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format as PgPortalFormat, Portal};
 use pgwire::api::query::ExtendedQueryHandler;
@@ -65,8 +75,11 @@ use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
 use pgwire::api::ClientInfo;
 use pgwire::api::ClientPortalStore;
+use pgwire::api::PgWireConnectionState;
 use pgwire::api::PgWireServerHandlers;
 use pgwire::api::Type;
+use pgwire::api::METADATA_APPLICATION_NAME;
+use pgwire::api::METADATA_CLIENT_ENCODING;
 use pgwire::api::METADATA_DATABASE;
 use pgwire::api::METADATA_USER;
 use pgwire::error::PgWireError;
@@ -80,6 +93,7 @@ use tokio::net::TcpListener;
 use tokio::task::spawn_blocking;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataMap;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::Request;
 use tonic::Response;
@@ -87,19 +101,141 @@ use tonic::Status;
 use tonic::Streaming;
 
 const FLIGHT_USER_HEADER: &str = "x-analyticsdb-user";
+const FLIGHT_ROLE_HEADER: &str = "x-analyticsdb-role";
 const FLIGHT_DATABASE_HEADER: &str = "x-analyticsdb-database";
 const FLIGHT_SCHEMA_HEADER: &str = "x-analyticsdb-schema";
+const FLIGHT_AUTH_METHOD_HEADER: &str = "x-analyticsdb-auth-method";
+const POSTGRES_SCHEMA_METADATA: &str = "analyticsdb-schema";
+const POSTGRES_ROLE_METADATA: &str = "analyticsdb-role";
+const POSTGRES_AUTH_METHOD_METADATA: &str = "analyticsdb-auth-method";
+const POSTGRES_SETTING_PREFIX: &str = "analyticsdb-setting-";
+const POSTGRES_SERVER_VERSION: &str = "16.6-analyticsdb-prototype";
+
+#[derive(Debug, Clone)]
+struct AuthRequest {
+    protocol: Protocol,
+    user: String,
+    database: String,
+    schema: String,
+    role: Option<String>,
+    password: Option<String>,
+    auth_header: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthDecision {
+    user: String,
+    role: String,
+    database: String,
+    schema: String,
+    auth_method: String,
+}
+
+trait AuthHook: Send + Sync {
+    fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status>;
+}
+
+struct PrototypeAllowAllAuthHook {
+    control_plane: Arc<ControlPlane>,
+}
+
+struct ControlPlaneAuthSource {
+    control_plane: Arc<ControlPlane>,
+}
+
+impl std::fmt::Debug for ControlPlaneAuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneAuthSource").finish()
+    }
+}
+
+#[async_trait]
+impl AuthSource for ControlPlaneAuthSource {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        let user = login
+            .user()
+            .ok_or_else(|| anyhow_error_to_pgwire(anyhow::anyhow!("missing user in login info")))?;
+        let catalog_user = self
+            .control_plane
+            .catalog_user(user)
+            .map_err(anyhow_error_to_pgwire)?;
+        let password = catalog_user.password.ok_or_else(|| {
+            anyhow_error_to_pgwire(anyhow::anyhow!(
+                "Missing credentials for user '{}'",
+                catalog_user.name
+            ))
+        })?;
+
+        Ok(Password::new(None, password.into_bytes()))
+    }
+}
+
+impl AuthHook for PrototypeAllowAllAuthHook {
+    fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status> {
+        let user = request.user.trim();
+        if user.is_empty() {
+            return Err(Status::invalid_argument(
+                "user cannot be empty in prototype auth hook",
+            ));
+        }
+
+        if request.password.is_some() {
+            self.control_plane
+                .validate_credentials(user, request.password.as_deref())
+                .map_err(|error| Status::unauthenticated(error.to_string()))?;
+        } else {
+            self.control_plane
+                .catalog_user(user)
+                .map_err(|error| Status::unauthenticated(error.to_string()))?;
+        }
+
+        let resolved_role = request.role.clone().unwrap_or_else(|| user.to_string());
+        self.control_plane
+            .authorize_role_assumption(user, &resolved_role)
+            .map_err(|error| Status::permission_denied(error.to_string()))?;
+
+        let auth_method = if request.auth_header.is_some() {
+            "prototype-basic-auth"
+        } else {
+            match request.protocol {
+                Protocol::PostgreSql => "postgres-wire-startup",
+                Protocol::ArrowFlightSql => "flight-sql-metadata",
+                Protocol::Embedded => "embedded-prototype",
+            }
+        };
+
+        Ok(AuthDecision {
+            user: user.to_string(),
+            role: resolved_role,
+            database: request.database.clone(),
+            schema: request.schema.clone(),
+            auth_method: auth_method.to_string(),
+        })
+    }
+}
 
 pub async fn serve_postgres_wire(
     listener: TcpListener,
     engine: Arc<PrototypeEngine>,
 ) -> anyhow::Result<()> {
+    let control_plane = engine.control_plane();
+    let auth_hook: Arc<dyn AuthHook> = Arc::new(PrototypeAllowAllAuthHook {
+        control_plane: Arc::clone(&control_plane),
+    });
+    let startup_auth = CleartextPasswordAuthStartupHandler::new(
+        ControlPlaneAuthSource {
+            control_plane: Arc::clone(&control_plane),
+        },
+        AnalyticsServerParameterProvider::default(),
+    );
     let query_parser = Arc::new(AnalyticsQueryParser {
         engine: Arc::clone(&engine),
     });
     let handler = Arc::new(AnalyticsPostgresHandler {
         engine,
         query_parser,
+        auth_hook,
+        startup_auth,
     });
     let factory = Arc::new(AnalyticsPostgresFactory {
         handler: Arc::clone(&handler),
@@ -118,7 +254,11 @@ pub async fn serve_flight_sql(
     listener: TcpListener,
     engine: Arc<PrototypeEngine>,
 ) -> anyhow::Result<()> {
-    let service = AnalyticsFlightSqlService { engine };
+    let control_plane = engine.control_plane();
+    let service = AnalyticsFlightSqlService {
+        engine,
+        auth_hook: Arc::new(PrototypeAllowAllAuthHook { control_plane }),
+    };
 
     Server::builder()
         .add_service(FlightServiceServer::new(service))
@@ -149,6 +289,96 @@ impl PgWireServerHandlers for AnalyticsPostgresFactory {
 struct AnalyticsPostgresHandler {
     engine: Arc<PrototypeEngine>,
     query_parser: Arc<AnalyticsQueryParser>,
+    auth_hook: Arc<dyn AuthHook>,
+    startup_auth: CleartextPasswordAuthStartupHandler<
+        ControlPlaneAuthSource,
+        AnalyticsServerParameterProvider,
+    >,
+}
+
+#[derive(Debug, Clone)]
+struct AnalyticsServerParameterProvider {
+    server_version: String,
+    time_zone: String,
+    date_style: String,
+    interval_style: String,
+    standard_conforming_strings: String,
+    search_path: String,
+    default_transaction_isolation: String,
+}
+
+impl Default for AnalyticsServerParameterProvider {
+    fn default() -> Self {
+        Self {
+            server_version: POSTGRES_SERVER_VERSION.to_string(),
+            time_zone: "UTC".to_string(),
+            date_style: "ISO, MDY".to_string(),
+            interval_style: "postgres".to_string(),
+            standard_conforming_strings: "on".to_string(),
+            search_path: "public".to_string(),
+            default_transaction_isolation: "read committed".to_string(),
+        }
+    }
+}
+
+impl ServerParameterProvider for AnalyticsServerParameterProvider {
+    fn server_parameters<C>(&self, client: &C) -> Option<HashMap<String, String>>
+    where
+        C: ClientInfo,
+    {
+        let mut params = HashMap::from([
+            ("server_version".to_string(), self.server_version.clone()),
+            ("server_encoding".to_string(), "UTF8".to_string()),
+            ("integer_datetimes".to_string(), "on".to_string()),
+            ("in_hot_standby".to_string(), "off".to_string()),
+            (
+                "default_transaction_read_only".to_string(),
+                "off".to_string(),
+            ),
+            (
+                "default_transaction_isolation".to_string(),
+                self.default_transaction_isolation.clone(),
+            ),
+            ("TimeZone".to_string(), self.time_zone.clone()),
+            ("DateStyle".to_string(), self.date_style.clone()),
+            ("IntervalStyle".to_string(), self.interval_style.clone()),
+            (
+                "standard_conforming_strings".to_string(),
+                self.standard_conforming_strings.clone(),
+            ),
+            ("search_path".to_string(), self.search_path.clone()),
+            (
+                "client_encoding".to_string(),
+                client
+                    .metadata()
+                    .get(METADATA_CLIENT_ENCODING)
+                    .cloned()
+                    .unwrap_or_else(|| "UTF8".to_string()),
+            ),
+            (
+                "application_name".to_string(),
+                client
+                    .metadata()
+                    .get(METADATA_APPLICATION_NAME)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            (
+                "session_authorization".to_string(),
+                client
+                    .metadata()
+                    .get(METADATA_USER)
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string()),
+            ),
+        ]);
+
+        if let Some(schema) = client.metadata().get(POSTGRES_SCHEMA_METADATA) {
+            params.insert("search_path".to_string(), schema.clone());
+        }
+
+        Some(params)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,22 +393,81 @@ struct AnalyticsQueryParser {
 }
 
 #[async_trait]
-impl NoopStartupHandler for AnalyticsPostgresHandler {
-    async fn post_startup<C>(
+impl StartupHandler for AnalyticsPostgresHandler {
+    async fn on_startup<C>(
         &self,
         client: &mut C,
-        _message: PgWireFrontendMessage,
+        message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if !client.metadata().contains_key(METADATA_DATABASE) {
-            client
-                .metadata_mut()
-                .insert(METADATA_DATABASE.to_string(), "postgres".to_string());
+        self.startup_auth.on_startup(client, message).await?;
+
+        if matches!(client.state(), PgWireConnectionState::ReadyForQuery)
+            && !client
+                .metadata()
+                .contains_key(POSTGRES_AUTH_METHOD_METADATA)
+        {
+            self.apply_post_startup_auth(client)?;
         }
+
+        Ok(())
+    }
+}
+
+impl AnalyticsPostgresHandler {
+    fn apply_post_startup_auth<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo,
+    {
+        let user = client
+            .metadata()
+            .get(METADATA_USER)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let database = client
+            .metadata()
+            .get(METADATA_DATABASE)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let schema = client
+            .metadata()
+            .get(POSTGRES_SCHEMA_METADATA)
+            .cloned()
+            .unwrap_or_else(|| "public".to_string());
+
+        let decision = self
+            .auth_hook
+            .authenticate(&AuthRequest {
+                protocol: Protocol::PostgreSql,
+                user,
+                database,
+                schema,
+                role: client.metadata().get(POSTGRES_ROLE_METADATA).cloned(),
+                password: None,
+                auth_header: None,
+            })
+            .map_err(status_to_pgwire)?;
+
+        client
+            .metadata_mut()
+            .insert(METADATA_USER.to_string(), decision.user);
+        client
+            .metadata_mut()
+            .insert(METADATA_DATABASE.to_string(), decision.database);
+        client
+            .metadata_mut()
+            .insert(POSTGRES_SCHEMA_METADATA.to_string(), decision.schema);
+        client
+            .metadata_mut()
+            .insert(POSTGRES_ROLE_METADATA.to_string(), decision.role);
+        client.metadata_mut().insert(
+            POSTGRES_AUTH_METHOD_METADATA.to_string(),
+            decision.auth_method,
+        );
 
         Ok(())
     }
@@ -191,6 +480,23 @@ impl SimpleQueryHandler for AnalyticsPostgresHandler {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
+        if let Some(response) =
+            apply_postgres_session_statement(client, parse_postgres_set_statement(query)?)?
+        {
+            return Ok(vec![response]);
+        }
+        if let Some(response) =
+            execute_postgres_show_statement(client, parse_postgres_show_statement(query)?)?
+        {
+            return Ok(vec![response]);
+        }
+        if let Some(response) = execute_postgres_introspection_statement(
+            client,
+            parse_postgres_introspection_statement(query)?,
+        )? {
+            return Ok(vec![response]);
+        }
+
         let execution = execute_postgres_sql(
             Arc::clone(&self.engine),
             QueryRequest {
@@ -221,7 +527,15 @@ impl QueryParser for AnalyticsQueryParser {
     {
         let parameter_count = referenced_parameter_count(sql);
         let parameter_types = resolved_parameter_types(parameter_count, types);
-        let result_schema = if sql_returns_rows(sql) {
+        let result_schema = if let Some(schema) =
+            postgres_show_result_schema(parse_postgres_show_statement(sql)?)
+        {
+            schema
+        } else if let Some(schema) =
+            postgres_introspection_result_schema(parse_postgres_introspection_statement(sql)?)
+        {
+            schema
+        } else if sql_returns_rows(sql) {
             let described_sql = render_sql_with_default_parameters(sql, &parameter_types)?;
             let request = QueryRequest {
                 sql: described_sql,
@@ -287,6 +601,23 @@ impl ExtendedQueryHandler for AnalyticsPostgresHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let rendered_sql = render_sql_with_portal_parameters(portal)?;
+        if let Some(response) =
+            apply_postgres_session_statement(client, parse_postgres_set_statement(&rendered_sql)?)?
+        {
+            return Ok(response);
+        }
+        if let Some(response) =
+            execute_postgres_show_statement(client, parse_postgres_show_statement(&rendered_sql)?)?
+        {
+            return Ok(response);
+        }
+        if let Some(response) = execute_postgres_introspection_statement(
+            client,
+            parse_postgres_introspection_statement(&rendered_sql)?,
+        )? {
+            return Ok(response);
+        }
+
         let execution = execute_postgres_sql(
             Arc::clone(&self.engine),
             QueryRequest {
@@ -349,14 +680,811 @@ fn postgres_session_from_client<C: ClientInfo>(client: &C) -> SessionContext {
             .get(METADATA_USER)
             .cloned()
             .unwrap_or_else(|| "postgres".to_string()),
+        role: client
+            .metadata()
+            .get(POSTGRES_ROLE_METADATA)
+            .cloned()
+            .unwrap_or_else(|| {
+                client
+                    .metadata()
+                    .get(METADATA_USER)
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string())
+            }),
         database: client
             .metadata()
             .get(METADATA_DATABASE)
             .cloned()
             .unwrap_or_else(|| "postgres".to_string()),
-        schema: "public".to_string(),
+        schema: client
+            .metadata()
+            .get(POSTGRES_SCHEMA_METADATA)
+            .cloned()
+            .unwrap_or_else(|| "public".to_string()),
+        auth_method: client
+            .metadata()
+            .get(POSTGRES_AUTH_METHOD_METADATA)
+            .cloned()
+            .unwrap_or_else(|| "postgres-wire-startup".to_string()),
         protocol: Protocol::PostgreSql,
     }
+}
+
+enum PostgresSetStatement {
+    Set { name: String, value: Option<String> },
+    Reset { name: String },
+    ResetAll,
+    NotASetStatement,
+}
+
+enum PostgresShowStatement {
+    Setting { name: String },
+    All,
+    NotAShowStatement,
+}
+
+enum PostgresIntrospectionStatement {
+    Version {
+        column_name: String,
+    },
+    CurrentDatabase {
+        column_name: String,
+    },
+    CurrentSchema {
+        column_name: String,
+    },
+    CurrentUser {
+        column_name: String,
+    },
+    SessionUser {
+        column_name: String,
+    },
+    CurrentSetting {
+        column_name: String,
+        setting_name: String,
+    },
+    NotAnIntrospectionStatement,
+}
+
+fn parse_postgres_set_statement(sql: &str) -> PgWireResult<PostgresSetStatement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+
+    if upper == "RESET ALL" {
+        return Ok(PostgresSetStatement::ResetAll);
+    }
+    if upper.starts_with("RESET ") {
+        return Ok(PostgresSetStatement::Reset {
+            name: normalize_postgres_setting_name(trimmed["RESET ".len()..].trim())?,
+        });
+    }
+
+    if !upper.starts_with("SET ") {
+        return Ok(PostgresSetStatement::NotASetStatement);
+    }
+
+    let remainder = strip_set_scope_prefix(trimmed["SET ".len()..].trim());
+    let remainder_upper = remainder.to_ascii_uppercase();
+
+    let session_characteristics_prefix = "CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ";
+    if remainder_upper.starts_with(session_characteristics_prefix) {
+        return Ok(PostgresSetStatement::Set {
+            name: "transaction_isolation".to_string(),
+            value: Some(normalize_transaction_isolation_level(
+                remainder[session_characteristics_prefix.len()..].trim(),
+            )?),
+        });
+    }
+
+    if remainder_upper.starts_with("TRANSACTION")
+        || remainder_upper.starts_with("ROLE")
+        || remainder_upper.starts_with("SESSION AUTHORIZATION")
+        || remainder_upper.starts_with("CONSTRAINTS")
+    {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "this SET form is not implemented in the current prototype"
+        )));
+    }
+
+    if remainder_upper.starts_with("TIME ZONE ") {
+        return Ok(PostgresSetStatement::Set {
+            name: "timezone".to_string(),
+            value: normalize_postgres_setting_value(remainder["TIME ZONE ".len()..].trim())?,
+        });
+    }
+    if remainder_upper.starts_with("NAMES ") {
+        return Ok(PostgresSetStatement::Set {
+            name: "client_encoding".to_string(),
+            value: normalize_postgres_setting_value(remainder["NAMES ".len()..].trim())?,
+        });
+    }
+
+    let (name_raw, value_raw) = split_postgres_set_assignment(remainder).ok_or_else(|| {
+        anyhow_error_to_pgwire(anyhow::anyhow!(
+            "unsupported PostgreSQL SET syntax in the current prototype"
+        ))
+    })?;
+
+    Ok(PostgresSetStatement::Set {
+        name: normalize_postgres_setting_name(name_raw)?,
+        value: normalize_postgres_setting_value(value_raw)?,
+    })
+}
+
+fn strip_set_scope_prefix(remainder: &str) -> &str {
+    let upper = remainder.to_ascii_uppercase();
+    if upper.starts_with("SESSION ") {
+        remainder["SESSION ".len()..].trim()
+    } else if upper.starts_with("LOCAL ") {
+        remainder["LOCAL ".len()..].trim()
+    } else {
+        remainder
+    }
+}
+
+fn split_postgres_set_assignment(input: &str) -> Option<(&str, &str)> {
+    let upper = input.to_ascii_uppercase();
+    if let Some(index) = upper.find(" TO ") {
+        return Some((input[..index].trim(), input[index + " TO ".len()..].trim()));
+    }
+    input
+        .split_once('=')
+        .map(|(left, right)| (left.trim(), right.trim()))
+}
+
+fn normalize_postgres_setting_name(raw: &str) -> PgWireResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "SET/RESET parameter name cannot be empty"
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+    {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "unsupported PostgreSQL parameter name '{}' in the current prototype",
+            raw
+        )));
+    }
+
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+fn normalize_postgres_setting_value(raw: &str) -> PgWireResult<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_transaction_isolation_level(raw: &str) -> PgWireResult<String> {
+    let normalized = raw
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "read committed" | "read uncommitted" | "repeatable read" | "serializable" => {
+            Ok(normalized)
+        }
+        _ => Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "unsupported transaction isolation level '{}' in the current prototype",
+            raw
+        ))),
+    }
+}
+
+fn apply_postgres_session_statement<C>(
+    client: &mut C,
+    statement: PostgresSetStatement,
+) -> PgWireResult<Option<PgResponse>>
+where
+    C: ClientInfo,
+{
+    match statement {
+        PostgresSetStatement::Set { name, value } => {
+            apply_postgres_setting(client, &name, value.as_deref())?;
+            Ok(Some(PgResponse::Execution(Tag::new("SET"))))
+        }
+        PostgresSetStatement::Reset { name } => {
+            reset_postgres_setting(client, &name)?;
+            Ok(Some(PgResponse::Execution(Tag::new("RESET"))))
+        }
+        PostgresSetStatement::ResetAll => {
+            reset_all_postgres_settings(client)?;
+            Ok(Some(PgResponse::Execution(Tag::new("RESET"))))
+        }
+        PostgresSetStatement::NotASetStatement => Ok(None),
+    }
+}
+
+fn parse_postgres_show_statement(sql: &str) -> PgWireResult<PostgresShowStatement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper == "SHOW ALL" {
+        return Ok(PostgresShowStatement::All);
+    }
+    if !upper.starts_with("SHOW ") {
+        return Ok(PostgresShowStatement::NotAShowStatement);
+    }
+
+    let raw_name = trimmed["SHOW ".len()..].trim();
+    if raw_name.is_empty() {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "SHOW parameter name cannot be empty"
+        )));
+    }
+
+    let raw_upper = raw_name.to_ascii_uppercase();
+    if raw_upper == "DATABASES"
+        || raw_upper == "SCHEMAS"
+        || raw_upper.starts_with("SCHEMAS FROM ")
+        || raw_upper == "TABLES"
+        || raw_upper.starts_with("TABLES FROM ")
+        || raw_upper == "VIEWS"
+        || raw_upper.starts_with("VIEWS FROM ")
+        || raw_upper.starts_with("COLUMNS FROM ")
+    {
+        return Ok(PostgresShowStatement::NotAShowStatement);
+    }
+    if raw_name.contains(char::is_whitespace)
+        && raw_upper != "TIME ZONE"
+        && raw_upper != "TRANSACTION ISOLATION LEVEL"
+    {
+        return Ok(PostgresShowStatement::NotAShowStatement);
+    }
+
+    Ok(PostgresShowStatement::Setting {
+        name: normalize_postgres_show_name(raw_name)?,
+    })
+}
+
+fn normalize_postgres_show_name(raw: &str) -> PgWireResult<String> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper == "TIME ZONE" {
+        return Ok("timezone".to_string());
+    }
+    if upper == "TRANSACTION ISOLATION LEVEL" {
+        return Ok("transaction_isolation".to_string());
+    }
+
+    normalize_postgres_setting_name(trimmed)
+}
+
+fn execute_postgres_show_statement<C>(
+    client: &C,
+    statement: PostgresShowStatement,
+) -> PgWireResult<Option<PgResponse>>
+where
+    C: ClientInfo,
+{
+    match statement {
+        PostgresShowStatement::Setting { name } => {
+            let value = effective_postgres_setting(client, &name)?;
+            let schema = Arc::new(vec![FieldInfo::new(
+                name.clone(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]);
+            let rows = encode_text_query_rows(Arc::clone(&schema), &[vec![value]])?;
+            Ok(Some(PgResponse::Query(PgQueryResponse::new(schema, rows))))
+        }
+        PostgresShowStatement::All => {
+            let schema = Arc::new(vec![
+                FieldInfo::new(
+                    "name".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "setting".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+            ]);
+            let rows = effective_postgres_settings_map(client)
+                .into_iter()
+                .map(|(name, value)| vec![name, value])
+                .collect::<Vec<_>>();
+            let rows = encode_text_query_rows(Arc::clone(&schema), &rows)?;
+            Ok(Some(PgResponse::Query(PgQueryResponse::new(schema, rows))))
+        }
+        PostgresShowStatement::NotAShowStatement => Ok(None),
+    }
+}
+
+fn postgres_show_result_schema(statement: PostgresShowStatement) -> Option<Vec<FieldInfo>> {
+    match statement {
+        PostgresShowStatement::Setting { name } => Some(vec![FieldInfo::new(
+            name,
+            None,
+            None,
+            Type::TEXT,
+            FieldFormat::Text,
+        )]),
+        PostgresShowStatement::All => Some(vec![
+            FieldInfo::new(
+                "name".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            ),
+            FieldInfo::new(
+                "setting".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            ),
+        ]),
+        PostgresShowStatement::NotAShowStatement => None,
+    }
+}
+
+fn parse_postgres_introspection_statement(
+    sql: &str,
+) -> PgWireResult<PostgresIntrospectionStatement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("SELECT ") {
+        return Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement);
+    }
+
+    let select_body = trimmed["SELECT ".len()..].trim();
+    if select_body.is_empty() || select_body.to_ascii_uppercase().contains(" FROM ") {
+        return Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement);
+    }
+
+    let (expression, alias) = split_select_expression_alias(select_body)?;
+    let compact_expression = expression
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    if compact_expression == "version()" {
+        return Ok(PostgresIntrospectionStatement::Version {
+            column_name: alias.unwrap_or_else(|| "version".to_string()),
+        });
+    }
+    if compact_expression == "current_database()" {
+        return Ok(PostgresIntrospectionStatement::CurrentDatabase {
+            column_name: alias.unwrap_or_else(|| "current_database".to_string()),
+        });
+    }
+    if compact_expression == "current_schema()" {
+        return Ok(PostgresIntrospectionStatement::CurrentSchema {
+            column_name: alias.unwrap_or_else(|| "current_schema".to_string()),
+        });
+    }
+    if compact_expression == "current_user" {
+        return Ok(PostgresIntrospectionStatement::CurrentUser {
+            column_name: alias.unwrap_or_else(|| "current_user".to_string()),
+        });
+    }
+    if compact_expression == "session_user" {
+        return Ok(PostgresIntrospectionStatement::SessionUser {
+            column_name: alias.unwrap_or_else(|| "session_user".to_string()),
+        });
+    }
+    if compact_expression.starts_with("current_setting(") && compact_expression.ends_with(')') {
+        return Ok(PostgresIntrospectionStatement::CurrentSetting {
+            column_name: alias.unwrap_or_else(|| "current_setting".to_string()),
+            setting_name: parse_current_setting_name(&compact_expression)?,
+        });
+    }
+
+    Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement)
+}
+
+fn split_select_expression_alias(select_body: &str) -> PgWireResult<(&str, Option<String>)> {
+    let upper = select_body.to_ascii_uppercase();
+    if let Some(index) = upper.rfind(" AS ") {
+        let expression = select_body[..index].trim();
+        let alias = select_body[index + " AS ".len()..].trim();
+        if expression.is_empty() || alias.is_empty() {
+            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                "unsupported PostgreSQL SELECT alias syntax in introspection query"
+            )));
+        }
+        return Ok((expression, Some(normalize_select_alias(alias)?)));
+    }
+
+    Ok((select_body.trim(), None))
+}
+
+fn normalize_select_alias(raw_alias: &str) -> PgWireResult<String> {
+    if raw_alias.starts_with('"') {
+        if !raw_alias.ends_with('"') || raw_alias.len() < 2 {
+            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                "unterminated quoted alias in PostgreSQL introspection query"
+            )));
+        }
+        return Ok(raw_alias[1..raw_alias.len() - 1].replace("\"\"", "\""));
+    }
+
+    Ok(raw_alias.to_string())
+}
+
+fn parse_current_setting_name(compact_expression: &str) -> PgWireResult<String> {
+    let inner = &compact_expression["current_setting(".len()..compact_expression.len() - 1];
+    let raw_name = if let Some((first, second)) = inner.split_once(',') {
+        if !second.eq_ignore_ascii_case("true") && !second.eq_ignore_ascii_case("false") {
+            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                "unsupported current_setting missing_ok argument in the current prototype"
+            )));
+        }
+        first
+    } else {
+        inner
+    };
+
+    parse_single_quoted_literal(raw_name).map(|value| value.to_ascii_lowercase())
+}
+
+fn parse_single_quoted_literal(raw: &str) -> PgWireResult<String> {
+    if !raw.starts_with('\'') || !raw.ends_with('\'') || raw.len() < 2 {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "expected a single-quoted string literal in PostgreSQL introspection query"
+        )));
+    }
+
+    let mut result = String::new();
+    let mut chars = raw[1..raw.len() - 1].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if matches!(chars.peek(), Some('\'')) {
+                let _ = chars.next();
+                result.push('\'');
+            } else {
+                return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                    "unterminated single-quoted string literal in PostgreSQL introspection query"
+                )));
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    Ok(result)
+}
+
+fn execute_postgres_introspection_statement<C>(
+    client: &C,
+    statement: PostgresIntrospectionStatement,
+) -> PgWireResult<Option<PgResponse>>
+where
+    C: ClientInfo,
+{
+    let response = match statement {
+        PostgresIntrospectionStatement::Version { column_name } => {
+            postgres_single_column_text_response(column_name, POSTGRES_SERVER_VERSION.to_string())?
+        }
+        PostgresIntrospectionStatement::CurrentDatabase { column_name } => {
+            let value = client
+                .metadata()
+                .get(METADATA_DATABASE)
+                .cloned()
+                .unwrap_or_else(|| "postgres".to_string());
+            postgres_single_column_text_response(column_name, value)?
+        }
+        PostgresIntrospectionStatement::CurrentSchema { column_name } => {
+            let value = client
+                .metadata()
+                .get(POSTGRES_SCHEMA_METADATA)
+                .cloned()
+                .unwrap_or_else(|| "public".to_string());
+            postgres_single_column_text_response(column_name, value)?
+        }
+        PostgresIntrospectionStatement::CurrentUser { column_name }
+        | PostgresIntrospectionStatement::SessionUser { column_name } => {
+            let value = client
+                .metadata()
+                .get(METADATA_USER)
+                .cloned()
+                .unwrap_or_else(|| "postgres".to_string());
+            postgres_single_column_text_response(column_name, value)?
+        }
+        PostgresIntrospectionStatement::CurrentSetting {
+            column_name,
+            setting_name,
+        } => {
+            let value = effective_postgres_setting(client, &setting_name)?;
+            postgres_single_column_text_response(column_name, value)?
+        }
+        PostgresIntrospectionStatement::NotAnIntrospectionStatement => return Ok(None),
+    };
+
+    Ok(Some(response))
+}
+
+fn postgres_single_column_text_response(
+    column_name: String,
+    value: String,
+) -> PgWireResult<PgResponse> {
+    let schema = Arc::new(vec![FieldInfo::new(
+        column_name,
+        None,
+        None,
+        Type::TEXT,
+        FieldFormat::Text,
+    )]);
+    let rows = encode_text_query_rows(Arc::clone(&schema), &[vec![value]])?;
+    Ok(PgResponse::Query(PgQueryResponse::new(schema, rows)))
+}
+
+fn postgres_introspection_result_schema(
+    statement: PostgresIntrospectionStatement,
+) -> Option<Vec<FieldInfo>> {
+    let column_name = match statement {
+        PostgresIntrospectionStatement::Version { column_name }
+        | PostgresIntrospectionStatement::CurrentDatabase { column_name }
+        | PostgresIntrospectionStatement::CurrentSchema { column_name }
+        | PostgresIntrospectionStatement::CurrentUser { column_name }
+        | PostgresIntrospectionStatement::SessionUser { column_name }
+        | PostgresIntrospectionStatement::CurrentSetting { column_name, .. } => column_name,
+        PostgresIntrospectionStatement::NotAnIntrospectionStatement => return None,
+    };
+
+    Some(vec![FieldInfo::new(
+        column_name,
+        None,
+        None,
+        Type::TEXT,
+        FieldFormat::Text,
+    )])
+}
+
+fn encode_text_query_rows(
+    row_schema: Arc<Vec<FieldInfo>>,
+    rows: &[Vec<String>],
+) -> PgWireResult<impl Stream<Item = PgWireResult<pgwire::messages::data::DataRow>> + Send + 'static>
+{
+    let mut encoded_rows = Vec::new();
+    for row in rows {
+        let mut encoder = DataRowEncoder::new(Arc::clone(&row_schema));
+        for value in row {
+            encoder.encode_field(value)?;
+        }
+        encoded_rows.push(Ok(encoder.take_row()));
+    }
+
+    Ok(stream::iter(encoded_rows))
+}
+
+fn effective_postgres_setting<C>(client: &C, name: &str) -> PgWireResult<String>
+where
+    C: ClientInfo,
+{
+    effective_postgres_settings_map(client)
+        .remove(name)
+        .ok_or_else(|| {
+            anyhow_error_to_pgwire(anyhow::anyhow!(
+                "unsupported or unknown PostgreSQL SHOW parameter '{}' in the current prototype",
+                name
+            ))
+        })
+}
+
+fn effective_postgres_settings_map<C>(client: &C) -> BTreeMap<String, String>
+where
+    C: ClientInfo,
+{
+    let mut settings = default_postgres_show_settings();
+
+    if let Some(schema) = client.metadata().get(POSTGRES_SCHEMA_METADATA) {
+        settings.insert("search_path".to_string(), schema.clone());
+    }
+
+    for (key, value) in client.metadata() {
+        if let Some(name) = key.strip_prefix(POSTGRES_SETTING_PREFIX) {
+            settings.insert(name.to_string(), value.clone());
+        }
+    }
+
+    settings
+}
+
+fn default_postgres_show_settings() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("application_name".to_string(), "".to_string()),
+        ("client_encoding".to_string(), "UTF8".to_string()),
+        ("datestyle".to_string(), "ISO, MDY".to_string()),
+        (
+            "default_transaction_isolation".to_string(),
+            "read committed".to_string(),
+        ),
+        ("extra_float_digits".to_string(), "1".to_string()),
+        ("intervalstyle".to_string(), "postgres".to_string()),
+        ("search_path".to_string(), "public".to_string()),
+        ("standard_conforming_strings".to_string(), "on".to_string()),
+        ("statement_timeout".to_string(), "0".to_string()),
+        (
+            "transaction_isolation".to_string(),
+            "read committed".to_string(),
+        ),
+        ("transaction_read_only".to_string(), "off".to_string()),
+        ("timezone".to_string(), "UTC".to_string()),
+    ])
+}
+
+fn apply_postgres_setting<C>(client: &mut C, name: &str, value: Option<&str>) -> PgWireResult<()>
+where
+    C: ClientInfo,
+{
+    if name == "search_path" {
+        let raw_value = value.ok_or_else(|| {
+            anyhow_error_to_pgwire(anyhow::anyhow!(
+                "SET search_path requires a value in the current prototype"
+            ))
+        })?;
+        let (entries, effective_schema) = parse_search_path_entries(raw_value)?;
+        client
+            .metadata_mut()
+            .insert(POSTGRES_SCHEMA_METADATA.to_string(), effective_schema);
+        client
+            .metadata_mut()
+            .insert(postgres_setting_metadata_key(name), entries.join(", "));
+        return Ok(());
+    }
+
+    let key = postgres_setting_metadata_key(name);
+    if let Some(value) = value {
+        client.metadata_mut().insert(key, value.to_string());
+    } else {
+        client.metadata_mut().remove(&key);
+    }
+
+    Ok(())
+}
+
+fn reset_postgres_setting<C>(client: &mut C, name: &str) -> PgWireResult<()>
+where
+    C: ClientInfo,
+{
+    if name == "search_path" {
+        client
+            .metadata_mut()
+            .insert(POSTGRES_SCHEMA_METADATA.to_string(), "public".to_string());
+    }
+    client
+        .metadata_mut()
+        .remove(&postgres_setting_metadata_key(name));
+    Ok(())
+}
+
+fn reset_all_postgres_settings<C>(client: &mut C) -> PgWireResult<()>
+where
+    C: ClientInfo,
+{
+    let keys = client
+        .metadata()
+        .keys()
+        .filter(|key| key.starts_with(POSTGRES_SETTING_PREFIX))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        client.metadata_mut().remove(&key);
+    }
+    client
+        .metadata_mut()
+        .insert(POSTGRES_SCHEMA_METADATA.to_string(), "public".to_string());
+
+    Ok(())
+}
+
+fn postgres_setting_metadata_key(name: &str) -> String {
+    format!("{POSTGRES_SETTING_PREFIX}{name}")
+}
+
+fn parse_search_path_entries(raw: &str) -> PgWireResult<(Vec<String>, String)> {
+    let entries = split_search_path_entries(raw)?
+        .into_iter()
+        .map(|entry| parse_search_path_schema_name(&entry))
+        .collect::<PgWireResult<Vec<_>>>()?;
+
+    if entries.is_empty() {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "SET search_path requires at least one schema name in the current prototype"
+        )));
+    }
+
+    let effective_schema = entries
+        .iter()
+        .find(|entry| entry.as_str() != "$user")
+        .cloned()
+        .unwrap_or_else(|| "public".to_string());
+
+    Ok((entries, effective_schema))
+}
+
+fn split_search_path_entries(raw: &str) -> PgWireResult<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = trimmed.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                current.push(ch);
+                if in_quotes && matches!(chars.peek(), Some('"')) {
+                    current.push(chars.next().expect("quoted search_path char should exist"));
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            ',' if !in_quotes => {
+                let part = current.trim();
+                if part.is_empty() {
+                    return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                        "empty search_path entry is not supported in the current prototype"
+                    )));
+                }
+                parts.push(part.to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "unterminated quoted schema name in SET search_path"
+        )));
+    }
+
+    let part = current.trim();
+    if !part.is_empty() {
+        parts.push(part.to_string());
+    }
+
+    Ok(parts)
+}
+
+fn parse_search_path_schema_name(value: &str) -> PgWireResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "schema name for SET search_path cannot be empty"
+        )));
+    }
+
+    if trimmed.starts_with('"') {
+        if !trimmed.ends_with('"') || trimmed.len() < 2 {
+            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+                "unterminated quoted schema name in SET search_path"
+            )));
+        }
+
+        return Ok(trimmed[1..trimmed.len() - 1].replace("\"\"", "\""));
+    }
+
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
+            "schema name in SET search_path must be a single identifier in the current prototype"
+        )));
+    }
+
+    Ok(trimmed.to_string())
 }
 
 async fn execute_postgres_sql(
@@ -374,7 +1502,7 @@ fn query_execution_to_pg_response(
     sql: &str,
     row_schema: Option<Arc<Vec<FieldInfo>>>,
 ) -> PgWireResult<PgResponse> {
-    if execution.schema.fields().is_empty() {
+    if !sql_returns_rows(sql) || execution.schema.fields().is_empty() {
         let rows = rows_affected_from_message(&execution.message);
         return Ok(PgResponse::Execution(
             Tag::new(command_tag_for_sql(sql)).with_rows(rows),
@@ -619,18 +1747,55 @@ fn render_sql_with_portal_parameters(
 
 fn render_sql_with_literals<F>(
     sql: &str,
-    parameter_count: usize,
+    _parameter_count: usize,
     mut literal_for_index: F,
 ) -> PgWireResult<String>
 where
     F: FnMut(usize) -> PgWireResult<String>,
 {
-    let mut rendered = sql.to_string();
+    let bytes = sql.as_bytes();
+    let mut rendered = String::with_capacity(sql.len());
+    let mut index = 0;
+    let mut in_single_quote = false;
 
-    // Replace from the highest placeholder index downward to avoid `$1`
-    // accidentally rewriting the prefix of `$10`.
-    for index in (1..=parameter_count).rev() {
-        rendered = rendered.replace(&format!("${index}"), &literal_for_index(index)?);
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if ch == '\'' {
+            rendered.push(ch);
+            if in_single_quote {
+                if index + 1 < bytes.len() && bytes[index + 1] as char == '\'' {
+                    rendered.push('\'');
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        if !in_single_quote && ch == '$' {
+            let mut end = index + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > index + 1 {
+                let placeholder = &sql[index + 1..end];
+                let placeholder_index = placeholder.parse::<usize>().map_err(|error| {
+                    anyhow_error_to_pgwire(anyhow::anyhow!(
+                        "invalid PostgreSQL parameter placeholder '${placeholder}': {error}"
+                    ))
+                })?;
+                rendered.push_str(&literal_for_index(placeholder_index)?);
+                index = end;
+                continue;
+            }
+        }
+
+        rendered.push(ch);
+        index += 1;
     }
 
     Ok(rendered)
@@ -740,9 +1905,14 @@ fn join_error_to_pgwire(error: tokio::task::JoinError) -> PgWireError {
     anyhow_error_to_pgwire(anyhow::anyhow!("join error while executing query: {error}"))
 }
 
+fn status_to_pgwire(status: Status) -> PgWireError {
+    anyhow_error_to_pgwire(anyhow::anyhow!(status.message().to_string()))
+}
+
 #[derive(Clone)]
 struct AnalyticsFlightSqlService {
     engine: Arc<PrototypeEngine>,
+    auth_hook: Arc<dyn AuthHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,16 +1927,85 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
     async fn do_handshake(
         &self,
-        _request: Request<Streaming<arrow_flight::HandshakeRequest>>,
+        request: Request<Streaming<arrow_flight::HandshakeRequest>>,
     ) -> Result<
         Response<
             Pin<Box<dyn Stream<Item = Result<arrow_flight::HandshakeResponse, Status>> + Send>>,
         >,
         Status,
     > {
-        Err(Status::unimplemented(
-            "handshake is not implemented in the current prototype",
-        ))
+        let metadata = request.metadata().clone();
+        let mut stream = request.into_inner();
+        let handshake_request =
+            stream
+                .next()
+                .await
+                .transpose()?
+                .unwrap_or(arrow_flight::HandshakeRequest {
+                    protocol_version: 0,
+                    payload: bytes::Bytes::new(),
+                });
+
+        let basic_auth = parse_basic_auth_from_metadata(&metadata)?;
+        let user = basic_auth
+            .as_ref()
+            .map(|(user, _)| user.clone())
+            .or_else(|| metadata_value(&metadata, FLIGHT_USER_HEADER))
+            .unwrap_or_else(|| "postgres".to_string());
+        let database = metadata_value(&metadata, FLIGHT_DATABASE_HEADER)
+            .unwrap_or_else(|| "postgres".to_string());
+        let schema =
+            metadata_value(&metadata, FLIGHT_SCHEMA_HEADER).unwrap_or_else(|| "public".to_string());
+
+        let decision = self.auth_hook.authenticate(&AuthRequest {
+            protocol: Protocol::ArrowFlightSql,
+            user,
+            database,
+            schema,
+            role: metadata_value(&metadata, FLIGHT_ROLE_HEADER),
+            password: basic_auth.as_ref().map(|(_, password)| password.clone()),
+            auth_header: metadata_value(&metadata, "authorization"),
+        })?;
+
+        let payload = serde_json::to_vec(&decision).map_err(status_from_error)?;
+        let response_stream = stream::once(async move {
+            Ok(arrow_flight::HandshakeResponse {
+                protocol_version: handshake_request.protocol_version,
+                payload: payload.into(),
+            })
+        });
+        let mut response = Response::new(Box::pin(response_stream)
+            as Pin<Box<dyn Stream<Item = Result<arrow_flight::HandshakeResponse, Status>> + Send>>);
+        response.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!(
+                "Bearer analyticsdb-prototype-{}",
+                uuid::Uuid::now_v7()
+            ))
+            .map_err(|error| {
+                Status::internal(format!("invalid authorization metadata: {error}"))
+            })?,
+        );
+        response.metadata_mut().insert(
+            FLIGHT_USER_HEADER,
+            MetadataValue::try_from(decision.user.as_str()).map_err(|error| {
+                Status::internal(format!("invalid handshake user metadata: {error}"))
+            })?,
+        );
+        response.metadata_mut().insert(
+            FLIGHT_ROLE_HEADER,
+            MetadataValue::try_from(decision.role.as_str()).map_err(|error| {
+                Status::internal(format!("invalid handshake role metadata: {error}"))
+            })?,
+        );
+        response.metadata_mut().insert(
+            FLIGHT_AUTH_METHOD_HEADER,
+            MetadataValue::try_from(decision.auth_method.as_str()).map_err(|error| {
+                Status::internal(format!("invalid handshake auth metadata: {error}"))
+            })?,
+        );
+
+        Ok(response)
     }
 
     async fn get_flight_info_statement(
@@ -1071,25 +2310,47 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
     async fn get_flight_info_sql_info(
         &self,
-        _query: CommandGetSqlInfo,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented(
-            "Flight SQL SqlInfo metadata is not implemented in the current prototype",
-        ))
+        let descriptor = request.into_inner();
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        });
+        let sql_info_data = flight_sql_info_data()?;
+        let info = FlightInfo::new()
+            .try_with_schema(query.into_builder(&sql_info_data).schema().as_ref())
+            .map_err(status_from_error)?
+            .with_endpoint(endpoint)
+            .with_descriptor(descriptor);
+
+        Ok(Response::new(info))
     }
 
     async fn do_get_sql_info(
         &self,
-        _query: CommandGetSqlInfo,
+        query: CommandGetSqlInfo,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented(
-            "Flight SQL SqlInfo metadata is not implemented in the current prototype",
-        ))
+        let sql_info_data = flight_sql_info_data()?;
+        let builder = query.into_builder(&sql_info_data);
+        let schema = builder.schema();
+        let batch = builder.build().map_err(status_from_error)?;
+
+        Ok(Response::new(encoded_single_batch(schema, batch)?))
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+    async fn get_flight_info_prepared_statement(
+        &self,
+        _query: CommandPreparedStatementQuery,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented(
+            "prepared statements are in scaffold status - full implementation coming",
+        ))
+    }
 }
 
 impl AnalyticsFlightSqlService {
@@ -1114,13 +2375,17 @@ impl AnalyticsFlightSqlService {
 }
 
 fn flight_session_from_metadata(metadata: &MetadataMap) -> SessionContext {
+    let user =
+        metadata_value(metadata, FLIGHT_USER_HEADER).unwrap_or_else(|| "postgres".to_string());
     SessionContext {
-        user: metadata_value(metadata, FLIGHT_USER_HEADER)
-            .unwrap_or_else(|| "postgres".to_string()),
+        user: user.clone(),
+        role: metadata_value(metadata, FLIGHT_ROLE_HEADER).unwrap_or(user.clone()),
         database: metadata_value(metadata, FLIGHT_DATABASE_HEADER)
             .unwrap_or_else(|| "postgres".to_string()),
         schema: metadata_value(metadata, FLIGHT_SCHEMA_HEADER)
             .unwrap_or_else(|| "public".to_string()),
+        auth_method: metadata_value(metadata, FLIGHT_AUTH_METHOD_HEADER)
+            .unwrap_or_else(|| "flight-sql-metadata".to_string()),
         protocol: Protocol::ArrowFlightSql,
     }
 }
@@ -1128,8 +2393,10 @@ fn flight_session_from_metadata(metadata: &MetadataMap) -> SessionContext {
 fn flight_session_for_database(session: &SessionContext, database: &str) -> SessionContext {
     SessionContext {
         user: session.user.clone(),
+        role: session.role.clone(),
         database: database.to_string(),
         schema: session.schema.clone(),
+        auth_method: session.auth_method.clone(),
         protocol: Protocol::ArrowFlightSql,
     }
 }
@@ -1139,6 +2406,32 @@ fn metadata_value(metadata: &MetadataMap, key: &str) -> Option<String> {
         .get(key)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn parse_basic_auth_from_metadata(
+    metadata: &MetadataMap,
+) -> Result<Option<(String, String)>, Status> {
+    let Some(raw_auth) = metadata_value(metadata, "authorization") else {
+        return Ok(None);
+    };
+    let Some(encoded) = raw_auth.strip_prefix("Basic ") else {
+        return Ok(None);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid basic authorization payload: {error}"))
+        })?;
+    let pair = String::from_utf8(decoded).map_err(|error| {
+        Status::invalid_argument(format!("invalid utf8 in authorization payload: {error}"))
+    })?;
+    let Some((user, password)) = pair.split_once(':') else {
+        return Err(Status::invalid_argument(
+            "basic authorization payload must contain username:password",
+        ));
+    };
+
+    Ok(Some((user.to_string(), password.to_string())))
 }
 
 fn statement_ticket(sql: String, session: SessionContext) -> Result<Ticket, Status> {
@@ -1202,12 +2495,118 @@ fn status_from_error(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }
 
+fn flight_sql_info_data() -> Result<SqlInfoData, Status> {
+    let mut builder = SqlInfoDataBuilder::new();
+    // Keep SqlInfo intentionally narrow for the current prototype slice.
+    builder.append(SqlInfo::FlightSqlServerName, "AnalyticsDB Prototype");
+    builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0-prototype");
+    builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
+
+    builder.build().map_err(status_from_error)
+}
+
+// Prototype scaffold: Flight SQL prepared statement parameter handling
+// Full implementation requires Flight SQL client API support for prepare/bind/execute cycles
+// These utilities are provided as infrastructure for future work:
+mod flight_prepared_statement_scaffold {
+    use pgwire::api::Type;
+    use pgwire::error::PgWireResult;
+
+    /// Convert Flight SQL parameter bytes to SQL literal string for a given type
+    /// This mirrors the PostgreSQL parameter handling in parameter_literal_from_portal
+    #[allow(dead_code)]
+    pub fn flight_sql_parameter_to_literal(
+        parameter: Option<&bytes::Bytes>,
+        param_type: &Type,
+    ) -> PgWireResult<String> {
+        match parameter {
+            None => Ok("NULL".to_string()),
+            Some(bytes) => match *param_type {
+                Type::BOOL => {
+                    if bytes.len() != 1 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "BOOL parameter must be 1 byte",
+                        ));
+                    }
+                    let value = bytes[0] != 0;
+                    Ok(if value { "TRUE" } else { "FALSE" }.to_string())
+                }
+                Type::INT2 => {
+                    if bytes.len() != 2 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "INT2 parameter must be 2 bytes",
+                        ));
+                    }
+                    let value = i16::from_be_bytes([bytes[0], bytes[1]]);
+                    Ok(value.to_string())
+                }
+                Type::INT4 => {
+                    if bytes.len() != 4 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "INT4 parameter must be 4 bytes",
+                        ));
+                    }
+                    let value = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Ok(value.to_string())
+                }
+                Type::INT8 => {
+                    if bytes.len() != 8 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "INT8 parameter must be 8 bytes",
+                        ));
+                    }
+                    let value = i64::from_be_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    Ok(value.to_string())
+                }
+                Type::FLOAT4 => {
+                    if bytes.len() != 4 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "FLOAT4 parameter must be 4 bytes",
+                        ));
+                    }
+                    let value = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Ok(value.to_string())
+                }
+                Type::FLOAT8 | Type::NUMERIC => {
+                    if bytes.len() != 8 {
+                        return Err(super::unsupported_parameter_type_error(
+                            "FLOAT8 parameter must be 8 bytes",
+                        ));
+                    }
+                    let value = f64::from_be_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    Ok(value.to_string())
+                }
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+                    let string = String::from_utf8(bytes.to_vec()).map_err(|error| {
+                        super::unsupported_parameter_type_error(&format!(
+                            "invalid UTF-8 string parameter: {error}"
+                        ))
+                    })?;
+                    Ok(format!("'{}'", string.replace('\'', "''")))
+                }
+                _ => Err(super::unsupported_parameter_type_error(&format!(
+                    "unsupported parameter type in flight SQL prepared statement: {}",
+                    param_type.name()
+                ))),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use arrow_flight::sql::CommandGetTables;
+    use arrow_flight::sql::SqlInfo;
+    use base64::Engine;
     use futures::TryStreamExt;
     use tokio_postgres::types::Type as PgType;
     use tokio_postgres::NoTls;
@@ -1235,7 +2634,7 @@ mod tests {
 
         let (client, connection) = tokio_postgres::connect(
             &format!(
-                "host=127.0.0.1 port={} user=postgres dbname=postgres",
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
                 addr.port()
             ),
             NoTls,
@@ -1280,7 +2679,7 @@ mod tests {
 
         let (client, connection) = tokio_postgres::connect(
             &format!(
-                "host=127.0.0.1 port={} user=postgres dbname=postgres",
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
                 addr.port()
             ),
             NoTls,
@@ -1340,6 +2739,779 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .expect("catalog path should have stem")
         ));
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_honors_set_search_path_for_subsequent_queries() {
+        let catalog_path = temp_catalog_path("postgres-search-path");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(
+            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+        );
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .simple_query("CREATE SCHEMA reporting")
+            .await
+            .expect("create schema should succeed");
+        client
+            .batch_execute("SET search_path TO reporting")
+            .await
+            .expect("setting search_path should succeed");
+        client
+            .simple_query("CREATE TABLE fact_metrics (metric BIGINT NOT NULL, status TEXT)")
+            .await
+            .expect("create table in reporting schema should succeed");
+        client
+            .simple_query("INSERT INTO fact_metrics VALUES (11, 'ok')")
+            .await
+            .expect("insert should succeed");
+
+        let messages = client
+            .simple_query("SELECT metric, status FROM fact_metrics")
+            .await
+            .expect("query should succeed");
+        let row = messages
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("row should exist");
+
+        assert_eq!(row.get("metric"), Some("11"));
+        assert_eq!(row.get("status"), Some("ok"));
+
+        let show_tables = client
+            .simple_query("SHOW TABLES FROM reporting")
+            .await
+            .expect("show tables should succeed");
+        let table_row = show_tables
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("table row should exist");
+
+        assert_eq!(table_row.get("table_name"), Some("fact_metrics"));
+
+        server.abort();
+        let _ = std::fs::remove_file(&catalog_path);
+        let _ = std::fs::remove_dir_all(format!(
+            "/tmp/{}.managed",
+            std::path::Path::new(&catalog_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .expect("catalog path should have stem")
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_accepts_jdbc_extra_float_digits_set_in_simple_query_path() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .batch_execute("SET extra_float_digits = 3")
+            .await
+            .expect("JDBC startup-style extra_float_digits SET should be accepted");
+
+        let rows = client
+            .simple_query("SELECT 1 AS one")
+            .await
+            .expect("query should succeed after no-op SET");
+        let row = rows
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("row should exist");
+        assert_eq!(row.get("one"), Some("1"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_accepts_jdbc_extra_float_digits_set_in_extended_query_path() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let set_stmt = client
+            .prepare_typed("SET extra_float_digits = 3", &[])
+            .await
+            .expect("extended SET should prepare");
+        let affected = client
+            .execute(&set_stmt, &[])
+            .await
+            .expect("extended SET should execute");
+        assert_eq!(affected, 0);
+
+        let rows = client
+            .simple_query("SELECT 1 AS one")
+            .await
+            .expect("query should succeed after extended no-op SET");
+        let row = rows
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("row should exist");
+        assert_eq!(row.get("one"), Some("1"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_accepts_generic_session_set_and_reset_forms() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .batch_execute("SET application_name = 'jdbc-client'")
+            .await
+            .expect("generic SET application_name should succeed");
+        let show_application_name = client
+            .simple_query("SHOW application_name")
+            .await
+            .expect("SHOW application_name should succeed after SET");
+        let show_application_name_row = show_application_name
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW application_name row should exist");
+        assert_eq!(
+            show_application_name_row.get("application_name"),
+            Some("'jdbc-client'")
+        );
+
+        client
+            .batch_execute("SET SESSION statement_timeout TO '5s'")
+            .await
+            .expect("SET SESSION should succeed");
+        client
+            .batch_execute("SET LOCAL extra_float_digits = 3")
+            .await
+            .expect("SET LOCAL should be accepted as session-scoped prototype behavior");
+        client
+            .batch_execute("SET TIME ZONE 'UTC'")
+            .await
+            .expect("SET TIME ZONE should succeed");
+        client
+            .batch_execute("SET NAMES 'UTF8'")
+            .await
+            .expect("SET NAMES should succeed");
+        let show_all = client
+            .simple_query("SHOW ALL")
+            .await
+            .expect("SHOW ALL should succeed");
+        let show_all_rows = show_all
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            show_all_rows.iter().any(|row| {
+                row.get("name") == Some("application_name")
+                    && row.get("setting") == Some("'jdbc-client'")
+            }),
+            "SHOW ALL rows={show_all_rows:?}"
+        );
+        assert!(
+            show_all_rows.iter().any(|row| {
+                row.get("name") == Some("client_encoding") && row.get("setting") == Some("'UTF8'")
+            }),
+            "SHOW ALL rows={show_all_rows:?}"
+        );
+
+        client
+            .batch_execute("RESET application_name")
+            .await
+            .expect("RESET name should succeed");
+        let reset_application_name = client
+            .simple_query("SHOW application_name")
+            .await
+            .expect("SHOW application_name should succeed after RESET");
+        let reset_application_name_row = reset_application_name
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW application_name row should exist after RESET");
+        assert_eq!(reset_application_name_row.get("application_name"), Some(""));
+
+        client
+            .batch_execute("RESET ALL")
+            .await
+            .expect("RESET ALL should succeed");
+        let reset_all_show = client
+            .simple_query("SHOW statement_timeout")
+            .await
+            .expect("SHOW statement_timeout should succeed after RESET ALL");
+        let reset_all_show_row = reset_all_show
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW statement_timeout row should exist after RESET ALL");
+        assert_eq!(reset_all_show_row.get("statement_timeout"), Some("0"));
+
+        let rows = client
+            .simple_query("SELECT 1 AS one")
+            .await
+            .expect("query should still succeed after SET/RESET sequence");
+        let row = rows
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("row should exist");
+        assert_eq!(row.get("one"), Some("1"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_rejects_unsupported_set_transaction_form() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let error = client
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .expect_err("SET TRANSACTION should remain unsupported without transaction semantics");
+        let text = error.to_string();
+        assert!(
+            text.to_ascii_lowercase().contains("db error")
+                || text.to_ascii_lowercase().contains("not implemented")
+                || text.to_ascii_lowercase().contains("unsupported"),
+            "unexpected error text: {text}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_show_search_path_tracks_set_and_reset() {
+        let catalog_path = temp_catalog_path("postgres-show-search-path");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(
+            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+        );
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .batch_execute("CREATE SCHEMA reporting")
+            .await
+            .expect("create schema should succeed");
+        client
+            .batch_execute("SET search_path TO \"$user\", reporting")
+            .await
+            .expect("SET search_path should succeed");
+
+        let show_search_path = client
+            .simple_query("SHOW search_path")
+            .await
+            .expect("SHOW search_path should succeed");
+        let show_search_path_row = show_search_path
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW search_path row should exist");
+        assert_eq!(
+            show_search_path_row.get("search_path"),
+            Some("$user, reporting")
+        );
+
+        client
+            .batch_execute("CREATE TABLE fact_metrics (metric BIGINT NOT NULL, status TEXT)")
+            .await
+            .expect("search_path should route create table into reporting");
+
+        client
+            .batch_execute("RESET search_path")
+            .await
+            .expect("RESET search_path should succeed");
+        let show_reset = client
+            .simple_query("SHOW search_path")
+            .await
+            .expect("SHOW search_path should succeed after RESET");
+        let show_reset_row = show_reset
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW search_path row should exist after RESET");
+        assert_eq!(show_reset_row.get("search_path"), Some("public"));
+
+        server.abort();
+        let _ = std::fs::remove_file(&catalog_path);
+        let _ = std::fs::remove_dir_all(format!(
+            "/tmp/{}.managed",
+            std::path::Path::new(&catalog_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .expect("catalog path should have stem")
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_exposes_expected_startup_parameter_status_values() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (_client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        assert_eq!(connection.parameter("client_encoding"), Some("UTF8"));
+        assert_eq!(connection.parameter("DateStyle"), Some("ISO, MDY"));
+        assert_eq!(connection.parameter("TimeZone"), Some("UTC"));
+        assert_eq!(
+            connection.parameter("default_transaction_isolation"),
+            Some("read committed")
+        );
+        assert_eq!(
+            connection.parameter("standard_conforming_strings"),
+            Some("on")
+        );
+        assert_eq!(connection.parameter("search_path"), Some("public"));
+        let server_version = connection
+            .parameter("server_version")
+            .expect("server_version ParameterStatus should be present");
+        assert_eq!(server_version, POSTGRES_SERVER_VERSION);
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_startup_parameter_status_includes_client_application_name() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (_client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres application_name=jdbc-probe",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        assert_eq!(connection.parameter("application_name"), Some("jdbc-probe"));
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_supports_common_jdbc_introspection_selects() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let version = client
+            .query_one("SELECT version()", &[])
+            .await
+            .expect("SELECT version() should succeed");
+        assert_eq!(version.get::<_, String>(0), POSTGRES_SERVER_VERSION);
+
+        let database = client
+            .query_one("SELECT current_database()", &[])
+            .await
+            .expect("SELECT current_database() should succeed");
+        assert_eq!(database.get::<_, String>(0), "postgres");
+
+        let schema = client
+            .query_one("SELECT current_schema()", &[])
+            .await
+            .expect("SELECT current_schema() should succeed");
+        assert_eq!(schema.get::<_, String>(0), "public");
+
+        let current_user = client
+            .query_one("SELECT current_user", &[])
+            .await
+            .expect("SELECT current_user should succeed");
+        assert_eq!(current_user.get::<_, String>(0), "postgres");
+
+        let session_user = client
+            .query_one("SELECT session_user", &[])
+            .await
+            .expect("SELECT session_user should succeed");
+        assert_eq!(session_user.get::<_, String>(0), "postgres");
+
+        let setting = client
+            .query_one(
+                "SELECT current_setting('search_path') AS active_search_path",
+                &[],
+            )
+            .await
+            .expect("SELECT current_setting should succeed");
+        assert_eq!(setting.get::<_, String>("active_search_path"), "public");
+
+        let isolation = client
+            .query_one("SELECT current_setting('transaction_isolation')", &[])
+            .await
+            .expect("SELECT current_setting(transaction_isolation) should succeed");
+        assert_eq!(isolation.get::<_, String>(0), "read committed");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_supports_transaction_isolation_show_and_session_characteristics_set() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let show_initial = client
+            .simple_query("SHOW transaction_isolation")
+            .await
+            .expect("SHOW transaction_isolation should succeed");
+        let show_initial_row = show_initial
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW transaction_isolation should return one row");
+        assert_eq!(
+            show_initial_row.get("transaction_isolation"),
+            Some("read committed")
+        );
+
+        client
+            .batch_execute(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            )
+            .await
+            .expect("SET SESSION CHARACTERISTICS should succeed");
+
+        let show_alias = client
+            .simple_query("SHOW TRANSACTION ISOLATION LEVEL")
+            .await
+            .expect("SHOW TRANSACTION ISOLATION LEVEL should succeed");
+        let show_alias_row = show_alias
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW TRANSACTION ISOLATION LEVEL should return one row");
+        assert_eq!(
+            show_alias_row.get("transaction_isolation"),
+            Some("serializable")
+        );
+
+        let current_setting = client
+            .query_one("SELECT current_setting('transaction_isolation')", &[])
+            .await
+            .expect("current_setting(transaction_isolation) should succeed");
+        assert_eq!(current_setting.get::<_, String>(0), "serializable");
+
+        client
+            .batch_execute("RESET transaction_isolation")
+            .await
+            .expect("RESET transaction_isolation should succeed");
+        let show_reset = client
+            .simple_query("SHOW transaction_isolation")
+            .await
+            .expect("SHOW transaction_isolation should succeed after RESET");
+        let show_reset_row = show_reset
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("SHOW transaction_isolation should return one row after RESET");
+        assert_eq!(
+            show_reset_row.get("transaction_isolation"),
+            Some("read committed")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_extended_query_keeps_parameter_markers_inside_string_literals() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=postgres",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await
+        .expect("postgres client should connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let statement = client
+            .prepare_typed(
+                "SELECT '$1' AS literal_value, $1 AS bound_value",
+                &[PgType::TEXT],
+            )
+            .await
+            .expect("statement should prepare");
+        let row = client
+            .query_one(&statement, &[&"value"])
+            .await
+            .expect("query should succeed");
+        assert_eq!(row.get::<_, String>("literal_value"), "$1");
+        assert_eq!(row.get::<_, String>("bound_value"), "value");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_rejects_unknown_user_during_startup_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let connect_result = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=missing_user dbname=postgres password=secret",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await;
+
+        let connect_error = match connect_result {
+            Ok(_) => panic!("unknown user should be rejected at startup auth"),
+            Err(error) => error,
+        };
+
+        let error_text = connect_error.to_string();
+        assert!(
+            error_text.to_ascii_lowercase().contains("db error")
+                && connect_error.as_db_error().is_some(),
+            "unexpected postgres auth failure text: {error_text}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_wire_rejects_wrong_password_during_startup_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+
+        let connect_result = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres dbname=postgres password=wrong-password",
+                addr.port()
+            ),
+            NoTls,
+        )
+        .await;
+
+        let connect_error = match connect_result {
+            Ok(_) => panic!("wrong password should be rejected at startup auth"),
+            Err(error) => error,
+        };
+
+        let error_text = connect_error.to_string();
+        assert!(
+            error_text.to_ascii_lowercase().contains("db error")
+                && connect_error.as_db_error().is_some(),
+            "unexpected postgres auth failure text: {error_text}"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
@@ -1488,5 +3660,274 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .expect("catalog path should have stem")
         ));
+    }
+
+    #[tokio::test]
+    async fn flight_sql_metadata_paths_include_reporting_namespace_tables_and_views() {
+        let catalog_path = temp_catalog_path("flight-catalog-metadata");
+        let engine = Arc::new(
+            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+        );
+
+        for sql in [
+            "CREATE SCHEMA reporting",
+            "CREATE TABLE reporting.fact_metrics (metric BIGINT NOT NULL, status TEXT)",
+            "CREATE VIEW reporting.daily_metrics AS SELECT metric, status FROM reporting.fact_metrics",
+        ] {
+            engine
+                .execute_query(&QueryRequest {
+                    sql: sql.to_string(),
+                    session: SessionContext {
+                        protocol: Protocol::Embedded,
+                        ..SessionContext::default()
+                    },
+                })
+                .expect("setup SQL should succeed");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+
+        let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
+            .expect("endpoint should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let mut client = FlightSqlServiceClient::new(channel);
+        client.set_header(FLIGHT_USER_HEADER, "postgres");
+        client.set_header(FLIGHT_DATABASE_HEADER, "postgres");
+        client.set_header(FLIGHT_SCHEMA_HEADER, "public");
+
+        let schemas_info = client
+            .get_db_schemas(CommandGetDbSchemas {
+                catalog: Some("postgres".to_string()),
+                db_schema_filter_pattern: None,
+            })
+            .await
+            .expect("get_db_schemas should succeed");
+        let schemas_ticket = schemas_info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("schemas ticket should exist");
+        let schema_batches = client
+            .do_get(schemas_ticket)
+            .await
+            .expect("do_get schemas should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("schema batches should collect");
+        let schema_rows = schema_batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(|row| {
+                    array_value_to_string(batch.column(1).as_ref(), row).expect("schema row value")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            schema_rows.iter().any(|schema| schema == "reporting"),
+            "schema rows={schema_rows:?}"
+        );
+
+        let tables_info = client
+            .get_tables(CommandGetTables {
+                catalog: Some("postgres".to_string()),
+                db_schema_filter_pattern: Some("reporting".to_string()),
+                table_name_filter_pattern: None,
+                table_types: vec!["TABLE".to_string(), "VIEW".to_string()],
+                include_schema: true,
+            })
+            .await
+            .expect("get_tables should succeed");
+        let tables_ticket = tables_info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("tables ticket should exist");
+        let table_batches = client
+            .do_get(tables_ticket)
+            .await
+            .expect("do_get tables should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("table batches should collect");
+
+        let mut found_table = false;
+        let mut found_view = false;
+        for batch in &table_batches {
+            for row in 0..batch.num_rows() {
+                let name =
+                    array_value_to_string(batch.column(2).as_ref(), row).expect("table name");
+                let kind =
+                    array_value_to_string(batch.column(3).as_ref(), row).expect("table kind");
+                if name == "fact_metrics" && kind == "TABLE" {
+                    found_table = true;
+                }
+                if name == "daily_metrics" && kind == "VIEW" {
+                    found_view = true;
+                }
+            }
+        }
+        assert!(
+            found_table,
+            "reporting.fact_metrics should be in get_tables output"
+        );
+        assert!(
+            found_view,
+            "reporting.daily_metrics should be in get_tables output"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(&catalog_path);
+        let _ = std::fs::remove_dir_all(format!(
+            "/tmp/{}.managed",
+            std::path::Path::new(&catalog_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .expect("catalog path should have stem")
+        ));
+    }
+
+    #[tokio::test]
+    async fn flight_sql_exposes_basic_sql_info_subset() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+
+        let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
+            .expect("endpoint should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let mut client = FlightSqlServiceClient::new(channel);
+        client.set_header(FLIGHT_USER_HEADER, "postgres");
+        client.set_header(FLIGHT_DATABASE_HEADER, "postgres");
+        client.set_header(FLIGHT_SCHEMA_HEADER, "public");
+
+        let info = client
+            .get_sql_info(vec![
+                SqlInfo::FlightSqlServerName,
+                SqlInfo::FlightSqlServerVersion,
+                SqlInfo::FlightSqlServerArrowVersion,
+            ])
+            .await
+            .expect("get_sql_info should succeed");
+        let ticket = info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("ticket should exist");
+        let batches = client
+            .do_get(ticket)
+            .await
+            .expect("do_get should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("batches should collect");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn flight_sql_handshake_returns_auth_payload_for_session_bootstrap() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should work");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+
+        let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
+            .expect("endpoint should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let mut client = FlightSqlServiceClient::new(channel);
+        client.set_header(FLIGHT_DATABASE_HEADER, "postgres");
+        client.set_header(FLIGHT_SCHEMA_HEADER, "public");
+
+        let payload = client
+            .handshake("postgres", "postgres")
+            .await
+            .expect("handshake should succeed");
+        let decision: AuthDecision =
+            serde_json::from_slice(&payload).expect("payload should decode to auth decision");
+
+        assert_eq!(decision.user, "postgres");
+        assert_eq!(decision.role, "postgres");
+        assert_eq!(decision.auth_method, "prototype-basic-auth");
+
+        server.abort();
+    }
+
+    #[test]
+    fn prototype_auth_hook_uses_requested_role_when_provided() {
+        let hook = PrototypeAllowAllAuthHook {
+            control_plane: Arc::new(ControlPlane::new_bootstrap()),
+        };
+        let decision = hook
+            .authenticate(&AuthRequest {
+                protocol: Protocol::ArrowFlightSql,
+                user: "postgres".to_string(),
+                database: "postgres".to_string(),
+                schema: "public".to_string(),
+                role: Some("analytics_reader".to_string()),
+                password: Some("postgres".to_string()),
+                auth_header: Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("postgres:postgres")
+                )),
+            })
+            .expect("auth should succeed");
+
+        assert_eq!(decision.role, "analytics_reader");
+        assert_eq!(decision.auth_method, "prototype-basic-auth");
+    }
+
+    #[test]
+    fn prototype_auth_hook_rejects_unknown_user_from_control_plane_lookup() {
+        let hook = PrototypeAllowAllAuthHook {
+            control_plane: Arc::new(ControlPlane::new_bootstrap()),
+        };
+        let error = hook
+            .authenticate(&AuthRequest {
+                protocol: Protocol::ArrowFlightSql,
+                user: "missing_user".to_string(),
+                database: "postgres".to_string(),
+                schema: "public".to_string(),
+                role: None,
+                password: Some("secret".to_string()),
+                auth_header: Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("missing_user:secret")
+                )),
+            })
+            .expect_err("unknown user should be rejected by auth hook");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert!(error.message().contains("Unknown user"));
+    }
+
+    #[test]
+    fn flight_prepared_statement_scaffold_parameter_conversion() {
+        // Verify scaffold utilities for parameter conversion are available
+        // (These will be used when full prepared statement binding is implemented)
+        use crate::flight_prepared_statement_scaffold::flight_sql_parameter_to_literal;
+
+        // Test NULL conversion
+        let null_result = flight_sql_parameter_to_literal(None, &pgwire::api::Type::INT4);
+        assert!(null_result.is_ok());
+        assert_eq!(null_result.unwrap(), "NULL");
     }
 }

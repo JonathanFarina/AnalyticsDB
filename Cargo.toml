@@ -19,6 +19,7 @@ version = "0.1.0"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 assert_cmd = "2.2.1"
+base64 = "0.22.1"
 bytes = "1.10.1"
 clap = { version = "4.6.1", features = ["derive"] }
 datafusion = "53.1.0"

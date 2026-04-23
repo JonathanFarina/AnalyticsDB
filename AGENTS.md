@@ -82,7 +82,7 @@ The repository now contains a real prototype foundation. Today that means:
 - a prototype single-process SQL execution path built on DataFusion
 - a protocol crate and prototype server binary for PostgreSQL wire and Arrow Flight SQL listeners
 - a CLI that can submit SQL in embedded mode and can also act as a PostgreSQL wire or Arrow Flight SQL client
-- a small metadata SQL subset for databases, schemas, and views
+- a small metadata SQL subset for databases, schemas, views, and prototype `ALTER USER ... PASSWORD ...` rotation
 - a managed-table prototype for `CREATE TABLE ... AS SELECT ...` backed by persisted column-oriented JSON snapshots
 - a managed-table prototype for explicit `CREATE TABLE (...)` definitions and `INSERT INTO ... VALUES ...` writes backed by the same persisted column-oriented JSON snapshots
 - persisted views that can be created through SQL and queried later through the CLI in embedded mode
@@ -105,8 +105,10 @@ Everything beyond that remains early-stage. In particular:
 - no benchmark claims are valid yet
 - no broad PostgreSQL compatibility claims are valid yet
 - no broad PostgreSQL extended query compatibility support exists yet
-- no PostgreSQL authentication or role-aware session management exists yet
-- no Flight SQL prepared statements, `SqlInfo`, or handshake-based auth exists yet
+- PostgreSQL startup and Flight SQL handshake now share a prototype auth-hook bootstrap with control-plane user lookup and bootstrap catalog passwords, but no production credential storage/rotation policy or full protocol auth coverage exists yet
+- prototype role-assumption checks now exist at session admission, but no full role/group authorization model exists yet
+- Flight SQL prepared statement scaffold exists (handler returns unimplemented) but full bind/execute/close protocol cycle is not yet complete
+- no broad Flight SQL `SqlInfo` coverage exists yet beyond the current basic prototype subset
 - no roles/groups implementation exists yet
 - no object-storage-backed production columnar managed-table storage exists yet
 

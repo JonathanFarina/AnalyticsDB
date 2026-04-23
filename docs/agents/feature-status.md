@@ -47,8 +47,8 @@ A feature is `Complete` only when all of the following are true:
 | Query routing by utilization | Prototype | routing logic with tests | load-aware routing proven under concurrency and node churn |
 | Single endpoint strategy | Prototype | entrypoint design and integration path | validated high-availability client behavior |
 | PostgreSQL wire protocol | Partial | startup/session bootstrap plus simple-query and parameterized extended-query tests | auth and compatibility suite for supported surface area |
-| Arrow Flight SQL protocol | Partial | statement query/update and metadata flow tests | metadata breadth, prepared statements, auth, and parity validation |
-| Protocol equivalence | Prototype | shared session and result model | proven parity for supported user-facing capabilities |
+| Arrow Flight SQL protocol | Partial | statement query/update and metadata flow tests | metadata breadth, prepared statements with full bind/execute/close cycle, auth, and parity validation |
+| Protocol equivalence | Partial | shared session/result contract plus CLI-driven PostgreSQL/Flight SQL parity tests for an explicit supported slice including result-shape, command-tag, and session-parameter reflection assertions | proven parity for supported user-facing capabilities beyond the current narrow slice |
 | SQL parser and analyzer | Partial | parser and semantic scaffold | documented PostgreSQL-compatibility coverage |
 | PostgreSQL syntax compatibility | Prototype | tested subset | explicit supported matrix and conformance coverage |
 | PostgreSQL built-in functions | Prototype | tested subset | compatibility evidence for supported function families |
@@ -95,9 +95,29 @@ A feature is `Complete` only when all of the following are true:
 - Control plane can persist managed table column metadata in JSON
 - Prototype engine can execute tested scalar SQL through the CLI in embedded mode
 - Prototype protocol crate can expose a tested PostgreSQL wire startup, simple-query path, and parameterized extended-query subset
+- Prototype protocol crate now includes tested PostgreSQL wire prototype session-setting compatibility for common `SET` / `RESET` / `SHOW` forms, including preserved `search_path` routing semantics, JDBC/libpq-style `extra_float_digits`, `SHOW ALL`, prototype `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`, and stored generic client parameters in both simple and extended query paths
+- Prototype protocol crate now includes tested PostgreSQL startup `ParameterStatus` coverage for common client-expected keys (`server_version`, `client_encoding`, `DateStyle`, `TimeZone`, `standard_conforming_strings`, `search_path`, `application_name`, and `default_transaction_isolation`)
+- Prototype protocol crate now includes tested PostgreSQL wire introspection-query shims for common JDBC probes (`SELECT version()`, `SELECT current_database()`, `SELECT current_schema()`, `SELECT current_user`, `SELECT session_user`, `SELECT current_setting('<name>')`)
+- Prototype protocol crate now includes tested PostgreSQL extended-query literal rendering that preserves parameter markers inside SQL string literals while still binding typed placeholders
+- Prototype protocol crate now includes tested PostgreSQL startup auth negative paths for unknown-user and wrong-password failures
 - Prototype protocol crate can expose a tested Flight SQL statement query/update path plus basic metadata listing
+- Prototype protocol crate now includes a shared prototype auth hook path used by PostgreSQL startup and Flight SQL handshake, with control-plane user lookup and role/auth-method metadata propagation into session context
+- CLI-driven tests now prove a narrow PostgreSQL/Flight SQL protocol-equivalent slice for non-parameterized SQL execution, requested schema routing, schema-scoped managed table/view workflows, cross-database metadata/DDL flows (`CREATE DATABASE`, `CREATE SCHEMA <database>.<schema>`, `SHOW DATABASES`, `SHOW SCHEMAS FROM <database>`, schema-qualified table create/insert/list), SQL metadata statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors through live listeners
+- CLI-driven tests now include a table-driven parity matrix over the current supported SQL surface that compares live PostgreSQL and Flight SQL user-visible success/error contracts
+- CLI-driven tests now include a capability-level drift guard that checks README-supported SQL subset statements against matrix-covered protocol parity capabilities
+- CLI-driven tests now include user-visible auth/session parity assertions for PostgreSQL and Flight SQL plus matched unknown-user auth failure behavior
+- CLI-driven tests now include a strict password matrix for valid and invalid credential outcomes across live PostgreSQL and Flight SQL listeners
+- CLI-driven tests now include password rotation behavior that invalidates old credentials and accepts rotated credentials across live PostgreSQL and Flight SQL listeners
+- CLI-driven tests now include strict `ALTER USER ... PASSWORD ...` error-contract parity checks for unknown users, empty passwords, malformed literals, and non-admin authorization failures across PostgreSQL and Flight SQL listeners
+- CLI-driven tests now include result-shape assertions (exact column names) for all metadata SQL statements (`SHOW DATABASES`, `SHOW SCHEMAS`, `SHOW TABLES`, `SHOW VIEWS`, `SHOW COLUMNS FROM`, `DESCRIBE`, `SELECT` scalar) through both PostgreSQL and Flight SQL wire protocols
+- CLI-driven tests now include command-tag / message consistency assertions confirming that DDL (`CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `CREATE VIEW`, `ALTER USER PASSWORD`) produces "Command completed. 0 row(s) affected." and DML INSERT produces "Command completed. N row(s) affected." identically across both wire protocols
+- CLI-driven tests now include session-parameter reflection assertions verifying that database, schema, user, role, and auth_method in the response session context match the startup parameters sent through both PostgreSQL wire startup and Flight SQL header handshake
+- CLI-driven tests now include an initial pg_catalog compatibility slice validating `pg_catalog.pg_tables`, `pg_catalog.pg_views`, `pg_catalog.pg_namespace`, `pg_catalog.pg_database`, and `pg_catalog.pg_roles` through both live protocol listeners, including tested projection/filter/order forms with equality + `IN` filters and mixed-direction multi-column `ORDER BY ASC|DESC` for the current constrained prototype subset
+- CLI-driven tests now include an initial `information_schema` compatibility slice validating `information_schema.schemata`, `information_schema.tables`, `information_schema.columns`, `information_schema.views`, `information_schema.table_constraints`, `information_schema.key_column_usage`, `information_schema.constraint_column_usage`, `information_schema.constraint_table_usage`, and `information_schema.referential_constraints` through both live protocol listeners, including tested projection/filter/order forms with equality + `IN` filters and mixed-direction multi-column `ORDER BY ASC|DESC` for the current constrained prototype subset
+- current information_schema constraint compatibility now includes deterministic prototype NOT NULL constraint rows in `table_constraints`, `constraint_column_usage`, and `constraint_table_usage` for managed-table NOT NULL columns, plus table-defined primary-key/foreign-key metadata rows in `key_column_usage` and `referential_constraints` for the current supported CREATE TABLE constraint subset
+- Protocol-crate integration tests now include Flight SQL metadata API coverage (`get_db_schemas`, `get_tables`) that validates schema/table/view discovery for the current pg_catalog compatibility setup
 - Prototype server binary can run PostgreSQL wire and Flight SQL listeners against the current engine
-- Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection
+- Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection and prototype `ALTER USER ... PASSWORD ...` rotation
 - Managed tables can be materialized from `CREATE TABLE ... AS SELECT ...` and queried from a later CLI process
 - Managed tables can also be defined with explicit column schemas and populated with `INSERT INTO ... VALUES ...` across later CLI processes
 - Managed table inserts support column-list insertion for the current tested embedded prototype subset
@@ -113,6 +133,9 @@ A feature is `Complete` only when all of the following are true:
 - No external table support yet
 - No deployment manifests yet
 - No broad PostgreSQL extended-query compatibility, auth, or conformance suite yet
-- No Flight SQL prepared statements, `SqlInfo`, or handshake auth yet
+- Flight SQL handshake scaffold now includes prototype credential and role-assumption validation through control-plane user lookup, bootstrap catalog passwords, and catalog password-rotation metadata, but no production credential management or full protocol auth coverage yet
+- Flight SQL prepared statement scaffold exists (get_flight_info_prepared_statement handler with unimplemented status) but full bind/execute/close cycle and CLI integration not yet complete
+- No broad Flight SQL `SqlInfo` coverage yet beyond the current basic prototype subset
+- No broad PostgreSQL/Flight SQL parity claim beyond the current explicitly tested slice
 
 Any agent claiming otherwise is wrong and must correct the tracker immediately.

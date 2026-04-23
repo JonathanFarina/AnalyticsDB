@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use futures::TryStreamExt;
+use serde::Deserialize;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
@@ -27,15 +28,23 @@ fn run() -> Result<()> {
 }
 
 fn run_query(options: QueryOptions) -> Result<()> {
+    let protocol = match options.protocol {
+        ClientProtocol::Embedded => Protocol::Embedded,
+        ClientProtocol::Postgres => Protocol::PostgreSql,
+        ClientProtocol::FlightSql => Protocol::ArrowFlightSql,
+    };
+    let role = options.role.clone().unwrap_or_else(|| options.user.clone());
     let session = SessionContext {
-        user: options.user,
+        user: options.user.clone(),
+        role,
         database: options.database,
         schema: options.schema,
-        protocol: match options.protocol {
-            ClientProtocol::Embedded => Protocol::Embedded,
-            ClientProtocol::Postgres => Protocol::PostgreSql,
-            ClientProtocol::FlightSql => Protocol::ArrowFlightSql,
+        auth_method: match protocol {
+            Protocol::Embedded => "embedded-prototype".to_string(),
+            Protocol::PostgreSql => "postgres-wire-startup".to_string(),
+            Protocol::ArrowFlightSql => "flight-sql-header".to_string(),
         },
+        protocol,
     };
 
     let response = match options.protocol {
@@ -50,13 +59,15 @@ fn run_query(options: QueryOptions) -> Result<()> {
             session,
             options.endpoint,
             options.params,
+            options.password,
         ))?,
-        ClientProtocol::FlightSql => {
-            if !options.params.is_empty() {
-                bail!("CLI parameters are not yet supported for Flight SQL mode");
-            }
-            run_async(run_flight_sql_query(options.sql, session, options.endpoint))?
-        }
+        ClientProtocol::FlightSql => run_async(run_flight_sql_query(
+            options.sql,
+            session,
+            options.endpoint,
+            options.params,
+            options.password,
+        ))?,
     };
 
     render_response(&response, options.format);
@@ -84,13 +95,17 @@ async fn run_postgres_query(
     session: SessionContext,
     endpoint: Option<String>,
     params: Vec<String>,
+    password: Option<String>,
 ) -> Result<QueryResponse> {
     let endpoint = endpoint.unwrap_or_else(|| "127.0.0.1:5432".to_string());
     let (host, port) = parse_postgres_endpoint(&endpoint)?;
-    let connection_string = format!(
+    let mut connection_string = format!(
         "host={host} port={port} user={} dbname={}",
         session.user, session.database
     );
+    if let Some(password) = password {
+        connection_string.push_str(&format!(" password={password}"));
+    }
 
     let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
         .await
@@ -116,15 +131,20 @@ async fn run_postgres_query(
 
     let started_at = Instant::now();
     let (columns, rows, _rows_affected, message) = if params.is_empty() {
+        let failure_context = if sql_returns_rows(&sql) {
+            "Remote query execution failed"
+        } else {
+            "Remote command execution failed"
+        };
         let messages = client
             .simple_query(&sql)
             .await
-            .with_context(|| "PostgreSQL wire query failed".to_string())?;
+            .with_context(|| failure_context.to_string())?;
         let (columns, rows, rows_affected) = simple_query_to_rows(messages);
-        let message = if rows.is_empty() {
-            format!("PostgreSQL wire command completed. {rows_affected} row(s) affected.")
+        let message = if columns.is_empty() {
+            command_completed_message(rows_affected)
         } else {
-            "PostgreSQL wire query completed.".to_string()
+            query_completed_message()
         };
         (columns, rows, rows_affected, message)
     } else {
@@ -133,7 +153,7 @@ async fn run_postgres_query(
             let rows = client
                 .query_typed(&sql, &params_to_postgres_typed_refs(&params))
                 .await
-                .with_context(|| "PostgreSQL extended query failed".to_string())?;
+                .with_context(|| "Remote query execution failed".to_string())?;
             (
                 rows.first()
                     .map(|row| {
@@ -153,23 +173,23 @@ async fn run_postgres_query(
                     })
                     .collect::<Result<Vec<_>>>()?,
                 0,
-                "PostgreSQL extended query completed.".to_string(),
+                query_completed_message(),
             )
         } else {
             let statement = client
                 .prepare_typed(&sql, &params_to_postgres_types(&params))
                 .await
-                .with_context(|| "PostgreSQL extended prepare failed".to_string())?;
+                .with_context(|| "Remote command preparation failed".to_string())?;
             let param_refs = params_to_postgres_refs(&params);
             let rows_affected = client
                 .execute(&statement, &param_refs)
                 .await
-                .with_context(|| "PostgreSQL extended execution failed".to_string())?;
+                .with_context(|| "Remote command execution failed".to_string())?;
             (
                 Vec::new(),
                 Vec::new(),
                 rows_affected,
-                format!("PostgreSQL extended command completed. {rows_affected} row(s) affected."),
+                command_completed_message(rows_affected),
             )
         }
     };
@@ -189,6 +209,8 @@ async fn run_flight_sql_query(
     sql: String,
     session: SessionContext,
     endpoint: Option<String>,
+    params: Vec<String>,
+    password: Option<String>,
 ) -> Result<QueryResponse> {
     let endpoint =
         normalize_flight_endpoint(endpoint.as_deref().unwrap_or("http://127.0.0.1:50051"));
@@ -200,48 +222,77 @@ async fn run_flight_sql_query(
 
     let mut client = FlightSqlServiceClient::new(channel);
     client.set_header("x-analyticsdb-user", session.user.clone());
+    client.set_header("x-analyticsdb-role", session.role.clone());
     client.set_header("x-analyticsdb-database", session.database.clone());
     client.set_header("x-analyticsdb-schema", session.schema.clone());
+    client.set_header("x-analyticsdb-auth-method", session.auth_method.clone());
+
+    let handshake_payload = client
+        .handshake(&session.user, password.as_deref().unwrap_or(""))
+        .await
+        .with_context(|| "Flight SQL handshake failed".to_string())?;
+    if !handshake_payload.is_empty() {
+        if let Ok(decision) = serde_json::from_slice::<HandshakeAuthDecision>(&handshake_payload) {
+            client.set_header("x-analyticsdb-user", decision.user);
+            client.set_header("x-analyticsdb-role", decision.role);
+            client.set_header("x-analyticsdb-auth-method", decision.auth_method);
+        }
+    }
 
     let started_at = Instant::now();
+
+    // For now, Flight SQL prepared statements are not yet exposed through the client API.
+    // Parameters would require prepare/bind/execute flow which is more complex.
+    if !params.is_empty() {
+        bail!("Flight SQL prepared statement binding through CLI is not yet fully integrated - consider using PostgreSQL protocol for parameterized queries");
+    }
+
     if sql_returns_rows(&sql) {
         let info = client
             .execute(sql, None)
             .await
-            .with_context(|| "Flight SQL statement execution failed".to_string())?;
+            .with_context(|| "Remote query execution failed".to_string())?;
         let ticket = info
             .endpoint
             .first()
             .and_then(|endpoint| endpoint.ticket.clone())
             .ok_or_else(|| anyhow!("Flight SQL server did not return a ticket"))?;
+        let fallback_columns = info
+            .try_decode_schema()
+            .with_context(|| "Flight SQL result schema could not be decoded".to_string())?
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
         let batches = client
             .do_get(ticket)
             .await
-            .with_context(|| "Flight SQL do_get failed".to_string())?
+            .with_context(|| "Remote result retrieval failed".to_string())?
             .try_collect::<Vec<_>>()
             .await
-            .with_context(|| "Flight SQL result stream could not be collected".to_string())?;
+            .with_context(|| "Remote result stream collection failed".to_string())?;
 
         query_response_from_batches(
             "unavailable-via-flight-sql".to_string(),
             "unavailable-via-flight-sql".to_string(),
             session,
             batches,
-            "Flight SQL query completed.".to_string(),
+            fallback_columns,
+            query_completed_message(),
             started_at.elapsed().as_millis(),
         )
     } else {
         let affected = client
             .execute_update(sql, None)
             .await
-            .with_context(|| "Flight SQL update execution failed".to_string())?;
+            .with_context(|| "Remote command execution failed".to_string())?;
         Ok(QueryResponse {
             query_id: "unavailable-via-flight-sql".to_string(),
             coordinator_node_id: "unavailable-via-flight-sql".to_string(),
             session,
             columns: Vec::new(),
             rows: Vec::new(),
-            message: format!("Flight SQL command completed. {affected} row(s) affected."),
+            message: command_completed_message(affected as u64),
             execution_time_ms: started_at.elapsed().as_millis(),
         })
     }
@@ -262,6 +313,7 @@ fn query_response_from_batches(
     coordinator_node_id: String,
     session: SessionContext,
     batches: Vec<RecordBatch>,
+    fallback_columns: Vec<String>,
     message: String,
     execution_time_ms: u128,
 ) -> Result<QueryResponse> {
@@ -275,7 +327,7 @@ fn query_response_from_batches(
                 .map(|field| field.name().to_string())
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or(fallback_columns);
 
     let mut rows = Vec::new();
     for batch in batches {
@@ -427,6 +479,14 @@ fn normalize_flight_endpoint(endpoint: &str) -> String {
     }
 }
 
+fn query_completed_message() -> String {
+    "Query executed successfully.".to_string()
+}
+
+fn command_completed_message(rows_affected: u64) -> String {
+    format!("Command completed. {rows_affected} row(s) affected.")
+}
+
 fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -533,6 +593,10 @@ struct QueryOptions {
     protocol: ClientProtocol,
     #[arg(long, default_value = "postgres")]
     database: String,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    password: Option<String>,
     #[arg(long, default_value = "public")]
     schema: String,
     #[arg(long, default_value = "postgres")]
@@ -543,6 +607,13 @@ struct QueryOptions {
     endpoint: Option<String>,
     #[arg(long = "param", action = clap::ArgAction::Append)]
     params: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandshakeAuthDecision {
+    user: String,
+    role: String,
+    auth_method: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

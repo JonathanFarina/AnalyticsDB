@@ -108,7 +108,14 @@ Current evidence:
 - startup/session bootstrap path is tested
 - simple-query execution is tested
 - parameterized extended-query execution is tested
+- PostgreSQL wire now includes tested JDBC-style introspection query shims for `version()`, `current_database()`, `current_schema()`, `current_user`, `session_user`, and `current_setting('<name>')`
+- PostgreSQL wire now includes tested prototype transaction-isolation session compatibility for `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`, `SHOW transaction_isolation` / `SHOW TRANSACTION ISOLATION LEVEL`, and startup `default_transaction_isolation` `ParameterStatus`
 - CLI-driven SQL tests now validate PostgreSQL wire execution against a live listener
+- CLI-driven paired tests now prove a narrow protocol-equivalent slice with Flight SQL for non-parameterized SQL execution, requested schema routing, schema-scoped and cross-database metadata/DDL SQL statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors
+- CLI-driven parity now also includes a broad table-driven matrix test over the current supported SQL surface for live PostgreSQL wire and Flight SQL listeners
+- CLI-driven parity pg_catalog metadata slice now covers `pg_tables`, `pg_views`, `pg_namespace`, `pg_database`, and `pg_roles` for the current constrained projection/filter/order subset
+- CLI-driven parity information_schema metadata slice now covers `schemata`, `tables`, `columns`, `views`, `table_constraints`, `key_column_usage`, `constraint_column_usage`, `constraint_table_usage`, and `referential_constraints` for the current constrained projection/filter/order subset
+- information_schema constraint parity now includes deterministic prototype NOT NULL rows in `table_constraints`, `constraint_column_usage`, and `constraint_table_usage`, plus table-defined primary-key/foreign-key rows in `key_column_usage` and `referential_constraints` for the current supported CREATE TABLE constraint subset
 
 Remaining gaps before this phase should be considered `Complete`:
 
@@ -138,13 +145,18 @@ Current evidence:
 - prototype Flight SQL listener exists
 - statement query and statement update flows are tested
 - catalogs, schemas, tables, and table-types metadata flows are implemented in the prototype
+- basic Flight SQL `SqlInfo` metadata responses are implemented and protocol-tested
 - CLI-driven SQL tests now validate Flight SQL execution against a live listener
+- CLI-driven paired tests now prove a narrow protocol-equivalent slice with PostgreSQL wire for non-parameterized SQL execution, requested schema routing, schema-scoped and cross-database metadata/DDL SQL statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors
+- CLI-driven parity now also includes a broad table-driven matrix test over the current supported SQL surface for live PostgreSQL wire and Flight SQL listeners
+- CLI-driven parity now also includes strict password matrix coverage for valid/invalid credential outcomes across PostgreSQL wire and Flight SQL
+- control-plane catalog user records now include prototype password-rotation metadata and tests proving rotated credentials invalidate prior passwords across both protocols
 
 Remaining gaps before this phase should be considered `Complete`:
 
 - no prepared statements
-- no `SqlInfo` support
-- no handshake-based auth
+- no broad `SqlInfo` coverage beyond a basic prototype subset
+- handshake-based auth scaffold now includes prototype control-plane credential lookup and role-assumption checks, but no production credential lifecycle or full protocol auth coverage
 - no broad parity proof against PostgreSQL surface
 
 ## Phase 5: Distributed Planning And Execution

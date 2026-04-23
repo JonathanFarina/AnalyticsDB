@@ -39,12 +39,23 @@ pub struct CatalogDatabase {
 pub struct CatalogUser {
     pub name: String,
     pub is_admin: bool,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_password_version")]
+    pub password_version: u64,
+    #[serde(default)]
+    pub password_rotated_at_epoch_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CatalogRelationKind {
     Table,
     View,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExternalStorageFormat {
+    Parquet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +66,27 @@ pub struct CatalogColumn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CatalogTableConstraintKind {
+    PrimaryKey,
+    ForeignKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogTableConstraint {
+    pub name: String,
+    pub kind: CatalogTableConstraintKind,
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub referenced_database: Option<String>,
+    #[serde(default)]
+    pub referenced_schema: Option<String>,
+    #[serde(default)]
+    pub referenced_table: Option<String>,
+    #[serde(default)]
+    pub referenced_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogRelation {
     pub database: String,
     pub schema: String,
@@ -62,7 +94,13 @@ pub struct CatalogRelation {
     pub kind: CatalogRelationKind,
     pub definition_sql: Option<String>,
     pub storage_path: Option<String>,
+    /// If set, this relation points to external storage rather than the
+    /// managed columnar JSON snapshot format.
+    #[serde(default)]
+    pub external_format: Option<ExternalStorageFormat>,
     pub columns: Vec<CatalogColumn>,
+    #[serde(default)]
+    pub constraints: Vec<CatalogTableConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +108,22 @@ pub struct TableColumnDefinition {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableConstraintDefinition {
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    ForeignKey {
+        name: Option<String>,
+        columns: Vec<String>,
+        referenced_database: Option<String>,
+        referenced_schema: Option<String>,
+        referenced_table: String,
+        referenced_columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +175,14 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
         columns: Vec<TableColumnDefinition>,
+        constraints: Vec<TableConstraintDefinition>,
+    },
+    CreateExternalTable {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        format: ExternalStorageFormat,
+        location: String,
     },
     InsertInto {
         database: Option<String>,
@@ -150,6 +212,52 @@ pub enum MetadataStatement {
         database: Option<String>,
         schema: Option<String>,
         name: String,
+    },
+    PgCatalogTables {
+        sql: String,
+    },
+    PgCatalogViews {
+        sql: String,
+    },
+    PgCatalogNamespace {
+        sql: String,
+    },
+    PgCatalogDatabase {
+        sql: String,
+    },
+    PgCatalogRoles {
+        sql: String,
+    },
+    InformationSchemaSchemata {
+        sql: String,
+    },
+    InformationSchemaTables {
+        sql: String,
+    },
+    InformationSchemaColumns {
+        sql: String,
+    },
+    InformationSchemaViews {
+        sql: String,
+    },
+    InformationSchemaTableConstraints {
+        sql: String,
+    },
+    InformationSchemaKeyColumnUsage {
+        sql: String,
+    },
+    InformationSchemaConstraintColumnUsage {
+        sql: String,
+    },
+    InformationSchemaConstraintTableUsage {
+        sql: String,
+    },
+    InformationSchemaReferentialConstraints {
+        sql: String,
+    },
+    AlterUserPassword {
+        name: String,
+        password: String,
     },
 }
 
@@ -203,14 +311,13 @@ impl ControlPlane {
     }
 
     pub fn validate_session(&self, session: &SessionContext) -> Result<()> {
+        let _ = self.catalog_user(&session.user)?;
+        self.authorize_role_assumption(&session.user, &session.role)?;
+
         let state = self
             .state
             .read()
             .expect("control plane lock should not poison");
-
-        if !state.users.contains_key(&session.user) {
-            bail!("Unknown user '{}'", session.user);
-        }
 
         let database = state
             .databases
@@ -222,6 +329,96 @@ impl ControlPlane {
         }
 
         Ok(())
+    }
+
+    pub fn validate_credentials(&self, user: &str, password: Option<&str>) -> Result<CatalogUser> {
+        let catalog_user = self.catalog_user(user)?;
+
+        if let Some(expected_password) = catalog_user.password.as_deref() {
+            let provided_password = password
+                .ok_or_else(|| anyhow::anyhow!("Missing credentials for user '{}'", user))?;
+            if provided_password != expected_password {
+                bail!("Invalid credentials for user '{}'", user);
+            }
+        }
+
+        Ok(catalog_user)
+    }
+
+    pub fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
+        let state = self
+            .state
+            .read()
+            .expect("control plane lock should not poison");
+
+        state
+            .users
+            .get(user)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))
+    }
+
+    pub fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .expect("control plane lock should not poison");
+
+        let user_entry = state
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+        if !state.users.contains_key(role) {
+            bail!("Unknown role '{}'", role);
+        }
+
+        if role != user && !user_entry.is_admin {
+            bail!(
+                "User '{}' is not allowed to assume role '{}' in the current prototype",
+                user,
+                role
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn rotate_user_password(
+        &self,
+        session: &SessionContext,
+        user: &str,
+        new_password: &str,
+    ) -> Result<String> {
+        self.validate_session(session)?;
+        if new_password.trim().is_empty() {
+            bail!("Password must not be empty in the current prototype");
+        }
+
+        let acting_user = self.catalog_user(&session.user)?;
+        if !acting_user.is_admin {
+            bail!(
+                "User '{}' is not allowed to rotate credentials in the current prototype",
+                session.user
+            );
+        }
+
+        {
+            let mut state = self
+                .state
+                .write()
+                .expect("control plane lock should not poison");
+            let catalog_user = state
+                .users
+                .get_mut(user)
+                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+
+            catalog_user.password = Some(new_password.to_string());
+            catalog_user.password_version = catalog_user.password_version.saturating_add(1);
+            catalog_user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
+        }
+
+        self.persist()?;
+        Ok(format!("Credentials rotated for user '{}'.", user))
     }
 
     pub fn execute_metadata_statement(
@@ -253,8 +450,12 @@ impl ControlPlane {
                     .map_or(session.schema.as_str(), String::as_str);
                 self.create_view(database_name, schema_name, name, definition_sql)
             }
+            MetadataStatement::AlterUserPassword { name, password } => {
+                self.rotate_user_password(session, name, password)
+            }
             MetadataStatement::CreateTableAs { .. }
             | MetadataStatement::CreateTable { .. }
+            | MetadataStatement::CreateExternalTable { .. }
             | MetadataStatement::InsertInto { .. } => {
                 bail!("Managed table DDL and DML should be handled by the engine persistence flow")
             }
@@ -263,7 +464,21 @@ impl ControlPlane {
             | MetadataStatement::ShowTables { .. }
             | MetadataStatement::ShowViews { .. }
             | MetadataStatement::ShowColumns { .. }
-            | MetadataStatement::DescribeRelation { .. } => {
+            | MetadataStatement::DescribeRelation { .. }
+            | MetadataStatement::PgCatalogTables { .. }
+            | MetadataStatement::PgCatalogViews { .. }
+            | MetadataStatement::PgCatalogNamespace { .. }
+            | MetadataStatement::PgCatalogDatabase { .. }
+            | MetadataStatement::PgCatalogRoles { .. }
+            | MetadataStatement::InformationSchemaSchemata { .. }
+            | MetadataStatement::InformationSchemaTables { .. }
+            | MetadataStatement::InformationSchemaColumns { .. }
+            | MetadataStatement::InformationSchemaViews { .. }
+            | MetadataStatement::InformationSchemaTableConstraints { .. }
+            | MetadataStatement::InformationSchemaKeyColumnUsage { .. }
+            | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
+            | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
+            | MetadataStatement::InformationSchemaReferentialConstraints { .. } => {
                 bail!("Listing statements should be handled through list metadata helpers")
             }
         }
@@ -500,7 +715,9 @@ impl ControlPlane {
                     kind: CatalogRelationKind::View,
                     definition_sql: Some(definition_sql.trim().to_string()),
                     storage_path: None,
+                    external_format: None,
                     columns: Vec::new(),
+                    constraints: Vec::new(),
                 },
             );
         }
@@ -548,6 +765,7 @@ impl ControlPlane {
         table_name: &str,
         storage_path: &Path,
         columns: Vec<CatalogColumn>,
+        constraints: Vec<CatalogTableConstraint>,
     ) -> Result<String> {
         self.validate_session(session)?;
         validate_identifier(table_name)?;
@@ -588,7 +806,9 @@ impl ControlPlane {
                     kind: CatalogRelationKind::Table,
                     definition_sql: None,
                     storage_path: Some(storage_path.to_string_lossy().into_owned()),
+                    external_format: None,
                     columns,
+                    constraints,
                 },
             );
         }
@@ -596,6 +816,68 @@ impl ControlPlane {
         self.persist()?;
         Ok(format!(
             "Table '{}.{}.{}' created successfully.",
+            database_name, schema_name, table_name
+        ))
+    }
+
+    pub fn register_external_table(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table_name: &str,
+        location: &str,
+        format: ExternalStorageFormat,
+    ) -> Result<String> {
+        self.validate_session(session)?;
+        validate_identifier(table_name)?;
+
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self
+                .state
+                .write()
+                .expect("control plane lock should not poison");
+            let database = state
+                .databases
+                .get(database_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
+
+            if !database.schemas.contains(schema_name) {
+                bail!("Unknown schema '{}.{}'", database_name, schema_name);
+            }
+
+            let relation_key = relation_key(database_name, schema_name, table_name);
+            if state.relations.contains_key(&relation_key) {
+                bail!(
+                    "Relation '{}.{}.{}' already exists",
+                    database_name,
+                    schema_name,
+                    table_name
+                );
+            }
+
+            state.relations.insert(
+                relation_key,
+                CatalogRelation {
+                    database: database_name.to_string(),
+                    schema: schema_name.to_string(),
+                    name: table_name.to_string(),
+                    kind: CatalogRelationKind::Table,
+                    definition_sql: None,
+                    storage_path: Some(location.to_string()),
+                    external_format: Some(format),
+                    columns: Vec::new(),
+                    constraints: Vec::new(),
+                },
+            );
+        }
+
+        self.persist()?;
+        Ok(format!(
+            "External table '{}.{}.{}' registered successfully.",
             database_name, schema_name, table_name
         ))
     }
@@ -666,6 +948,9 @@ fn bootstrap_state() -> CatalogState {
         CatalogUser {
             name: "postgres".to_string(),
             is_admin: true,
+            password: Some("postgres".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
         },
     );
     users.insert(
@@ -673,6 +958,19 @@ fn bootstrap_state() -> CatalogState {
         CatalogUser {
             name: "analyticsdb_admin".to_string(),
             is_admin: true,
+            password: Some("analyticsdb_admin".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+        },
+    );
+    users.insert(
+        "analytics_reader".to_string(),
+        CatalogUser {
+            name: "analytics_reader".to_string(),
+            is_admin: false,
+            password: Some("analytics_reader".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
         },
     );
 
@@ -749,6 +1047,17 @@ fn relation_key(database: &str, schema: &str, name: &str) -> String {
     format!("{database}.{schema}.{name}")
 }
 
+fn default_password_version() -> u64 {
+    0
+}
+
+fn current_epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_millis()
+}
+
 fn split_sql_top_level(input: &str, delimiter: char) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -802,43 +1111,139 @@ fn split_sql_top_level(input: &str, delimiter: char) -> Result<Vec<String>> {
     Ok(parts)
 }
 
-fn parse_table_columns(raw: &str) -> Result<Vec<TableColumnDefinition>> {
-    split_sql_top_level(raw, ',')?
-        .into_iter()
-        .map(|column| {
-            let tokens = column.split_whitespace().collect::<Vec<_>>();
-            if tokens.len() < 2 {
-                bail!(
-                    "Unsupported column definition '{}' in the current prototype",
-                    column
-                );
-            }
+fn parse_table_columns(
+    raw: &str,
+) -> Result<(Vec<TableColumnDefinition>, Vec<TableConstraintDefinition>)> {
+    let mut columns = Vec::new();
+    let mut constraints = Vec::new();
 
-            let nullable = !(tokens.len() >= 4
-                && tokens[tokens.len() - 2].eq_ignore_ascii_case("NOT")
-                && tokens[tokens.len() - 1].eq_ignore_ascii_case("NULL"));
+    for element in split_sql_top_level(raw, ',')? {
+        if let Some(constraint) = parse_table_constraint_definition(&element)? {
+            constraints.push(constraint);
+            continue;
+        }
+        columns.push(parse_table_column_definition(&element)?);
+    }
 
-            let data_type_end = if nullable {
-                tokens.len()
-            } else {
-                tokens.len() - 2
-            };
-            let data_type = tokens[1..data_type_end].join(" ");
+    Ok((columns, constraints))
+}
 
-            if data_type.is_empty() {
-                bail!(
-                    "Unsupported column definition '{}' in the current prototype",
-                    column
-                );
-            }
+fn parse_table_column_definition(column: &str) -> Result<TableColumnDefinition> {
+    let tokens = column.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        bail!(
+            "Unsupported column definition '{}' in the current prototype",
+            column
+        );
+    }
 
-            Ok(TableColumnDefinition {
-                name: tokens[0].to_string(),
-                data_type,
-                nullable,
-            })
-        })
-        .collect()
+    let nullable = !(tokens.len() >= 4
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("NOT")
+        && tokens[tokens.len() - 1].eq_ignore_ascii_case("NULL"));
+
+    let data_type_end = if nullable {
+        tokens.len()
+    } else {
+        tokens.len() - 2
+    };
+    let data_type = tokens[1..data_type_end].join(" ");
+
+    if data_type.is_empty() {
+        bail!(
+            "Unsupported column definition '{}' in the current prototype",
+            column
+        );
+    }
+
+    Ok(TableColumnDefinition {
+        name: tokens[0].to_string(),
+        data_type,
+        nullable,
+    })
+}
+
+fn parse_table_constraint_definition(raw: &str) -> Result<Option<TableConstraintDefinition>> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+
+    let (constraint_name, definition) = if upper.starts_with("CONSTRAINT ") {
+        let rest = trimmed["CONSTRAINT ".len()..].trim();
+        let (name, remainder) = rest.split_once(' ').ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported table constraint syntax '{}' in the current prototype",
+                raw
+            )
+        })?;
+        (Some(name.to_string()), remainder.trim())
+    } else {
+        (None, trimmed)
+    };
+
+    let definition_upper = definition.to_ascii_uppercase();
+    if definition_upper.starts_with("PRIMARY KEY") {
+        let open = definition.find('(').ok_or_else(|| {
+            anyhow::anyhow!("PRIMARY KEY constraint requires column list in '{}'.", raw)
+        })?;
+        let close = definition.rfind(')').ok_or_else(|| {
+            anyhow::anyhow!("PRIMARY KEY constraint requires closing ')' in '{}'.", raw)
+        })?;
+        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
+        if columns.is_empty() {
+            bail!(
+                "PRIMARY KEY constraint requires at least one column in '{}'.",
+                raw
+            );
+        }
+        return Ok(Some(TableConstraintDefinition::PrimaryKey {
+            name: constraint_name,
+            columns,
+        }));
+    }
+
+    if definition_upper.starts_with("FOREIGN KEY") {
+        let open = definition.find('(').ok_or_else(|| {
+            anyhow::anyhow!("FOREIGN KEY constraint requires column list in '{}'.", raw)
+        })?;
+        let close = definition.find(')').ok_or_else(|| {
+            anyhow::anyhow!("FOREIGN KEY constraint requires closing ')' in '{}'.", raw)
+        })?;
+        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
+        let after_columns = definition[close + 1..].trim();
+        let after_upper = after_columns.to_ascii_uppercase();
+        let references_prefix = "REFERENCES ";
+        if !after_upper.starts_with(references_prefix) {
+            bail!(
+                "FOREIGN KEY constraint requires REFERENCES clause in '{}'.",
+                raw
+            );
+        }
+        let ref_target_and_columns = after_columns[references_prefix.len()..].trim();
+        let ref_open = ref_target_and_columns.find('(').ok_or_else(|| {
+            anyhow::anyhow!(
+                "REFERENCES clause requires referenced column list in '{}'.",
+                raw
+            )
+        })?;
+        let ref_close = ref_target_and_columns.rfind(')').ok_or_else(|| {
+            anyhow::anyhow!("REFERENCES clause requires closing ')' in '{}'.", raw)
+        })?;
+        let ref_target = ref_target_and_columns[..ref_open].trim();
+        let referenced_columns =
+            split_sql_top_level(&ref_target_and_columns[ref_open + 1..ref_close], ',')?;
+        let (referenced_database, referenced_schema, referenced_table) =
+            parse_qualified_name(ref_target, None, None)?;
+
+        return Ok(Some(TableConstraintDefinition::ForeignKey {
+            name: constraint_name,
+            columns,
+            referenced_database,
+            referenced_schema,
+            referenced_table,
+            referenced_columns,
+        }));
+    }
+
+    Ok(None)
 }
 
 fn parse_insert_rows(raw: &str) -> Result<Vec<Vec<String>>> {
@@ -958,6 +1363,30 @@ fn parse_schema_scope(raw: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
+fn parse_sql_single_quoted_literal(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('\'') || !trimmed.ends_with('\'') || trimmed.len() < 2 {
+        bail!("Expected single-quoted SQL string literal, got '{}'.", raw);
+    }
+
+    let mut result = String::new();
+    let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if matches!(chars.peek(), Some('\'')) {
+                let _ = chars.next();
+                result.push('\'');
+            } else {
+                bail!("Unescaped quote in SQL string literal '{}'.", raw);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    Ok(result)
+}
+
 pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
@@ -965,6 +1394,84 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
 
     if tokens.is_empty() {
         return None;
+    }
+
+    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_TABLES") {
+        return Some(MetadataStatement::PgCatalogTables {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_VIEWS") {
+        return Some(MetadataStatement::PgCatalogViews {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_NAMESPACE") {
+        return Some(MetadataStatement::PgCatalogNamespace {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_DATABASE") {
+        return Some(MetadataStatement::PgCatalogDatabase {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_ROLES") {
+        return Some(MetadataStatement::PgCatalogRoles {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.SCHEMATA") {
+        return Some(MetadataStatement::InformationSchemaSchemata {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.TABLES") {
+        return Some(MetadataStatement::InformationSchemaTables {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.COLUMNS") {
+        return Some(MetadataStatement::InformationSchemaColumns {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.VIEWS") {
+        return Some(MetadataStatement::InformationSchemaViews {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS")
+    {
+        return Some(MetadataStatement::InformationSchemaTableConstraints {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE") {
+        return Some(MetadataStatement::InformationSchemaKeyColumnUsage {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ")
+        && upper.contains(" FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE")
+    {
+        return Some(MetadataStatement::InformationSchemaConstraintColumnUsage {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ")
+        && upper.contains(" FROM INFORMATION_SCHEMA.CONSTRAINT_TABLE_USAGE")
+    {
+        return Some(MetadataStatement::InformationSchemaConstraintTableUsage {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ")
+        && upper.contains(" FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS")
+    {
+        return Some(MetadataStatement::InformationSchemaReferentialConstraints {
+            sql: trimmed.to_string(),
+        });
     }
 
     if tokens.len() == 3
@@ -1012,6 +1519,40 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         });
     }
 
+    if upper.starts_with("CREATE EXTERNAL TABLE ") {
+        let remainder = trimmed["CREATE EXTERNAL TABLE ".len()..].trim();
+        let upper_remainder = remainder.to_ascii_uppercase();
+
+        // Expect: <name> STORED AS PARQUET LOCATION '<path>'
+        let stored_as_parquet = " STORED AS PARQUET ";
+        if let Some(stored_index) = upper_remainder.find(stored_as_parquet) {
+            let raw_name = remainder[..stored_index].trim();
+            let after_stored = &remainder[stored_index + stored_as_parquet.len()..];
+            let upper_after = after_stored.to_ascii_uppercase();
+
+            if let Some(loc_index) = upper_after.find("LOCATION ") {
+                let raw_location = after_stored[loc_index + "LOCATION ".len()..].trim();
+                let Ok(location) = parse_sql_single_quoted_literal(raw_location) else {
+                    return None;
+                };
+                let Ok((database, schema, name)) = parse_qualified_name(raw_name, None, None)
+                else {
+                    return None;
+                };
+
+                return Some(MetadataStatement::CreateExternalTable {
+                    database,
+                    schema,
+                    name,
+                    format: ExternalStorageFormat::Parquet,
+                    location,
+                });
+            }
+        }
+
+        return None;
+    }
+
     if upper.starts_with("CREATE TABLE ") {
         let remainder = trimmed["CREATE TABLE ".len()..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
@@ -1041,7 +1582,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         let Ok((database, schema, name)) = parse_qualified_name(raw_name, None, None) else {
             return None;
         };
-        let Ok(columns) = parse_table_columns(raw_columns) else {
+        let Ok((columns, constraints)) = parse_table_columns(raw_columns) else {
             return None;
         };
 
@@ -1050,6 +1591,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
             schema,
             name,
             columns,
+            constraints,
         });
     }
 
@@ -1175,6 +1717,25 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         });
     }
 
+    if upper.starts_with("ALTER USER ") {
+        let remainder = trimmed["ALTER USER ".len()..].trim();
+        let upper_remainder = remainder.to_ascii_uppercase();
+        let password_index = upper_remainder.find(" PASSWORD ")?;
+        let user_name = remainder[..password_index].trim();
+        if user_name.is_empty() {
+            return None;
+        }
+        let raw_password = remainder[password_index + " PASSWORD ".len()..].trim();
+        let Ok(password) = parse_sql_single_quoted_literal(raw_password) else {
+            return None;
+        };
+
+        return Some(MetadataStatement::AlterUserPassword {
+            name: user_name.to_string(),
+            password,
+        });
+    }
+
     None
 }
 
@@ -1187,7 +1748,7 @@ mod tests {
 
     use super::{
         parse_metadata_statement, CatalogRelationKind, ControlPlane, MetadataStatement, NodeRole,
-        QueryAdmission, TableColumnDefinition,
+        QueryAdmission, TableColumnDefinition, TableConstraintDefinition,
     };
 
     fn default_session() -> SessionContext {
@@ -1231,6 +1792,172 @@ mod tests {
             .expect_err("unknown database should fail");
 
         assert!(error.to_string().contains("Unknown database"));
+    }
+
+    #[test]
+    fn rejects_unknown_role_in_session_validation() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let mut session = default_session();
+        session.role = "missing_role".to_string();
+
+        let error = control_plane
+            .validate_session(&session)
+            .expect_err("unknown role should fail validation");
+
+        assert!(error.to_string().contains("Unknown role"));
+    }
+
+    #[test]
+    fn rejects_non_admin_role_assumption() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let mut session = default_session();
+        session.user = "analytics_reader".to_string();
+        session.role = "postgres".to_string();
+
+        let error = control_plane
+            .validate_session(&session)
+            .expect_err("non-admin user should not assume postgres role");
+
+        assert!(error.to_string().contains("is not allowed to assume role"));
+    }
+
+    #[test]
+    fn allows_admin_role_assumption() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let mut session = default_session();
+        session.user = "analyticsdb_admin".to_string();
+        session.role = "postgres".to_string();
+
+        control_plane
+            .validate_session(&session)
+            .expect("admin role assumption should be allowed");
+    }
+
+    #[test]
+    fn validates_credentials_with_unknown_user() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let error = control_plane
+            .validate_credentials("missing", Some("secret"))
+            .expect_err("unknown user must fail credentials validation");
+
+        assert!(error.to_string().contains("Unknown user"));
+    }
+
+    #[test]
+    fn validates_credentials_with_expected_bootstrap_password() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let user = control_plane
+            .validate_credentials("postgres", Some("postgres"))
+            .expect("postgres bootstrap password should be accepted");
+
+        assert_eq!(user.name, "postgres");
+    }
+
+    #[test]
+    fn rejects_invalid_bootstrap_password() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let error = control_plane
+            .validate_credentials("postgres", Some("wrong-password"))
+            .expect_err("wrong password should be rejected");
+
+        assert!(error.to_string().contains("Invalid credentials"));
+    }
+
+    #[test]
+    fn rejects_missing_password_for_passworded_bootstrap_user() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let error = control_plane
+            .validate_credentials("postgres", None)
+            .expect_err("missing password should be rejected");
+
+        assert!(error.to_string().contains("Missing credentials"));
+    }
+
+    #[test]
+    fn rotates_password_and_invalidates_previous_credentials() {
+        let path = temp_catalog_path("password-rotation");
+        let control_plane = ControlPlane::from_catalog_path(&path).expect("catalog should load");
+
+        let before = control_plane
+            .catalog_user("analytics_reader")
+            .expect("reader user should exist before rotation");
+        assert_eq!(before.password_version, 1);
+
+        let message = control_plane
+            .rotate_user_password(&default_session(), "analytics_reader", "reader-next")
+            .expect("password rotation should succeed");
+        assert!(message.contains("Credentials rotated"));
+
+        let stale = control_plane
+            .validate_credentials("analytics_reader", Some("analytics_reader"))
+            .expect_err("old password should be rejected after rotation");
+        assert!(stale.to_string().contains("Invalid credentials"));
+
+        let updated = control_plane
+            .validate_credentials("analytics_reader", Some("reader-next"))
+            .expect("new password should be accepted");
+        assert_eq!(updated.password_version, 2);
+        assert!(updated.password_rotated_at_epoch_ms.is_some());
+    }
+
+    #[test]
+    fn rejects_password_rotation_for_non_admin_user() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let mut session = default_session();
+        session.user = "analytics_reader".to_string();
+        session.role = "analytics_reader".to_string();
+
+        let error = control_plane
+            .rotate_user_password(&session, "postgres", "next")
+            .expect_err("non-admin should not rotate passwords");
+        assert!(error
+            .to_string()
+            .contains("not allowed to rotate credentials"));
+    }
+
+    #[test]
+    fn metadata_statement_alter_user_password_rotates_credentials() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let message = control_plane
+            .execute_metadata_statement(
+                &default_session(),
+                &MetadataStatement::AlterUserPassword {
+                    name: "analytics_reader".to_string(),
+                    password: "reader-sql-rotated".to_string(),
+                },
+            )
+            .expect("admin ALTER USER PASSWORD should succeed");
+        assert!(message.contains("Credentials rotated"));
+
+        let stale = control_plane
+            .validate_credentials("analytics_reader", Some("analytics_reader"))
+            .expect_err("old password should be invalidated");
+        assert!(stale.to_string().contains("Invalid credentials"));
+
+        control_plane
+            .validate_credentials("analytics_reader", Some("reader-sql-rotated"))
+            .expect("new rotated password should be accepted");
+    }
+
+    #[test]
+    fn metadata_statement_alter_user_password_rejects_non_admin_actor() {
+        let control_plane = ControlPlane::new_bootstrap();
+        let mut reader_session = default_session();
+        reader_session.user = "analytics_reader".to_string();
+        reader_session.role = "analytics_reader".to_string();
+
+        let error = control_plane
+            .execute_metadata_statement(
+                &reader_session,
+                &MetadataStatement::AlterUserPassword {
+                    name: "postgres".to_string(),
+                    password: "pwned".to_string(),
+                },
+            )
+            .expect_err("non-admin ALTER USER PASSWORD should fail");
+        assert!(error
+            .to_string()
+            .contains("not allowed to rotate credentials"));
     }
 
     #[test]
@@ -1284,8 +2011,6 @@ mod tests {
 
         assert!(databases.iter().any(|database| database == "analytics"));
         assert!(schemas.iter().any(|schema| schema == "reporting"));
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1319,8 +2044,6 @@ mod tests {
             view.name == "daily_metrics"
                 && view.definition_sql.as_deref() == Some("SELECT 7 AS metric")
         }));
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1381,7 +2104,37 @@ mod tests {
                         data_type: "TEXT".to_string(),
                         nullable: true,
                     }
-                ]
+                ],
+                constraints: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement(
+                "CREATE TABLE reporting.fact_events (metric_id BIGINT NOT NULL, CONSTRAINT fact_events_pkey PRIMARY KEY (metric_id), CONSTRAINT fact_events_metric_fk FOREIGN KEY (metric_id) REFERENCES reporting.fact_metrics(metric))"
+            ),
+            Some(MetadataStatement::CreateTable {
+                database: None,
+                schema: Some("reporting".to_string()),
+                name: "fact_events".to_string(),
+                columns: vec![TableColumnDefinition {
+                    name: "metric_id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                }],
+                constraints: vec![
+                    TableConstraintDefinition::PrimaryKey {
+                        name: Some("fact_events_pkey".to_string()),
+                        columns: vec!["metric_id".to_string()],
+                    },
+                    TableConstraintDefinition::ForeignKey {
+                        name: Some("fact_events_metric_fk".to_string()),
+                        columns: vec!["metric_id".to_string()],
+                        referenced_database: None,
+                        referenced_schema: Some("reporting".to_string()),
+                        referenced_table: "fact_metrics".to_string(),
+                        referenced_columns: vec!["metric".to_string()],
+                    },
+                ],
             })
         );
         assert_eq!(
@@ -1423,6 +2176,108 @@ mod tests {
             Some(MetadataStatement::ShowViews {
                 database: None,
                 schema: Some("reporting".to_string())
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("ALTER USER analytics_reader PASSWORD 'reader-next'"),
+            Some(MetadataStatement::AlterUserPassword {
+                name: "analytics_reader".to_string(),
+                password: "reader-next".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("ALTER USER analytics_reader PASSWORD 'reader''s next'"),
+            Some(MetadataStatement::AlterUserPassword {
+                name: "analytics_reader".to_string(),
+                password: "reader's next".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("ALTER USER analytics_reader PASSWORD reader-next"),
+            None
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM pg_catalog.pg_tables"),
+            Some(MetadataStatement::PgCatalogTables {
+                sql: "SELECT * FROM pg_catalog.pg_tables".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM pg_catalog.pg_views"),
+            Some(MetadataStatement::PgCatalogViews {
+                sql: "SELECT * FROM pg_catalog.pg_views".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM pg_catalog.pg_namespace"),
+            Some(MetadataStatement::PgCatalogNamespace {
+                sql: "SELECT * FROM pg_catalog.pg_namespace".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM pg_catalog.pg_database"),
+            Some(MetadataStatement::PgCatalogDatabase {
+                sql: "SELECT * FROM pg_catalog.pg_database".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM pg_catalog.pg_roles"),
+            Some(MetadataStatement::PgCatalogRoles {
+                sql: "SELECT * FROM pg_catalog.pg_roles".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.schemata"),
+            Some(MetadataStatement::InformationSchemaSchemata {
+                sql: "SELECT * FROM information_schema.schemata".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.tables"),
+            Some(MetadataStatement::InformationSchemaTables {
+                sql: "SELECT * FROM information_schema.tables".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.columns"),
+            Some(MetadataStatement::InformationSchemaColumns {
+                sql: "SELECT * FROM information_schema.columns".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.views"),
+            Some(MetadataStatement::InformationSchemaViews {
+                sql: "SELECT * FROM information_schema.views".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.table_constraints"),
+            Some(MetadataStatement::InformationSchemaTableConstraints {
+                sql: "SELECT * FROM information_schema.table_constraints".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.key_column_usage"),
+            Some(MetadataStatement::InformationSchemaKeyColumnUsage {
+                sql: "SELECT * FROM information_schema.key_column_usage".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.constraint_column_usage"),
+            Some(MetadataStatement::InformationSchemaConstraintColumnUsage {
+                sql: "SELECT * FROM information_schema.constraint_column_usage".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.constraint_table_usage"),
+            Some(MetadataStatement::InformationSchemaConstraintTableUsage {
+                sql: "SELECT * FROM information_schema.constraint_table_usage".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_metadata_statement("SELECT * FROM information_schema.referential_constraints"),
+            Some(MetadataStatement::InformationSchemaReferentialConstraints {
+                sql: "SELECT * FROM information_schema.referential_constraints".to_string(),
             })
         );
     }
