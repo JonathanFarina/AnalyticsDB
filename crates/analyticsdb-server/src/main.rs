@@ -17,7 +17,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let engine = Arc::new(if let Some(path) = cli.catalog_path.as_deref() {
-        PrototypeEngine::from_catalog_path(path)?
+        PrototypeEngine::from_catalog_path(path).await?
     } else {
         PrototypeEngine::new()?
     });

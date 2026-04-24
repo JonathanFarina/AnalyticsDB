@@ -7,11 +7,16 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 analyticsdb-core = { path = "../analyticsdb-core" }
 analyticsdb-control = { path = "../analyticsdb-control" }
 datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlparser = "0.61.0"
 tokio.workspace = true
 
 [dev-dependencies]

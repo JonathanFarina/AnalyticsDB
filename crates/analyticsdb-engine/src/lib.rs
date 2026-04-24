@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use analyticsdb_control::{
-    parse_metadata_statement, CatalogColumn, CatalogRelation, CatalogRelationKind,
+    parse_metadata_statement, CatalogColumn, CatalogRelationKind,
     CatalogTableConstraint, CatalogTableConstraintKind, ControlPlane, ExternalStorageFormat,
-    MetadataStatement, TableColumnDefinition, TableConstraintDefinition,
+    MetadataStatement, QueryAdmission, TableColumnDefinition, TableConstraintDefinition,
 };
 use analyticsdb_core::{QueryRequest, QueryResponse};
 use anyhow::Result;
@@ -17,10 +17,18 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::catalog::MemorySchemaProvider;
 use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
+
+pub mod functions;
+pub mod postgres_compatibility;
+pub mod sql_rewriter;
+pub mod system_catalog;
+
+use functions::register_postgres_functions;
+use system_catalog::PgCatalogSchemaProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedTableFile {
@@ -74,7 +82,20 @@ enum PersistedScalarValue {
 
 pub struct PrototypeEngine {
     control_plane: Arc<ControlPlane>,
-    runtime: Runtime,
+}
+
+impl std::fmt::Debug for PrototypeEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrototypeEngine")
+            .field("control_plane", &self.control_plane)
+            .finish()
+    }
+}
+
+impl Clone for PrototypeEngine {
+    fn clone(&self) -> Self {
+        self.clone_prototype()
+    }
 }
 
 pub struct QueryExecutionResult {
@@ -106,27 +127,75 @@ impl PrototypeEngine {
         Self::with_control_plane(Arc::new(ControlPlane::new_bootstrap()))
     }
 
-    pub fn from_catalog_path(path: &str) -> Result<Self> {
-        Self::with_control_plane(Arc::new(ControlPlane::from_catalog_path(path)?))
+    pub async fn from_catalog_path(path: &str) -> Result<Self> {
+        Self::with_control_plane(Arc::new(ControlPlane::from_catalog_path(path).await?))
     }
 
     pub fn with_control_plane(control_plane: Arc<ControlPlane>) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
+        Ok(Self { control_plane })
+    }
 
-        Ok(Self {
-            control_plane,
-            runtime,
-        })
+    pub fn clone_prototype(&self) -> Self {
+        Self {
+            control_plane: Arc::clone(&self.control_plane),
+        }
     }
 
     pub fn control_plane(&self) -> Arc<ControlPlane> {
         Arc::clone(&self.control_plane)
     }
 
-    pub fn execute_query(&self, request: &QueryRequest) -> Result<QueryResponse> {
-        let execution = self.execute_query_batches(request)?;
+    async fn create_session_context(
+        &self,
+        session: &analyticsdb_core::SessionContext,
+    ) -> Result<SessionContext> {
+        let mut config = SessionConfig::new();
+        config.options_mut().sql_parser.enable_ident_normalization = false;
+        config.options_mut().sql_parser.parse_float_as_decimal = true;
+        config.options_mut().optimizer.skip_failed_rules = true;
+
+        // Use the session's schema as the default for resolution.
+        let config = config
+            .set_str("datafusion.catalog.default_schema", &session.schema)
+            .with_extension(Arc::new(session.clone()));
+
+        let context = SessionContext::new_with_config(config);
+
+        context.add_analyzer_rule(Arc::new(postgres_compatibility::DuplicateColumnAlerter::new()));
+
+        register_postgres_functions(&context);
+
+        let default_catalog = context
+            .catalog("datafusion")
+            .expect("default catalog should exist");
+
+        // Always ensure public schema exists
+        if default_catalog.schema("public").is_none() {
+            default_catalog.register_schema("public", Arc::new(MemorySchemaProvider::new()))?;
+        }
+        
+        // Ensure all schemas in the database are registered in DataFusion
+        let schemas = self.control_plane.list_schemas(session, Some(&session.database)).await?;
+        for schema_name in schemas {
+            if default_catalog.schema(&schema_name).is_none() {
+                default_catalog.register_schema(&schema_name, Arc::new(MemorySchemaProvider::new()))?;
+            }
+        }
+
+        default_catalog.register_schema(
+            "pg_catalog",
+            Arc::new(PgCatalogSchemaProvider::new(Arc::clone(&self.control_plane))),
+        )?;
+
+        // Register relations for the entire database into their respective schemas in DataFusion
+        register_persisted_tables(&context, &self.control_plane, session).await?;
+        register_persisted_views(&context, &self.control_plane, session).await?;
+
+        Ok(context)
+    }
+
+    pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryResponse> {
+        let execution = self.execute_query_batches(request).await?;
         let columns = execution.columns();
         let rows = batches_to_rows(&execution.batches)?;
 
@@ -141,43 +210,49 @@ impl PrototypeEngine {
         })
     }
 
-    pub fn execute_query_batches(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
+    pub async fn execute_query_batches(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryExecutionResult> {
         let started = Instant::now();
-        let admission = self.control_plane.admit_query(&request.session)?;
+        let admission = self.control_plane.admit_query(&request.session).await?;
         if let Some(statement) = parse_metadata_statement(&request.sql) {
-            return self.execute_metadata_query(request, statement, admission, started);
+            return self
+                .execute_metadata_query(request, statement, admission, started)
+                .await;
         }
 
         let control_plane = Arc::clone(&self.control_plane);
-        let sql = request.sql.clone();
+        let sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
+            &request.sql,
+            &control_plane,
+            &request.session,
+        )
+        .await?;
         let session = request.session.clone();
 
-        self.runtime.block_on(async move {
-            let context = SessionContext::new();
-            register_persisted_tables(&context, &control_plane, &session).await?;
-            register_persisted_views(&context, &control_plane, &session).await?;
-            let dataframe = context.sql(&sql).await?;
-            let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
-            let batches = dataframe.collect().await?;
-            let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let context = self.create_session_context(&session).await?;
+        let dataframe = context.sql(&sql).await?;
+        let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
+        let batches = dataframe.collect().await?;
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-            Ok(QueryExecutionResult {
-                query_id: admission.query_id,
-                coordinator_node_id: admission.coordinator_node_id,
-                session,
-                schema,
-                batches,
-                message: format!("Query executed successfully. {row_count} row(s) returned."),
-                execution_time_ms: started.elapsed().as_millis(),
-            })
+        Ok(QueryExecutionResult {
+            query_id: admission.query_id,
+            coordinator_node_id: admission.coordinator_node_id,
+            session,
+            schema,
+            batches,
+            message: format!("Query executed successfully. {row_count} row(s) returned."),
+            execution_time_ms: started.elapsed().as_millis(),
         })
     }
 
-    fn execute_metadata_query(
+    async fn execute_metadata_query(
         &self,
         request: &QueryRequest,
         statement: MetadataStatement,
-        admission: analyticsdb_control::QueryAdmission,
+        admission: QueryAdmission,
         started: Instant,
     ) -> Result<QueryExecutionResult> {
         let session = request.session.clone();
@@ -185,12 +260,9 @@ impl PrototypeEngine {
         let (schema, batches, message) = match statement {
             MetadataStatement::CreateDatabase { .. }
             | MetadataStatement::CreateSchema { .. }
-            | MetadataStatement::CreateView { .. }
-            | MetadataStatement::PgCatalogTables { .. }
-            | MetadataStatement::PgCatalogViews { .. }
-            | MetadataStatement::PgCatalogNamespace { .. }
-            | MetadataStatement::PgCatalogDatabase { .. }
-            | MetadataStatement::PgCatalogRoles { .. }
+            | MetadataStatement::Begin
+            | MetadataStatement::Commit
+            | MetadataStatement::Rollback
             | MetadataStatement::InformationSchemaSchemata { .. }
             | MetadataStatement::InformationSchemaTables { .. }
             | MetadataStatement::InformationSchemaColumns { .. }
@@ -201,189 +273,6 @@ impl PrototypeEngine {
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
             | MetadataStatement::InformationSchemaReferentialConstraints { .. }
             | MetadataStatement::AlterUserPassword { .. } => match statement {
-                MetadataStatement::PgCatalogTables { sql } => {
-                    let columns = [
-                        "schemaname",
-                        "tablename",
-                        "tableowner",
-                        "tablespace",
-                        "hasindexes",
-                        "hasrules",
-                        "hastriggers",
-                        "rowsecurity",
-                    ];
-                    let rows = self
-                        .list_relations_for_current_database(
-                            &request.session,
-                            CatalogRelationKind::Table,
-                        )?
-                        .into_iter()
-                        .map(|relation| {
-                            vec![
-                                relation.schema,
-                                relation.name,
-                                "postgres".to_string(),
-                                String::new(),
-                                "false".to_string(),
-                                "false".to_string(),
-                                "false".to_string(),
-                                "false".to_string(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let (batch, row_count) =
-                        execute_pg_catalog_select(&sql, "pg_catalog.pg_tables", &columns, &rows)?;
-                    (
-                        batch.schema(),
-                        vec![batch],
-                        format!("{row_count} pg_catalog.pg_tables row(s) listed successfully."),
-                    )
-                }
-                MetadataStatement::PgCatalogViews { sql } => {
-                    let columns = ["schemaname", "viewname", "viewowner", "definition"];
-                    let rows = self
-                        .list_relations_for_current_database(
-                            &request.session,
-                            CatalogRelationKind::View,
-                        )?
-                        .into_iter()
-                        .map(|relation| {
-                            vec![
-                                relation.schema,
-                                relation.name,
-                                "postgres".to_string(),
-                                relation.definition_sql.unwrap_or_default(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let (batch, row_count) =
-                        execute_pg_catalog_select(&sql, "pg_catalog.pg_views", &columns, &rows)?;
-                    (
-                        batch.schema(),
-                        vec![batch],
-                        format!("{row_count} pg_catalog.pg_views row(s) listed successfully."),
-                    )
-                }
-                MetadataStatement::PgCatalogNamespace { sql } => {
-                    let columns = ["oid", "nspname", "nspowner", "nspacl"];
-                    let rows = self
-                        .control_plane
-                        .list_schemas(&request.session, Some(&request.session.database))?
-                        .into_iter()
-                        .map(|schema| {
-                            vec![
-                                synthetic_namespace_oid(&request.session.database, &schema)
-                                    .to_string(),
-                                schema,
-                                "postgres".to_string(),
-                                String::new(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let (batch, row_count) = execute_pg_catalog_select(
-                        &sql,
-                        "pg_catalog.pg_namespace",
-                        &columns,
-                        &rows,
-                    )?;
-                    (
-                        batch.schema(),
-                        vec![batch],
-                        format!("{row_count} pg_catalog.pg_namespace row(s) listed successfully."),
-                    )
-                }
-                MetadataStatement::PgCatalogDatabase { sql } => {
-                    let columns = [
-                        "oid",
-                        "datname",
-                        "datdba",
-                        "encoding",
-                        "datcollate",
-                        "datctype",
-                        "datistemplate",
-                        "datallowconn",
-                        "datconnlimit",
-                        "datlastsysoid",
-                        "datfrozenxid",
-                        "datminmxid",
-                        "dattablespace",
-                        "datacl",
-                    ];
-                    let rows = self
-                        .control_plane
-                        .list_databases(&request.session)?
-                        .into_iter()
-                        .map(|database| {
-                            vec![
-                                synthetic_database_oid(&database).to_string(),
-                                database,
-                                "10".to_string(),
-                                "6".to_string(),
-                                "C".to_string(),
-                                "C".to_string(),
-                                "false".to_string(),
-                                "true".to_string(),
-                                "-1".to_string(),
-                                "0".to_string(),
-                                "0".to_string(),
-                                "1".to_string(),
-                                "1663".to_string(),
-                                String::new(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let (batch, row_count) =
-                        execute_pg_catalog_select(&sql, "pg_catalog.pg_database", &columns, &rows)?;
-                    (
-                        batch.schema(),
-                        vec![batch],
-                        format!("{row_count} pg_catalog.pg_database row(s) listed successfully."),
-                    )
-                }
-                MetadataStatement::PgCatalogRoles { sql } => {
-                    let columns = [
-                        "oid",
-                        "rolname",
-                        "rolsuper",
-                        "rolinherit",
-                        "rolcreaterole",
-                        "rolcreatedb",
-                        "rolcanlogin",
-                        "rolreplication",
-                        "rolbypassrls",
-                        "rolconnlimit",
-                        "rolpassword",
-                        "rolvaliduntil",
-                    ];
-                    let mut users = self.control_plane.cluster_snapshot().users;
-                    users.sort_by(|left, right| left.name.cmp(&right.name));
-                    let rows = users
-                        .into_iter()
-                        .map(|user| {
-                            vec![
-                                synthetic_role_oid(&user.name).to_string(),
-                                user.name,
-                                user.is_admin.to_string(),
-                                "true".to_string(),
-                                user.is_admin.to_string(),
-                                user.is_admin.to_string(),
-                                "true".to_string(),
-                                "false".to_string(),
-                                "false".to_string(),
-                                "-1".to_string(),
-                                String::new(),
-                                String::new(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let (batch, row_count) =
-                        execute_pg_catalog_select(&sql, "pg_catalog.pg_roles", &columns, &rows)?;
-                    (
-                        batch.schema(),
-                        vec![batch],
-                        format!("{row_count} pg_catalog.pg_roles row(s) listed successfully."),
-                    )
-                }
                 MetadataStatement::InformationSchemaSchemata { sql } => {
                     let columns = [
                         "catalog_name",
@@ -394,7 +283,9 @@ impl PrototypeEngine {
                         "default_character_set_name",
                         "sql_path",
                     ];
-                    let rows = self.information_schema_schemata_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_schemata_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.schemata",
@@ -424,7 +315,9 @@ impl PrototypeEngine {
                         "is_typed",
                         "commit_action",
                     ];
-                    let rows = self.information_schema_tables_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_tables_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.tables",
@@ -456,7 +349,9 @@ impl PrototypeEngine {
                         "numeric_scale",
                         "datetime_precision",
                     ];
-                    let rows = self.information_schema_columns_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_columns_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.columns",
@@ -484,7 +379,7 @@ impl PrototypeEngine {
                         "is_trigger_deletable",
                         "is_trigger_insertable_into",
                     ];
-                    let rows = self.information_schema_views_rows(&request.session)?;
+                    let rows = self.information_schema_views_rows(&request.session).await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.views",
@@ -511,7 +406,9 @@ impl PrototypeEngine {
                         "enforced",
                         "nulls_distinct",
                     ];
-                    let rows = self.information_schema_table_constraints_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_table_constraints_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.table_constraints",
@@ -538,7 +435,9 @@ impl PrototypeEngine {
                         "ordinal_position",
                         "position_in_unique_constraint",
                     ];
-                    let rows = self.information_schema_key_column_usage_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_key_column_usage_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.key_column_usage",
@@ -563,8 +462,9 @@ impl PrototypeEngine {
                         "constraint_schema",
                         "constraint_name",
                     ];
-                    let rows =
-                        self.information_schema_constraint_column_usage_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_constraint_column_usage_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.constraint_column_usage",
@@ -588,8 +488,9 @@ impl PrototypeEngine {
                         "constraint_schema",
                         "constraint_name",
                     ];
-                    let rows =
-                        self.information_schema_constraint_table_usage_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_constraint_table_usage_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.constraint_table_usage",
@@ -616,8 +517,9 @@ impl PrototypeEngine {
                         "update_rule",
                         "delete_rule",
                     ];
-                    let rows =
-                        self.information_schema_referential_constraints_rows(&request.session)?;
+                    let rows = self
+                        .information_schema_referential_constraints_rows(&request.session)
+                        .await?;
                     let (batch, row_count) = execute_pg_catalog_select(
                         &sql,
                         "information_schema.referential_constraints",
@@ -635,10 +537,50 @@ impl PrototypeEngine {
                 _ => {
                     let message = self
                         .control_plane
-                        .execute_metadata_statement(&request.session, &statement)?;
+                        .execute_metadata_statement(&request.session, &statement)
+                        .await?;
                     (Arc::new(Schema::empty()), Vec::new(), message)
                 }
             },
+            MetadataStatement::CreateView {
+                database,
+                schema,
+                name,
+                definition_sql,
+            } => {
+                // Determine schema of the view query
+                let session = analyticsdb_core::SessionContext {
+                    database: database.clone().unwrap_or(request.session.database.clone()),
+                    schema: schema.clone().unwrap_or(request.session.schema.clone()),
+                    ..request.session.clone()
+                };
+                let query_sql = definition_sql.clone();
+                let target_schema_opt = schema.clone();
+                let columns = async move {
+                    // Use a context where the default schema is the target schema
+                    // This ensures unqualified names in the view SQL resolve correctly.
+                    let context = self.create_session_context(&session).await?;
+
+                    let dataframe = context.sql(&query_sql).await?;
+                    let arrow_schema = dataframe.schema().as_arrow().clone();
+                    Ok::<_, anyhow::Error>(catalog_columns_from_schema(&arrow_schema))
+                }
+                .await?;
+
+                let message = self
+                    .control_plane
+                    .register_view(
+                        &request.session,
+                        database.as_deref(),
+                        target_schema_opt.as_deref(),
+                        &name,
+                        &definition_sql,
+                        columns,
+                    )
+                    .await?;
+                (Arc::new(Schema::empty()), Vec::new(), message)
+            }
+
             MetadataStatement::CreateExternalTable {
                 database,
                 schema,
@@ -646,34 +588,40 @@ impl PrototypeEngine {
                 format,
                 location,
             } => {
-                let message = self.control_plane.register_external_table(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                    &location,
-                    format,
-                )?;
-
+                let message = self
+                    .control_plane
+                    .register_external_table(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                        &location,
+                        format,
+                    )
+                    .await?;
                 (Arc::new(Schema::empty()), Vec::new(), message)
             }
+
             MetadataStatement::CreateTableAs {
                 database,
                 schema,
                 name,
                 query_sql,
             } => {
-                let storage_path = self.control_plane.managed_table_storage_path(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                )?;
+                let storage_path = self
+                    .control_plane
+                    .managed_table_storage_path(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
 
                 let control_plane = Arc::clone(&self.control_plane);
                 let session = request.session.clone();
                 let storage_path_for_write = storage_path.clone();
-                let (row_count, columns_metadata) = self.runtime.block_on(async move {
+                let (row_count, columns_metadata) = async move {
                     let context = SessionContext::new();
                     register_persisted_tables(&context, &control_plane, &session).await?;
                     register_persisted_views(&context, &control_plane, &session).await?;
@@ -686,17 +634,21 @@ impl PrototypeEngine {
                         persist_table_snapshot(&storage_path_for_write, &arrow_schema, &batches)?;
 
                     Ok::<_, anyhow::Error>((row_count, columns_metadata))
-                })?;
+                }
+                .await?;
 
-                let created_message = self.control_plane.register_managed_table(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                    &storage_path,
-                    columns_metadata,
-                    Vec::new(),
-                )?;
+                let created_message = self
+                    .control_plane
+                    .register_managed_table(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                        &storage_path,
+                        columns_metadata,
+                        Vec::new(),
+                    )
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -711,31 +663,37 @@ impl PrototypeEngine {
                 columns,
                 constraints,
             } => {
-                let storage_path = self.control_plane.managed_table_storage_path(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                )?;
+                let storage_path = self
+                    .control_plane
+                    .managed_table_storage_path(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
                 let arrow_schema = build_arrow_schema_from_definitions(&columns)?;
 
                 persist_empty_table_snapshot(&storage_path, &arrow_schema)?;
 
-                let created_message = self.control_plane.register_managed_table(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                    &storage_path,
-                    catalog_columns_from_schema(&arrow_schema),
-                    catalog_constraints_from_definitions(
-                        &name,
+                let created_message = self
+                    .control_plane
+                    .register_managed_table(
+                        &request.session,
                         database.as_deref(),
                         schema.as_deref(),
-                        &request.session,
-                        &constraints,
-                    )?,
-                )?;
+                        &name,
+                        &storage_path,
+                        catalog_columns_from_schema(&arrow_schema),
+                        catalog_constraints_from_definitions(
+                            &name,
+                            database.as_deref(),
+                            schema.as_deref(),
+                            &request.session,
+                            &constraints,
+                        )?,
+                    )
+                    .await?;
 
                 (Arc::new(Schema::empty()), Vec::new(), created_message)
             }
@@ -746,12 +704,15 @@ impl PrototypeEngine {
                 columns,
                 rows,
             } => {
-                let relation = self.control_plane.table_relation(
-                    &request.session,
-                    database.as_deref(),
-                    schema.as_deref(),
-                    &name,
-                )?;
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
                 let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Managed table '{}.{}.{}' is missing a storage path",
@@ -778,7 +739,8 @@ impl PrototypeEngine {
             MetadataStatement::ShowDatabases => {
                 let rows = self
                     .control_plane
-                    .list_databases(&request.session)?
+                    .list_databases(&request.session)
+                    .await?
                     .into_iter()
                     .map(|database| vec![database])
                     .collect::<Vec<_>>();
@@ -793,7 +755,8 @@ impl PrototypeEngine {
             MetadataStatement::ShowSchemas { database } => {
                 let rows = self
                     .control_plane
-                    .list_schemas(&request.session, database.as_deref())?
+                    .list_schemas(&request.session, database.as_deref())
+                    .await?
                     .into_iter()
                     .map(|schema| vec![schema])
                     .collect::<Vec<_>>();
@@ -813,7 +776,8 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         CatalogRelationKind::Table,
-                    )?
+                    )
+                    .await?
                     .into_iter()
                     .map(|relation| vec![relation.name])
                     .collect::<Vec<_>>();
@@ -833,7 +797,8 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         CatalogRelationKind::View,
-                    )?
+                    )
+                    .await?
                     .into_iter()
                     .map(|relation| vec![relation.name])
                     .collect::<Vec<_>>();
@@ -862,7 +827,8 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         &name,
-                    )?
+                    )
+                    .await?
                     .into_iter()
                     .map(|column| {
                         vec![
@@ -897,22 +863,22 @@ impl PrototypeEngine {
         })
     }
 
-    pub fn list_databases(
+    pub async fn list_databases(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<String>> {
-        self.control_plane.list_databases(session)
+        self.control_plane.list_databases(session).await
     }
 
-    pub fn list_schemas(
+    pub async fn list_schemas(
         &self,
         session: &analyticsdb_core::SessionContext,
         database: Option<&str>,
     ) -> Result<Vec<String>> {
-        self.control_plane.list_schemas(session, database)
+        self.control_plane.list_schemas(session, database).await
     }
 
-    pub fn list_relations(
+    pub async fn list_relations(
         &self,
         session: &analyticsdb_core::SessionContext,
         database: Option<&str>,
@@ -921,59 +887,22 @@ impl PrototypeEngine {
     ) -> Result<Vec<analyticsdb_control::CatalogRelation>> {
         self.control_plane
             .list_relations(session, database, schema, kind)
+            .await
     }
 }
 
 impl PrototypeEngine {
-    fn list_relations_for_current_database(
-        &self,
-        session: &analyticsdb_core::SessionContext,
-        kind: CatalogRelationKind,
-    ) -> Result<Vec<CatalogRelation>> {
-        let mut rows = Vec::new();
-        let mut schemas = self
-            .control_plane
-            .list_schemas(session, Some(&session.database))?;
-        schemas.sort();
-
-        for schema in schemas {
-            rows.extend(self.control_plane.list_relations(
-                session,
-                Some(&session.database),
-                Some(&schema),
-                kind.clone(),
-            )?);
-        }
-
-        rows.sort_by(|left, right| {
-            (left.schema.as_str(), left.name.as_str())
-                .cmp(&(right.schema.as_str(), right.name.as_str()))
-        });
-
-        Ok(rows)
-    }
-
-    fn list_all_relations_for_current_database(
-        &self,
-        session: &analyticsdb_core::SessionContext,
-    ) -> Result<Vec<CatalogRelation>> {
-        let mut rows =
-            self.list_relations_for_current_database(session, CatalogRelationKind::Table)?;
-        rows.extend(self.list_relations_for_current_database(session, CatalogRelationKind::View)?);
-        rows.sort_by(|left, right| {
-            (left.schema.as_str(), left.name.as_str())
-                .cmp(&(right.schema.as_str(), right.name.as_str()))
-        });
-        Ok(rows)
-    }
-
-    fn information_schema_schemata_rows(
+    async fn information_schema_schemata_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
-        let mut schemas = self
-            .control_plane
-            .list_schemas(session, Some(&session.database))?;
+        let cluster = self.control_plane.cluster_snapshot().await;
+        let mut schemas = cluster
+            .databases
+            .iter()
+            .find(|db| db.name == session.database)
+            .map(|db| db.schemas.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         schemas.sort();
 
         Ok(schemas
@@ -992,12 +921,22 @@ impl PrototypeEngine {
             .collect())
     }
 
-    fn information_schema_tables_rows(
+    async fn information_schema_tables_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
-        Ok(self
-            .list_all_relations_for_current_database(session)?
+        let cluster = self.control_plane.cluster_snapshot().await;
+        let mut relations = cluster
+            .relations
+            .into_iter()
+            .filter(|relation| relation.database == session.database)
+            .collect::<Vec<_>>();
+        relations.sort_by(|left, right| {
+            (left.schema.as_str(), left.name.as_str())
+                .cmp(&(right.schema.as_str(), right.name.as_str()))
+        });
+
+        Ok(relations
             .into_iter()
             .map(|relation| {
                 let (table_type, is_insertable_into) = match relation.kind {
@@ -1022,12 +961,23 @@ impl PrototypeEngine {
             .collect())
     }
 
-    fn information_schema_columns_rows(
+    async fn information_schema_columns_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
+        let mut relations = cluster
+            .relations
+            .into_iter()
+            .filter(|relation| relation.database == session.database)
+            .collect::<Vec<_>>();
+        relations.sort_by(|left, right| {
+            (left.schema.as_str(), left.name.as_str())
+                .cmp(&(right.schema.as_str(), right.name.as_str()))
+        });
+
         let mut rows = Vec::new();
-        for relation in self.list_all_relations_for_current_database(session)? {
+        for relation in relations {
             rows.extend(relation.columns.iter().enumerate().map(|(index, column)| {
                 vec![
                     relation.database.clone(),
@@ -1054,12 +1004,18 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    fn information_schema_views_rows(
+    async fn information_schema_views_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
-        let mut views =
-            self.list_relations_for_current_database(session, CatalogRelationKind::View)?;
+        let cluster = self.control_plane.cluster_snapshot().await;
+        let mut views = cluster
+            .relations
+            .into_iter()
+            .filter(|relation| {
+                relation.kind == CatalogRelationKind::View && relation.database == session.database
+            })
+            .collect::<Vec<_>>();
         views.sort_by(|left, right| {
             (left.schema.as_str(), left.name.as_str())
                 .cmp(&(right.schema.as_str(), right.name.as_str()))
@@ -1084,12 +1040,13 @@ impl PrototypeEngine {
             .collect())
     }
 
-    fn information_schema_table_constraints_rows(
+    async fn information_schema_table_constraints_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
         Ok(self
-            .information_schema_constraints(session)?
+            .information_schema_constraints_snapshot(session, &cluster)?
             .into_iter()
             .map(|constraint| {
                 vec![
@@ -1109,12 +1066,13 @@ impl PrototypeEngine {
             .collect())
     }
 
-    fn information_schema_key_column_usage_rows(
+    async fn information_schema_key_column_usage_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
         let mut rows = Vec::new();
-        for constraint in self.information_schema_constraints(session)? {
+        for constraint in self.information_schema_constraints_snapshot(session, &cluster)? {
             if constraint.constraint_type != "PRIMARY KEY"
                 && constraint.constraint_type != "FOREIGN KEY"
             {
@@ -1141,12 +1099,13 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    fn information_schema_constraint_column_usage_rows(
+    async fn information_schema_constraint_column_usage_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
         let mut rows = Vec::new();
-        for constraint in self.information_schema_constraints(session)? {
+        for constraint in self.information_schema_constraints_snapshot(session, &cluster)? {
             for column_name in &constraint.columns {
                 rows.push(vec![
                     constraint.table_catalog.clone(),
@@ -1162,12 +1121,13 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    fn information_schema_constraint_table_usage_rows(
+    async fn information_schema_constraint_table_usage_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
         let mut rows = Vec::new();
-        for constraint in self.information_schema_constraints(session)? {
+        for constraint in self.information_schema_constraints_snapshot(session, &cluster)? {
             let (table_catalog, table_schema, table_name) =
                 if constraint.constraint_type == "FOREIGN KEY" {
                     (
@@ -1203,12 +1163,13 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    fn information_schema_referential_constraints_rows(
+    async fn information_schema_referential_constraints_rows(
         &self,
         session: &analyticsdb_core::SessionContext,
     ) -> Result<Vec<Vec<String>>> {
+        let cluster = self.control_plane.cluster_snapshot().await;
         Ok(self
-            .information_schema_constraints(session)?
+            .information_schema_constraints_snapshot(session, &cluster)?
             .into_iter()
             .filter(|constraint| constraint.constraint_type == "FOREIGN KEY")
             .map(|constraint| {
@@ -1242,14 +1203,25 @@ impl PrototypeEngine {
             .collect())
     }
 
-    fn information_schema_constraints(
+    fn information_schema_constraints_snapshot(
         &self,
         session: &analyticsdb_core::SessionContext,
+        cluster: &analyticsdb_control::ClusterSnapshot,
     ) -> Result<Vec<InformationSchemaConstraintRow>> {
         let mut constraints = Vec::new();
-        for relation in
-            self.list_relations_for_current_database(session, CatalogRelationKind::Table)?
-        {
+        let mut relations = cluster
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == CatalogRelationKind::Table && relation.database == session.database
+            })
+            .collect::<Vec<_>>();
+        relations.sort_by(|left, right| {
+            (left.schema.as_str(), left.name.as_str())
+                .cmp(&(right.schema.as_str(), right.name.as_str()))
+        });
+
+        for relation in relations {
             for column in &relation.columns {
                 if !column.nullable {
                     constraints.push(InformationSchemaConstraintRow {
@@ -1267,15 +1239,15 @@ impl PrototypeEngine {
                 }
             }
 
-            for relation_constraint in relation.constraints {
+            for relation_constraint in &relation.constraints {
                 match relation_constraint.kind {
                     CatalogTableConstraintKind::PrimaryKey => {
                         constraints.push(InformationSchemaConstraintRow {
                             table_catalog: relation.database.clone(),
                             table_schema: relation.schema.clone(),
                             table_name: relation.name.clone(),
-                            columns: relation_constraint.columns,
-                            constraint_name: relation_constraint.name,
+                            columns: relation_constraint.columns.clone(),
+                            constraint_name: relation_constraint.name.clone(),
                             constraint_type: "PRIMARY KEY".to_string(),
                             referenced_catalog: None,
                             referenced_schema: None,
@@ -1293,11 +1265,11 @@ impl PrototypeEngine {
                             table_catalog: relation.database.clone(),
                             table_schema: relation.schema.clone(),
                             table_name: relation.name.clone(),
-                            columns: relation_constraint.columns,
-                            constraint_name: relation_constraint.name,
+                            columns: relation_constraint.columns.clone(),
+                            constraint_name: relation_constraint.name.clone(),
                             constraint_type: "FOREIGN KEY".to_string(),
-                            referenced_catalog: relation_constraint.referenced_database,
-                            referenced_schema: relation_constraint.referenced_schema,
+                            referenced_catalog: relation_constraint.referenced_database.clone(),
+                            referenced_schema: relation_constraint.referenced_schema.clone(),
                             referenced_table,
                             referenced_unique_constraint_name,
                         });
@@ -1343,49 +1315,6 @@ fn normalize_information_schema_data_type(column: &CatalogColumn) -> String {
         "timestamp without time zone".to_string()
     } else {
         normalized
-    }
-}
-
-fn synthetic_namespace_oid(database: &str, schema: &str) -> u32 {
-    // Deterministic FNV-like hash for stable synthetic namespace IDs in the prototype.
-    let mut hash = 2166136261_u32;
-    for byte in database.bytes().chain([b'.']).chain(schema.bytes()) {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-
-    if hash < 16384 {
-        hash + 16384
-    } else {
-        hash
-    }
-}
-
-fn synthetic_database_oid(database: &str) -> u32 {
-    let mut hash = 2166136261_u32;
-    for byte in database.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-
-    if hash < 16384 {
-        hash + 16384
-    } else {
-        hash
-    }
-}
-
-fn synthetic_role_oid(role: &str) -> u32 {
-    let mut hash = 2166136261_u32;
-    for byte in role.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-
-    if hash < 16384 {
-        hash + 16384
-    } else {
-        hash
     }
 }
 
@@ -2266,7 +2195,10 @@ async fn register_persisted_tables(
     control_plane: &ControlPlane,
     session: &analyticsdb_core::SessionContext,
 ) -> Result<()> {
-    for table in control_plane.list_tables_for_session(session)? {
+    for table in control_plane
+        .list_relations_for_database(session, &session.database, CatalogRelationKind::Table)
+        .await?
+    {
         let Some(storage_path) = table.storage_path.as_deref() else {
             anyhow::bail!(
                 "Table '{}.{}.{}' is missing a storage path",
@@ -2276,16 +2208,25 @@ async fn register_persisted_tables(
             );
         };
 
-        match table.external_format {
-            Some(ExternalStorageFormat::Parquet) => {
-                context
-                    .register_parquet(&table.name, storage_path, Default::default())
-                    .await?;
+        // Always register with schema-qualified name to allow cross-schema joins.
+        // Also register with short name to support standard resolution.
+        let names = vec![table.name.clone(), format!("{}.{}", table.schema, table.name)];
+
+        for name in names {
+            if context.table_exist(&name)? {
+                continue;
             }
-            None => {
-                let batch = load_persisted_table_snapshot(Path::new(storage_path))?;
-                let provider = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-                context.register_table(table.name, Arc::new(provider))?;
+            match table.external_format {
+                Some(ExternalStorageFormat::Parquet) => {
+                    context
+                        .register_parquet(&name, storage_path, Default::default())
+                        .await?;
+                }
+                None => {
+                    let batch = load_persisted_table_snapshot(Path::new(storage_path))?;
+                    let provider = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+                    context.register_table(name, Arc::new(provider))?;
+                }
             }
         }
     }
@@ -2298,10 +2239,19 @@ async fn register_persisted_views(
     control_plane: &ControlPlane,
     session: &analyticsdb_core::SessionContext,
 ) -> Result<()> {
-    for view in control_plane.list_views_for_session(session)? {
+    for view in control_plane
+        .list_relations_for_database(session, &session.database, CatalogRelationKind::View)
+        .await?
+    {
         if let Some(definition_sql) = view.definition_sql.as_deref() {
-            let statement = format!("CREATE VIEW {} AS {}", view.name, definition_sql);
-            context.sql(&statement).await?.collect().await?;
+            // Always register both short name and schema-qualified name
+            let names = vec![view.name.clone(), format!("{}.{}", view.schema, view.name)];
+            for name in names {
+                if !context.table_exist(&name)? {
+                    let statement = format!("CREATE VIEW {} AS {}", name, definition_sql);
+                    context.sql(&statement).await?.collect().await?;
+                }
+            }
         }
     }
 
@@ -2361,8 +2311,8 @@ mod tests {
 
     use super::{PersistedStorageLayout, PrototypeEngine};
 
-    #[test]
-    fn executes_scalar_select() {
+    #[tokio::test]
+    async fn executes_scalar_select() {
         let engine = PrototypeEngine::new().expect("engine should initialize");
         let response = engine
             .execute_query(&QueryRequest {
@@ -2372,6 +2322,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("query should execute");
 
         assert!(response.query_id.starts_with("q-"));
@@ -2382,8 +2333,8 @@ mod tests {
         assert!(response.message.contains("1 row(s)"));
     }
 
-    #[test]
-    fn rejects_unknown_schema_before_execution() {
+    #[tokio::test]
+    async fn rejects_unknown_schema_before_execution() {
         let engine = PrototypeEngine::new().expect("engine should initialize");
         let error = engine
             .execute_query(&QueryRequest {
@@ -2394,13 +2345,14 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect_err("unknown schema should fail");
 
         assert!(error.to_string().contains("Unknown schema"));
     }
 
-    #[test]
-    fn executes_metadata_show_databases() {
+    #[tokio::test]
+    async fn executes_metadata_show_databases() {
         let engine = PrototypeEngine::new().expect("engine should initialize");
         let response = engine
             .execute_query(&QueryRequest {
@@ -2410,6 +2362,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("metadata query should execute");
 
         assert_eq!(response.columns, vec!["database_name"]);
@@ -2420,8 +2373,8 @@ mod tests {
         assert!(response.message.contains("database(s) listed"));
     }
 
-    #[test]
-    fn executes_metadata_alter_user_password() {
+    #[tokio::test]
+    async fn executes_metadata_alter_user_password() {
         let engine = PrototypeEngine::new().expect("engine should initialize");
 
         let response = engine
@@ -2432,21 +2385,24 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("alter user password should execute through metadata path");
         assert!(response.message.contains("Credentials rotated"));
 
         let control_plane = engine.control_plane();
         let stale = control_plane
             .validate_credentials("analytics_reader", Some("analytics_reader"))
+            .await
             .expect_err("old password should be invalidated after ALTER USER");
         assert!(stale.to_string().contains("Invalid credentials"));
         control_plane
             .validate_credentials("analytics_reader", Some("reader-v2"))
+            .await
             .expect("new password should be valid");
     }
 
-    #[test]
-    fn executes_persisted_view_query() {
+    #[tokio::test]
+    async fn executes_persisted_view_query() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2461,6 +2417,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2471,6 +2428,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("view creation should succeed");
 
         let reloaded = PrototypeEngine::from_catalog_path(
@@ -2478,6 +2436,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should reload");
 
         let response = reloaded
@@ -2488,6 +2447,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("persisted view should be queryable");
 
         assert_eq!(response.columns, vec!["metric"]);
@@ -2496,8 +2456,8 @@ mod tests {
         let _ = std::fs::remove_file(catalog_path);
     }
 
-    #[test]
-    fn executes_persisted_table_query() {
+    #[tokio::test]
+    async fn executes_persisted_table_query() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2512,6 +2472,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2522,6 +2483,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table creation should succeed");
 
         let reloaded = PrototypeEngine::from_catalog_path(
@@ -2529,6 +2491,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should reload");
 
         let response = reloaded
@@ -2539,6 +2502,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("persisted table should be queryable");
 
         assert_eq!(response.columns, vec!["metric", "status"]);
@@ -2558,8 +2522,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn creates_explicit_table_inserts_rows_and_queries_it() {
+    #[tokio::test]
+    async fn creates_explicit_table_inserts_rows_and_queries_it() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2574,6 +2538,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2585,6 +2550,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table definition should succeed");
 
         engine
@@ -2596,6 +2562,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("insert should succeed");
 
         let reloaded = PrototypeEngine::from_catalog_path(
@@ -2603,6 +2570,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should reload");
 
         let response = reloaded
@@ -2613,6 +2581,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("persisted inserted rows should be queryable");
 
         assert_eq!(response.columns, vec!["metric", "status", "is_hot"]);
@@ -2632,6 +2601,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("describe should succeed");
 
         assert!(describe.rows.iter().any(|row| {
@@ -2659,8 +2629,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn inserts_with_column_list_and_omitted_nullable_columns() {
+    #[tokio::test]
+    async fn inserts_with_column_list_and_omitted_nullable_columns() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2675,6 +2645,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2686,6 +2657,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table definition should succeed");
 
         engine
@@ -2697,6 +2669,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("insert should succeed");
 
         let response = engine
@@ -2707,6 +2680,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("query should succeed");
 
         assert_eq!(
@@ -2731,6 +2705,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("describe should succeed");
 
         assert!(describe.rows.iter().any(|row| {
@@ -2755,8 +2730,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn rejects_insert_with_wrong_column_count() {
+    #[tokio::test]
+    async fn rejects_insert_with_wrong_column_count() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2771,6 +2746,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2781,6 +2757,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table definition should succeed");
 
         let error = engine
@@ -2791,6 +2768,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect_err("insert should fail");
 
         assert!(error
@@ -2808,8 +2786,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn rejects_insert_when_not_null_column_is_omitted() {
+    #[tokio::test]
+    async fn rejects_insert_when_not_null_column_is_omitted() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2824,6 +2802,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2834,6 +2813,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table definition should succeed");
 
         let error = engine
@@ -2844,6 +2824,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect_err("insert should fail");
 
         assert!(error
@@ -2861,8 +2842,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn persists_managed_table_in_columnar_layout() {
+    #[tokio::test]
+    async fn persists_managed_table_in_columnar_layout() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2877,6 +2858,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2887,6 +2869,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table creation should succeed");
 
         let managed_dir = catalog_path.with_file_name(format!(
@@ -2916,8 +2899,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn describes_persisted_table_columns() {
+    #[tokio::test]
+    async fn describes_persisted_table_columns() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2932,6 +2915,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
 
         engine
@@ -2942,6 +2926,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table creation should succeed");
 
         let response = engine
@@ -2952,6 +2937,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("describe should succeed");
 
         assert_eq!(
@@ -2976,8 +2962,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
-    #[test]
-    fn exposes_pg_catalog_tables_views_and_namespace_rows() {
+    #[tokio::test]
+    async fn exposes_pg_catalog_tables_views_and_namespace_rows() {
         let catalog_path = {
             let mut path = std::env::temp_dir();
             path.push(format!(
@@ -2991,6 +2977,7 @@ mod tests {
                 .to_str()
                 .expect("temp catalog path should be valid utf-8"),
         )
+        .await
         .expect("engine should initialize");
         let session = SessionContext {
             protocol: Protocol::Embedded,
@@ -3002,12 +2989,14 @@ mod tests {
                 sql: "CREATE SCHEMA reporting".to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("schema creation should succeed");
         engine
             .execute_query(&QueryRequest {
                 sql: "CREATE SCHEMA alpha".to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("alpha schema creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3015,6 +3004,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("table creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3022,6 +3012,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("view creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3029,6 +3020,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("alpha table creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3036,6 +3028,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("alpha view creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3043,6 +3036,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("dim_metrics table creation should succeed");
         engine
             .execute_query(&QueryRequest {
@@ -3050,6 +3044,7 @@ mod tests {
                     .to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("fact_events table creation should succeed");
 
         let tables = engine
@@ -3057,6 +3052,7 @@ mod tests {
                 sql: "SELECT * FROM pg_catalog.pg_tables".to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("pg_tables query should succeed");
         assert_eq!(
             tables.columns,
@@ -3085,6 +3081,7 @@ mod tests {
                 sql: "SELECT * FROM pg_catalog.pg_views".to_string(),
                 session: session.clone(),
             })
+            .await
             .expect("pg_views query should succeed");
         assert_eq!(
             views.columns,
@@ -3104,6 +3101,7 @@ mod tests {
                 sql: "SELECT * FROM pg_catalog.pg_namespace".to_string(),
                 session,
             })
+            .await
             .expect("pg_namespace query should succeed");
         assert_eq!(
             namespaces.columns,
@@ -3134,6 +3132,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("pg_database query should succeed");
         assert_eq!(databases.columns, vec!["datname"]);
         assert_eq!(databases.rows, vec![vec!["postgres".to_string()]]);
@@ -3147,6 +3146,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("pg_roles query should succeed");
         assert_eq!(roles.columns, vec!["rolname"]);
         assert_eq!(
@@ -3166,6 +3166,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("filtered pg_tables query should succeed");
         assert_eq!(filtered_tables.columns, vec!["schemaname", "tablename"]);
         assert_eq!(
@@ -3186,6 +3187,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("filtered pg_namespace query should succeed");
         assert_eq!(filtered_namespace.columns, vec!["nspname"]);
         assert_eq!(filtered_namespace.rows, vec![vec!["reporting".to_string()]]);
@@ -3199,6 +3201,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("IN-filtered pg_tables query should succeed");
         assert_eq!(in_filtered_tables.columns, vec!["schemaname", "tablename"]);
         assert_eq!(
@@ -3220,6 +3223,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("IN-filtered pg_views query should succeed");
         assert_eq!(in_filtered_views.columns, vec!["schemaname", "viewname"]);
         assert_eq!(
@@ -3239,6 +3243,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("DESC pg_tables query should succeed");
         assert_eq!(
             desc_tables.rows,
@@ -3259,6 +3264,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("DESC pg_views query should succeed");
         assert_eq!(
             desc_views.rows,
@@ -3277,6 +3283,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("DESC pg_namespace query should succeed");
         assert_eq!(
             desc_namespace.rows,
@@ -3296,6 +3303,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.schemata query should succeed");
         assert_eq!(info_schemata.columns, vec!["schema_name"]);
         assert!(info_schemata
@@ -3312,6 +3320,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.tables query should succeed");
         assert_eq!(
             info_tables.rows,
@@ -3358,6 +3367,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.columns query should succeed");
         assert_eq!(
             info_columns.rows,
@@ -3390,6 +3400,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.views query should succeed");
         assert_eq!(
             info_views.rows,
@@ -3416,6 +3427,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.table_constraints query should succeed");
         assert_eq!(
             info_constraints.rows,
@@ -3458,6 +3470,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.key_column_usage query should succeed");
         assert_eq!(
             info_key_usage.rows,
@@ -3484,6 +3497,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.constraint_column_usage query should succeed");
         assert_eq!(
             info_constraint_column_usage.columns,
@@ -3530,6 +3544,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.constraint_table_usage query should succeed");
         assert_eq!(
             info_constraint_table_usage.columns,
@@ -3573,6 +3588,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("information_schema.referential_constraints query should succeed");
         assert_eq!(
             info_referential_constraints.rows,

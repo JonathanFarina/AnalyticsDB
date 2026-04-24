@@ -10,4 +10,5 @@ analyticsdb-core = { path = "../analyticsdb-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "fs"] }
 uuid.workspace = true

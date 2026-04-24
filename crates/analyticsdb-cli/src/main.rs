@@ -12,22 +12,23 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("ERROR: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Query(options) => run_query(options),
+        Commands::Query(options) => run_query(options).await,
     }
 }
 
-fn run_query(options: QueryOptions) -> Result<()> {
+async fn run_query(options: QueryOptions) -> Result<()> {
     let protocol = match options.protocol {
         ClientProtocol::Embedded => Protocol::Embedded,
         ClientProtocol::Postgres => Protocol::PostgreSql,
@@ -52,22 +53,28 @@ fn run_query(options: QueryOptions) -> Result<()> {
             if !options.params.is_empty() {
                 bail!("CLI parameters are currently only supported for PostgreSQL protocol mode");
             }
-            run_embedded_query(options.sql, session, options.catalog_path)?
+            run_embedded_query(options.sql, session, options.catalog_path).await?
         }
-        ClientProtocol::Postgres => run_async(run_postgres_query(
-            options.sql,
-            session,
-            options.endpoint,
-            options.params,
-            options.password,
-        ))?,
-        ClientProtocol::FlightSql => run_async(run_flight_sql_query(
-            options.sql,
-            session,
-            options.endpoint,
-            options.params,
-            options.password,
-        ))?,
+        ClientProtocol::Postgres => {
+            run_postgres_query(
+                options.sql,
+                session,
+                options.endpoint,
+                options.params,
+                options.password,
+            )
+            .await?
+        }
+        ClientProtocol::FlightSql => {
+            run_flight_sql_query(
+                options.sql,
+                session,
+                options.endpoint,
+                options.params,
+                options.password,
+            )
+            .await?
+        }
     };
 
     render_response(&response, options.format);
@@ -75,19 +82,19 @@ fn run_query(options: QueryOptions) -> Result<()> {
     Ok(())
 }
 
-fn run_embedded_query(
+async fn run_embedded_query(
     sql: String,
     session: SessionContext,
     catalog_path: Option<String>,
 ) -> Result<QueryResponse> {
     let request = QueryRequest { sql, session };
     let engine = if let Some(path) = catalog_path {
-        PrototypeEngine::from_catalog_path(&path)?
+        PrototypeEngine::from_catalog_path(&path).await?
     } else {
         PrototypeEngine::new()?
     };
 
-    engine.execute_query(&request)
+    engine.execute_query(&request).await
 }
 
 async fn run_postgres_query(
@@ -296,16 +303,6 @@ async fn run_flight_sql_query(
             execution_time_ms: started_at.elapsed().as_millis(),
         })
     }
-}
-
-fn run_async<F, T>(future: F) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(future)
 }
 
 fn query_response_from_batches(

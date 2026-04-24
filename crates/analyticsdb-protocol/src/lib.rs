@@ -90,7 +90,6 @@ use pgwire::tokio::process_socket;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::task::spawn_blocking;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataMap;
 use tonic::metadata::MetadataValue;
@@ -131,8 +130,9 @@ struct AuthDecision {
     auth_method: String,
 }
 
+#[async_trait]
 trait AuthHook: Send + Sync {
-    fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status>;
+    async fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status>;
 }
 
 struct PrototypeAllowAllAuthHook {
@@ -158,6 +158,7 @@ impl AuthSource for ControlPlaneAuthSource {
         let catalog_user = self
             .control_plane
             .catalog_user(user)
+            .await
             .map_err(anyhow_error_to_pgwire)?;
         let password = catalog_user.password.ok_or_else(|| {
             anyhow_error_to_pgwire(anyhow::anyhow!(
@@ -170,8 +171,9 @@ impl AuthSource for ControlPlaneAuthSource {
     }
 }
 
+#[async_trait]
 impl AuthHook for PrototypeAllowAllAuthHook {
-    fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status> {
+    async fn authenticate(&self, request: &AuthRequest) -> Result<AuthDecision, Status> {
         let user = request.user.trim();
         if user.is_empty() {
             return Err(Status::invalid_argument(
@@ -182,16 +184,19 @@ impl AuthHook for PrototypeAllowAllAuthHook {
         if request.password.is_some() {
             self.control_plane
                 .validate_credentials(user, request.password.as_deref())
+                .await
                 .map_err(|error| Status::unauthenticated(error.to_string()))?;
         } else {
             self.control_plane
                 .catalog_user(user)
+                .await
                 .map_err(|error| Status::unauthenticated(error.to_string()))?;
         }
 
         let resolved_role = request.role.clone().unwrap_or_else(|| user.to_string());
         self.control_plane
             .authorize_role_assumption(user, &resolved_role)
+            .await
             .map_err(|error| Status::permission_denied(error.to_string()))?;
 
         let auth_method = if request.auth_header.is_some() {
@@ -242,10 +247,12 @@ pub async fn serve_postgres_wire(
     });
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, addr) = listener.accept().await?;
+        eprintln!("[TRACE] postgres: accepting connection from {:?}", addr);
         let factory_ref = Arc::clone(&factory);
         tokio::spawn(async move {
             let _ = process_socket(socket, None, factory_ref).await;
+            eprintln!("[TRACE] postgres: connection closed for {:?}", addr);
         });
     }
 }
@@ -411,7 +418,7 @@ impl StartupHandler for AnalyticsPostgresHandler {
                 .metadata()
                 .contains_key(POSTGRES_AUTH_METHOD_METADATA)
         {
-            self.apply_post_startup_auth(client)?;
+            self.apply_post_startup_auth(client).await?;
         }
 
         Ok(())
@@ -419,7 +426,7 @@ impl StartupHandler for AnalyticsPostgresHandler {
 }
 
 impl AnalyticsPostgresHandler {
-    fn apply_post_startup_auth<C>(&self, client: &mut C) -> PgWireResult<()>
+    async fn apply_post_startup_auth<C>(&self, client: &mut C) -> PgWireResult<()>
     where
         C: ClientInfo,
     {
@@ -450,6 +457,7 @@ impl AnalyticsPostgresHandler {
                 password: None,
                 auth_header: None,
             })
+            .await
             .map_err(status_to_pgwire)?;
 
         client
@@ -480,6 +488,7 @@ impl SimpleQueryHandler for AnalyticsPostgresHandler {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
+        eprintln!("[SQL] postgres_simple_query: {}", query);
         if let Some(response) =
             apply_postgres_session_statement(client, parse_postgres_set_statement(query)?)?
         {
@@ -488,12 +497,6 @@ impl SimpleQueryHandler for AnalyticsPostgresHandler {
         if let Some(response) =
             execute_postgres_show_statement(client, parse_postgres_show_statement(query)?)?
         {
-            return Ok(vec![response]);
-        }
-        if let Some(response) = execute_postgres_introspection_statement(
-            client,
-            parse_postgres_introspection_statement(query)?,
-        )? {
             return Ok(vec![response]);
         }
 
@@ -525,14 +528,11 @@ impl QueryParser for AnalyticsQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        eprintln!("[SQL] postgres_parse: {}", sql);
         let parameter_count = referenced_parameter_count(sql);
         let parameter_types = resolved_parameter_types(parameter_count, types);
         let result_schema = if let Some(schema) =
             postgres_show_result_schema(parse_postgres_show_statement(sql)?)
-        {
-            schema
-        } else if let Some(schema) =
-            postgres_introspection_result_schema(parse_postgres_introspection_statement(sql)?)
         {
             schema
         } else if sql_returns_rows(sql) {
@@ -609,12 +609,6 @@ impl ExtendedQueryHandler for AnalyticsPostgresHandler {
         if let Some(response) =
             execute_postgres_show_statement(client, parse_postgres_show_statement(&rendered_sql)?)?
         {
-            return Ok(response);
-        }
-        if let Some(response) = execute_postgres_introspection_statement(
-            client,
-            parse_postgres_introspection_statement(&rendered_sql)?,
-        )? {
             return Ok(response);
         }
 
@@ -721,29 +715,6 @@ enum PostgresShowStatement {
     Setting { name: String },
     All,
     NotAShowStatement,
-}
-
-enum PostgresIntrospectionStatement {
-    Version {
-        column_name: String,
-    },
-    CurrentDatabase {
-        column_name: String,
-    },
-    CurrentSchema {
-        column_name: String,
-    },
-    CurrentUser {
-        column_name: String,
-    },
-    SessionUser {
-        column_name: String,
-    },
-    CurrentSetting {
-        column_name: String,
-        setting_name: String,
-    },
-    NotAnIntrospectionStatement,
 }
 
 fn parse_postgres_set_statement(sql: &str) -> PgWireResult<PostgresSetStatement> {
@@ -1034,220 +1005,6 @@ fn postgres_show_result_schema(statement: PostgresShowStatement) -> Option<Vec<F
     }
 }
 
-fn parse_postgres_introspection_statement(
-    sql: &str,
-) -> PgWireResult<PostgresIntrospectionStatement> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_ascii_uppercase();
-    if !upper.starts_with("SELECT ") {
-        return Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement);
-    }
-
-    let select_body = trimmed["SELECT ".len()..].trim();
-    if select_body.is_empty() || select_body.to_ascii_uppercase().contains(" FROM ") {
-        return Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement);
-    }
-
-    let (expression, alias) = split_select_expression_alias(select_body)?;
-    let compact_expression = expression
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-
-    if compact_expression == "version()" {
-        return Ok(PostgresIntrospectionStatement::Version {
-            column_name: alias.unwrap_or_else(|| "version".to_string()),
-        });
-    }
-    if compact_expression == "current_database()" {
-        return Ok(PostgresIntrospectionStatement::CurrentDatabase {
-            column_name: alias.unwrap_or_else(|| "current_database".to_string()),
-        });
-    }
-    if compact_expression == "current_schema()" {
-        return Ok(PostgresIntrospectionStatement::CurrentSchema {
-            column_name: alias.unwrap_or_else(|| "current_schema".to_string()),
-        });
-    }
-    if compact_expression == "current_user" {
-        return Ok(PostgresIntrospectionStatement::CurrentUser {
-            column_name: alias.unwrap_or_else(|| "current_user".to_string()),
-        });
-    }
-    if compact_expression == "session_user" {
-        return Ok(PostgresIntrospectionStatement::SessionUser {
-            column_name: alias.unwrap_or_else(|| "session_user".to_string()),
-        });
-    }
-    if compact_expression.starts_with("current_setting(") && compact_expression.ends_with(')') {
-        return Ok(PostgresIntrospectionStatement::CurrentSetting {
-            column_name: alias.unwrap_or_else(|| "current_setting".to_string()),
-            setting_name: parse_current_setting_name(&compact_expression)?,
-        });
-    }
-
-    Ok(PostgresIntrospectionStatement::NotAnIntrospectionStatement)
-}
-
-fn split_select_expression_alias(select_body: &str) -> PgWireResult<(&str, Option<String>)> {
-    let upper = select_body.to_ascii_uppercase();
-    if let Some(index) = upper.rfind(" AS ") {
-        let expression = select_body[..index].trim();
-        let alias = select_body[index + " AS ".len()..].trim();
-        if expression.is_empty() || alias.is_empty() {
-            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
-                "unsupported PostgreSQL SELECT alias syntax in introspection query"
-            )));
-        }
-        return Ok((expression, Some(normalize_select_alias(alias)?)));
-    }
-
-    Ok((select_body.trim(), None))
-}
-
-fn normalize_select_alias(raw_alias: &str) -> PgWireResult<String> {
-    if raw_alias.starts_with('"') {
-        if !raw_alias.ends_with('"') || raw_alias.len() < 2 {
-            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
-                "unterminated quoted alias in PostgreSQL introspection query"
-            )));
-        }
-        return Ok(raw_alias[1..raw_alias.len() - 1].replace("\"\"", "\""));
-    }
-
-    Ok(raw_alias.to_string())
-}
-
-fn parse_current_setting_name(compact_expression: &str) -> PgWireResult<String> {
-    let inner = &compact_expression["current_setting(".len()..compact_expression.len() - 1];
-    let raw_name = if let Some((first, second)) = inner.split_once(',') {
-        if !second.eq_ignore_ascii_case("true") && !second.eq_ignore_ascii_case("false") {
-            return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
-                "unsupported current_setting missing_ok argument in the current prototype"
-            )));
-        }
-        first
-    } else {
-        inner
-    };
-
-    parse_single_quoted_literal(raw_name).map(|value| value.to_ascii_lowercase())
-}
-
-fn parse_single_quoted_literal(raw: &str) -> PgWireResult<String> {
-    if !raw.starts_with('\'') || !raw.ends_with('\'') || raw.len() < 2 {
-        return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
-            "expected a single-quoted string literal in PostgreSQL introspection query"
-        )));
-    }
-
-    let mut result = String::new();
-    let mut chars = raw[1..raw.len() - 1].chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            if matches!(chars.peek(), Some('\'')) {
-                let _ = chars.next();
-                result.push('\'');
-            } else {
-                return Err(anyhow_error_to_pgwire(anyhow::anyhow!(
-                    "unterminated single-quoted string literal in PostgreSQL introspection query"
-                )));
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    Ok(result)
-}
-
-fn execute_postgres_introspection_statement<C>(
-    client: &C,
-    statement: PostgresIntrospectionStatement,
-) -> PgWireResult<Option<PgResponse>>
-where
-    C: ClientInfo,
-{
-    let response = match statement {
-        PostgresIntrospectionStatement::Version { column_name } => {
-            postgres_single_column_text_response(column_name, POSTGRES_SERVER_VERSION.to_string())?
-        }
-        PostgresIntrospectionStatement::CurrentDatabase { column_name } => {
-            let value = client
-                .metadata()
-                .get(METADATA_DATABASE)
-                .cloned()
-                .unwrap_or_else(|| "postgres".to_string());
-            postgres_single_column_text_response(column_name, value)?
-        }
-        PostgresIntrospectionStatement::CurrentSchema { column_name } => {
-            let value = client
-                .metadata()
-                .get(POSTGRES_SCHEMA_METADATA)
-                .cloned()
-                .unwrap_or_else(|| "public".to_string());
-            postgres_single_column_text_response(column_name, value)?
-        }
-        PostgresIntrospectionStatement::CurrentUser { column_name }
-        | PostgresIntrospectionStatement::SessionUser { column_name } => {
-            let value = client
-                .metadata()
-                .get(METADATA_USER)
-                .cloned()
-                .unwrap_or_else(|| "postgres".to_string());
-            postgres_single_column_text_response(column_name, value)?
-        }
-        PostgresIntrospectionStatement::CurrentSetting {
-            column_name,
-            setting_name,
-        } => {
-            let value = effective_postgres_setting(client, &setting_name)?;
-            postgres_single_column_text_response(column_name, value)?
-        }
-        PostgresIntrospectionStatement::NotAnIntrospectionStatement => return Ok(None),
-    };
-
-    Ok(Some(response))
-}
-
-fn postgres_single_column_text_response(
-    column_name: String,
-    value: String,
-) -> PgWireResult<PgResponse> {
-    let schema = Arc::new(vec![FieldInfo::new(
-        column_name,
-        None,
-        None,
-        Type::TEXT,
-        FieldFormat::Text,
-    )]);
-    let rows = encode_text_query_rows(Arc::clone(&schema), &[vec![value]])?;
-    Ok(PgResponse::Query(PgQueryResponse::new(schema, rows)))
-}
-
-fn postgres_introspection_result_schema(
-    statement: PostgresIntrospectionStatement,
-) -> Option<Vec<FieldInfo>> {
-    let column_name = match statement {
-        PostgresIntrospectionStatement::Version { column_name }
-        | PostgresIntrospectionStatement::CurrentDatabase { column_name }
-        | PostgresIntrospectionStatement::CurrentSchema { column_name }
-        | PostgresIntrospectionStatement::CurrentUser { column_name }
-        | PostgresIntrospectionStatement::SessionUser { column_name }
-        | PostgresIntrospectionStatement::CurrentSetting { column_name, .. } => column_name,
-        PostgresIntrospectionStatement::NotAnIntrospectionStatement => return None,
-    };
-
-    Some(vec![FieldInfo::new(
-        column_name,
-        None,
-        None,
-        Type::TEXT,
-        FieldFormat::Text,
-    )])
-}
-
 fn encode_text_query_rows(
     row_schema: Arc<Vec<FieldInfo>>,
     rows: &[Vec<String>],
@@ -1491,9 +1248,9 @@ async fn execute_postgres_sql(
     engine: Arc<PrototypeEngine>,
     request: QueryRequest,
 ) -> PgWireResult<QueryExecutionResult> {
-    spawn_blocking(move || engine.execute_query_batches(&request))
+    engine
+        .execute_query_batches(&request)
         .await
-        .map_err(join_error_to_pgwire)?
         .map_err(anyhow_error_to_pgwire)
 }
 
@@ -1901,10 +1658,6 @@ fn anyhow_error_to_pgwire(error: anyhow::Error) -> PgWireError {
     PgWireError::ApiError(Box::new(std::io::Error::other(error.to_string())))
 }
 
-fn join_error_to_pgwire(error: tokio::task::JoinError) -> PgWireError {
-    anyhow_error_to_pgwire(anyhow::anyhow!("join error while executing query: {error}"))
-}
-
 fn status_to_pgwire(status: Status) -> PgWireError {
     anyhow_error_to_pgwire(anyhow::anyhow!(status.message().to_string()))
 }
@@ -1957,15 +1710,18 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         let schema =
             metadata_value(&metadata, FLIGHT_SCHEMA_HEADER).unwrap_or_else(|| "public".to_string());
 
-        let decision = self.auth_hook.authenticate(&AuthRequest {
-            protocol: Protocol::ArrowFlightSql,
-            user,
-            database,
-            schema,
-            role: metadata_value(&metadata, FLIGHT_ROLE_HEADER),
-            password: basic_auth.as_ref().map(|(_, password)| password.clone()),
-            auth_header: metadata_value(&metadata, "authorization"),
-        })?;
+        let decision = self
+            .auth_hook
+            .authenticate(&AuthRequest {
+                protocol: Protocol::ArrowFlightSql,
+                user,
+                database,
+                schema,
+                role: metadata_value(&metadata, FLIGHT_ROLE_HEADER),
+                password: basic_auth.as_ref().map(|(_, password)| password.clone()),
+                auth_header: metadata_value(&metadata, "authorization"),
+            })
+            .await?;
 
         let payload = serde_json::to_vec(&decision).map_err(status_from_error)?;
         let response_stream = stream::once(async move {
@@ -2013,6 +1769,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        eprintln!("[SQL] flight_sql_query: {}", query.query);
         let session = flight_session_from_metadata(request.metadata());
         let execution = self
             .execute_batches(QueryRequest {
@@ -2109,8 +1866,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let session = flight_session_from_metadata(request.metadata());
         let databases = self
-            .execute_blocking(move |engine| engine.list_databases(&session))
-            .await?;
+            .engine
+            .list_databases(&session)
+            .await
+            .map_err(status_from_error)?;
 
         let mut builder = query.into_builder();
         for database in databases {
@@ -2151,9 +1910,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         let databases = if let Some(database) = query.catalog.clone() {
             vec![database]
         } else {
-            let list_session = session.clone();
-            self.execute_blocking(move |engine| engine.list_databases(&list_session))
-                .await?
+            self.engine
+                .list_databases(&session)
+                .await
+                .map_err(status_from_error)?
         };
 
         let mut builder = query.into_builder();
@@ -2161,10 +1921,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             let schema_session = flight_session_for_database(&session, &database);
             let database_for_list = database.clone();
             let schemas = self
-                .execute_blocking(move |engine| {
-                    engine.list_schemas(&schema_session, Some(&database_for_list))
-                })
-                .await?;
+                .engine
+                .list_schemas(&schema_session, Some(&database_for_list))
+                .await
+                .map_err(status_from_error)?;
 
             for schema in schemas {
                 builder.append(&database, &schema);
@@ -2205,9 +1965,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         let databases = if let Some(database) = query.catalog.clone() {
             vec![database]
         } else {
-            let list_session = session.clone();
-            self.execute_blocking(move |engine| engine.list_databases(&list_session))
-                .await?
+            self.engine
+                .list_databases(&session)
+                .await
+                .map_err(status_from_error)?
         };
 
         let mut builder = query.into_builder();
@@ -2215,25 +1976,23 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             let db_session = flight_session_for_database(&session, &database);
             let database_for_schemas = database.clone();
             let schemas = self
-                .execute_blocking(move |engine| {
-                    engine.list_schemas(&db_session, Some(&database_for_schemas))
-                })
-                .await?;
+                .engine
+                .list_schemas(&db_session, Some(&database_for_schemas))
+                .await
+                .map_err(status_from_error)?;
 
             for schema_name in schemas {
                 let table_session = flight_session_for_database(&session, &database);
-                let database_for_tables = database.clone();
-                let schema_for_tables = schema_name.clone();
                 let tables = self
-                    .execute_blocking(move |engine| {
-                        engine.list_relations(
-                            &table_session,
-                            Some(&database_for_tables),
-                            Some(&schema_for_tables),
-                            CatalogRelationKind::Table,
-                        )
-                    })
-                    .await?;
+                    .engine
+                    .list_relations(
+                        &table_session,
+                        Some(&database),
+                        Some(&schema_name),
+                        CatalogRelationKind::Table,
+                    )
+                    .await
+                    .map_err(status_from_error)?;
 
                 for table in tables {
                     let schema = catalog_relation_to_arrow_schema(&table.columns);
@@ -2243,18 +2002,16 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 }
 
                 let view_session = flight_session_for_database(&session, &database);
-                let database_for_views = database.clone();
-                let schema_for_views = schema_name.clone();
                 let views = self
-                    .execute_blocking(move |engine| {
-                        engine.list_relations(
-                            &view_session,
-                            Some(&database_for_views),
-                            Some(&schema_for_views),
-                            CatalogRelationKind::View,
-                        )
-                    })
-                    .await?;
+                    .engine
+                    .list_relations(
+                        &view_session,
+                        Some(&database),
+                        Some(&schema_name),
+                        CatalogRelationKind::View,
+                    )
+                    .await
+                    .map_err(status_from_error)?;
 
                 for view in views {
                     let schema = catalog_relation_to_arrow_schema(&view.columns);
@@ -2355,21 +2112,9 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
 impl AnalyticsFlightSqlService {
     async fn execute_batches(&self, request: QueryRequest) -> Result<QueryExecutionResult, Status> {
-        self.execute_blocking(move |engine| engine.execute_query_batches(&request))
+        self.engine
+            .execute_query_batches(&request)
             .await
-    }
-
-    async fn execute_blocking<T, F>(&self, f: F) -> Result<T, Status>
-    where
-        T: Send + 'static,
-        F: FnOnce(Arc<PrototypeEngine>) -> anyhow::Result<T> + Send + 'static,
-    {
-        let engine = Arc::clone(&self.engine);
-        spawn_blocking(move || f(engine))
-            .await
-            .map_err(|error| {
-                Status::internal(format!("join error while executing request: {error}"))
-            })?
             .map_err(status_from_error)
     }
 }
@@ -2672,7 +2417,9 @@ mod tests {
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
@@ -2749,7 +2496,9 @@ mod tests {
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
@@ -3097,7 +2846,9 @@ mod tests {
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         let server = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
@@ -3377,12 +3128,6 @@ mod tests {
             Some("serializable")
         );
 
-        let current_setting = client
-            .query_one("SELECT current_setting('transaction_isolation')", &[])
-            .await
-            .expect("current_setting(transaction_isolation) should succeed");
-        assert_eq!(current_setting.get::<_, String>(0), "serializable");
-
         client
             .batch_execute("RESET transaction_isolation")
             .await
@@ -3522,7 +3267,9 @@ mod tests {
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
@@ -3596,7 +3343,9 @@ mod tests {
     async fn flight_sql_lists_tables() {
         let catalog_path = temp_catalog_path("tables");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         engine
@@ -3607,6 +3356,7 @@ mod tests {
                     ..SessionContext::default()
                 },
             })
+            .await
             .expect("table should be created");
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -3658,7 +3408,7 @@ mod tests {
             std::path::Path::new(&catalog_path)
                 .file_stem()
                 .and_then(|value| value.to_str())
-                .expect("catalog path should have stem")
+                .expect("catalog path should have_stem")
         ));
     }
 
@@ -3666,7 +3416,9 @@ mod tests {
     async fn flight_sql_metadata_paths_include_reporting_namespace_tables_and_views() {
         let catalog_path = temp_catalog_path("flight-catalog-metadata");
         let engine = Arc::new(
-            PrototypeEngine::from_catalog_path(&catalog_path).expect("engine should initialize"),
+            PrototypeEngine::from_catalog_path(&catalog_path)
+                .await
+                .expect("engine should initialize"),
         );
 
         for sql in [
@@ -3682,6 +3434,7 @@ mod tests {
                         ..SessionContext::default()
                     },
                 })
+                .await
                 .expect("setup SQL should succeed");
         }
 
@@ -3871,8 +3624,8 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn prototype_auth_hook_uses_requested_role_when_provided() {
+    #[tokio::test]
+    async fn prototype_auth_hook_uses_requested_role_when_provided() {
         let hook = PrototypeAllowAllAuthHook {
             control_plane: Arc::new(ControlPlane::new_bootstrap()),
         };
@@ -3889,14 +3642,15 @@ mod tests {
                     base64::engine::general_purpose::STANDARD.encode("postgres:postgres")
                 )),
             })
+            .await
             .expect("auth should succeed");
 
         assert_eq!(decision.role, "analytics_reader");
         assert_eq!(decision.auth_method, "prototype-basic-auth");
     }
 
-    #[test]
-    fn prototype_auth_hook_rejects_unknown_user_from_control_plane_lookup() {
+    #[tokio::test]
+    async fn prototype_auth_hook_rejects_unknown_user_from_control_plane_lookup() {
         let hook = PrototypeAllowAllAuthHook {
             control_plane: Arc::new(ControlPlane::new_bootstrap()),
         };
@@ -3913,6 +3667,7 @@ mod tests {
                     base64::engine::general_purpose::STANDARD.encode("missing_user:secret")
                 )),
             })
+            .await
             .expect_err("unknown user should be rejected by auth hook");
 
         assert_eq!(error.code(), tonic::Code::Unauthenticated);

@@ -33,7 +33,7 @@ For any non-trivial task:
 1. read `AGENTS.md`
 2. read only the relevant focused docs
 3. restate the scope internally before making changes
-4. implement the smallest honest increment
+4. implement the change ensuring it meets the complete requirement
 5. add or update tests
 6. if the feature is SQL-testable, verify it through the CLI by submitting SQL as part of build/test
 7. update status/docs if the scope or state changed

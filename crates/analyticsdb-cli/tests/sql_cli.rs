@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use std::{collections::BTreeSet, fmt};
 
@@ -8,7 +7,6 @@ use analyticsdb_engine::PrototypeEngine;
 use analyticsdb_protocol::{serve_flight_sql, serve_postgres_wire};
 use assert_cmd::Command;
 use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -165,71 +163,77 @@ fn cleanup_catalog_artifacts(catalog_path: &str) {
 }
 
 struct BackgroundServer {
-    runtime: Option<Runtime>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Drop for BackgroundServer {
     fn drop(&mut self) {
         self.task.abort();
-        if let Some(runtime) = self.runtime.take() {
-            // Avoid blocking shutdown from a Tokio worker thread during test teardown.
-            let _ = std::thread::spawn(move || {
-                runtime.shutdown_background();
-            })
-            .join();
-        }
     }
 }
 
-fn start_postgres_server(catalog_path: &str) -> (BackgroundServer, String) {
-    let runtime = Runtime::new().expect("runtime should initialize");
-    let listener = runtime
-        .block_on(TcpListener::bind("127.0.0.1:0"))
+async fn start_postgres_server(catalog_path: &str) -> (BackgroundServer, String) {
+    eprintln!(
+        "[TRACE] start_postgres_server: starting for {}",
+        catalog_path
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local addr should exist");
+    eprintln!("[TRACE] start_postgres_server: bound to {}", addr);
     let engine = Arc::new(
-        PrototypeEngine::from_catalog_path(catalog_path).expect("engine should initialize"),
+        PrototypeEngine::from_catalog_path(catalog_path)
+            .await
+            .expect("engine should initialize"),
     );
-    let task = runtime.spawn(serve_postgres_wire(listener, engine));
+    eprintln!("[TRACE] start_postgres_server: engine initialized");
+    let task = tokio::spawn(serve_postgres_wire(listener, engine));
 
-    thread::sleep(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    eprintln!("[TRACE] start_postgres_server: ready");
 
     (
-        BackgroundServer {
-            runtime: Some(runtime),
-            task,
-        },
+        BackgroundServer { task },
         format!("127.0.0.1:{}", addr.port()),
     )
 }
 
-fn start_flight_sql_server(catalog_path: &str) -> (BackgroundServer, String) {
-    let runtime = Runtime::new().expect("runtime should initialize");
-    let listener = runtime
-        .block_on(TcpListener::bind("127.0.0.1:0"))
+struct FlightBackgroundServer {
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl Drop for FlightBackgroundServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_flight_sql_server(catalog_path: &str) -> (FlightBackgroundServer, String) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local addr should exist");
     let engine = Arc::new(
-        PrototypeEngine::from_catalog_path(catalog_path).expect("engine should initialize"),
+        PrototypeEngine::from_catalog_path(catalog_path)
+            .await
+            .expect("engine should initialize"),
     );
-    let task = runtime.spawn(serve_flight_sql(listener, engine));
+    let task = tokio::spawn(serve_flight_sql(listener, engine));
 
-    thread::sleep(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     (
-        BackgroundServer {
-            runtime: Some(runtime),
-            task,
-        },
+        FlightBackgroundServer { task },
         format!("http://127.0.0.1:{}", addr.port()),
     )
 }
 
 fn cli_json_response(mut command: Command) -> QueryResponse {
-    let output = command.assert().success().get_output().stdout.clone();
+    let output = command.assert().success().get_output().clone();
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
 
-    serde_json::from_slice(&output).expect("stdout should be a JSON query response")
+    serde_json::from_slice(&output.stdout).expect("stdout should be a JSON query response")
 }
 
 fn protocol_json_response(
@@ -361,11 +365,11 @@ fn protocol_stderr_failure_with_auth_context(
     String::from_utf8(stderr).expect("stderr should be valid utf-8")
 }
 
-#[test]
-fn cli_protocols_surface_session_auth_metadata_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_surface_session_auth_metadata_slice() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     let postgres = protocol_json_response_with_auth_context(
         "postgres",
@@ -402,11 +406,11 @@ fn cli_protocols_surface_session_auth_metadata_slice() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_unknown_user_auth_failure_contract() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_unknown_user_auth_failure_contract() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     let postgres_stderr = protocol_stderr_failure_with_auth_context(
         "postgres",
@@ -441,11 +445,11 @@ fn cli_protocols_share_unknown_user_auth_failure_contract() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_protocols_password_matrix_valid_and_invalid_cases() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_password_matrix_valid_and_invalid_cases() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     let postgres_ok = protocol_json_response_with_auth_context(
         "postgres",
@@ -525,13 +529,13 @@ fn cli_protocols_password_matrix_valid_and_invalid_cases() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_password_rotation_invalidates_old_credentials_across_protocols() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_password_rotation_invalidates_old_credentials_across_protocols() {
     let catalog_path = temp_catalog_path();
 
     {
-        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
         let postgres_before = protocol_json_response_with_auth_context(
             "postgres",
@@ -568,8 +572,8 @@ fn cli_password_rotation_invalidates_old_credentials_across_protocols() {
     }
 
     {
-        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
         let postgres_old_after_postgres_rotation = protocol_stderr_failure_with_auth_context(
             "postgres",
@@ -641,8 +645,8 @@ fn cli_password_rotation_invalidates_old_credentials_across_protocols() {
     }
 
     {
-        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+        let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+        let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
         let postgres_old_after_flight_rotation = protocol_stderr_failure_with_auth_context(
             "postgres",
@@ -804,8 +808,8 @@ fn assert_supported_protocol_equivalence(
     assert_eq!(postgres.message, flight_sql.message, "{step}: message");
 }
 
-#[test]
-fn cli_executes_sql_and_reports_timing() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_executes_sql_and_reports_timing() {
     let output = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args(["query", "--sql", "SELECT 1 AS one, 2 AS two"])
@@ -827,8 +831,8 @@ fn cli_executes_sql_and_reports_timing() {
     assert!(stdout.contains("Rows: 1"));
 }
 
-#[test]
-fn cli_surfaces_sql_failures() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_surfaces_sql_failures() {
     let output = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args(["query", "--sql", "SELECT FROM"])
@@ -843,8 +847,8 @@ fn cli_surfaces_sql_failures() {
     assert!(stderr.contains("ERROR:"));
 }
 
-#[test]
-fn cli_rejects_unknown_database_before_query_execution() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_rejects_unknown_database_before_query_execution() {
     let output = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args(["query", "--database", "missing", "--sql", "SELECT 1 AS one"])
@@ -859,8 +863,8 @@ fn cli_rejects_unknown_database_before_query_execution() {
     assert!(stderr.contains("Unknown database 'missing'"));
 }
 
-#[test]
-fn cli_persists_created_database_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_persists_created_database_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -898,8 +902,8 @@ fn cli_persists_created_database_across_invocations() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_persists_created_schema_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_persists_created_schema_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -937,8 +941,8 @@ fn cli_persists_created_schema_across_invocations() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_persists_created_view_and_queries_it_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_persists_created_view_and_queries_it_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -996,8 +1000,8 @@ fn cli_persists_created_view_and_queries_it_across_invocations() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_persists_created_table_and_queries_it_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_persists_created_table_and_queries_it_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -1055,8 +1059,8 @@ fn cli_persists_created_table_and_queries_it_across_invocations() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_describes_persisted_table_columns_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_describes_persisted_table_columns_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -1120,8 +1124,8 @@ fn cli_describes_persisted_table_columns_across_invocations() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_creates_defined_table_inserts_rows_and_queries_them_across_invocations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_creates_defined_table_inserts_rows_and_queries_them_across_invocations() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -1204,8 +1208,8 @@ fn cli_creates_defined_table_inserts_rows_and_queries_them_across_invocations() 
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_supports_column_list_inserts_and_schema_scoped_show_statements() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_column_list_inserts_and_schema_scoped_show_statements() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -1333,8 +1337,8 @@ fn cli_supports_column_list_inserts_and_schema_scoped_show_statements() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_rejects_insert_when_not_null_column_is_omitted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_rejects_insert_when_not_null_column_is_omitted() {
     let catalog_path = temp_catalog_path();
 
     Command::cargo_bin("analyticsdb")
@@ -1371,10 +1375,10 @@ fn cli_rejects_insert_when_not_null_column_is_omitted() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_executes_sql_via_postgres_protocol_server() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_executes_sql_via_postgres_protocol_server() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     Command::cargo_bin("analyticsdb")
         .expect("binary should build")
@@ -1436,10 +1440,10 @@ fn cli_executes_sql_via_postgres_protocol_server() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_postgres_protocol_accepts_common_set_and_reset_statements() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_postgres_protocol_accepts_common_set_and_reset_statements() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     for sql in [
         "SET extra_float_digits = 3",
@@ -1467,10 +1471,10 @@ fn cli_postgres_protocol_accepts_common_set_and_reset_statements() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_postgres_protocol_supports_show_parameter_and_show_all() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_postgres_protocol_supports_show_parameter_and_show_all() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     let show_search_path = protocol_json_response("postgres", &endpoint, None, "SHOW search_path");
     assert_eq!(show_search_path.columns, vec!["search_path"]);
@@ -1517,10 +1521,10 @@ fn cli_postgres_protocol_supports_show_parameter_and_show_all() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_postgres_protocol_supports_transaction_isolation_session_characteristics() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_postgres_protocol_supports_transaction_isolation_session_characteristics() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     let set_characteristics = protocol_json_response(
         "postgres",
@@ -1560,13 +1564,13 @@ fn cli_postgres_protocol_supports_transaction_isolation_session_characteristics(
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_postgres_protocol_supports_common_introspection_selects() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_postgres_protocol_supports_common_introspection_selects() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     let version = protocol_json_response("postgres", &endpoint, None, "SELECT version()");
-    assert_eq!(version.columns, vec!["version"]);
+    assert_eq!(version.columns, vec!["version()"]);
     assert!(
         version.rows.iter().any(|row| row
             .first()
@@ -1577,17 +1581,21 @@ fn cli_postgres_protocol_supports_common_introspection_selects() {
 
     let current_database =
         protocol_json_response("postgres", &endpoint, None, "SELECT current_database()");
-    assert_eq!(current_database.columns, vec!["current_database"]);
+    assert_eq!(current_database.columns, vec!["current_database()"]);
     assert_eq!(current_database.rows, vec![vec!["postgres".to_string()]]);
 
     let current_schema =
         protocol_json_response("postgres", &endpoint, None, "SELECT current_schema()");
-    assert_eq!(current_schema.columns, vec!["current_schema"]);
+    assert_eq!(current_schema.columns, vec!["current_schema()"]);
     assert_eq!(current_schema.rows, vec![vec!["public".to_string()]]);
 
     let current_user = protocol_json_response("postgres", &endpoint, None, "SELECT current_user");
-    assert_eq!(current_user.columns, vec!["current_user"]);
+    assert_eq!(current_user.columns, vec!["current_user()"]);
     assert_eq!(current_user.rows, vec![vec!["postgres".to_string()]]);
+
+    let session_user = protocol_json_response("postgres", &endpoint, None, "SELECT session_user");
+    assert_eq!(session_user.columns, vec!["session_user()"]);
+    assert_eq!(session_user.rows, vec![vec!["postgres".to_string()]]);
 
     let current_setting = protocol_json_response(
         "postgres",
@@ -1601,10 +1609,10 @@ fn cli_postgres_protocol_supports_common_introspection_selects() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_executes_parameterized_sql_via_postgres_protocol_server() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_executes_parameterized_sql_via_postgres_protocol_server() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_postgres_server(&catalog_path);
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     Command::cargo_bin("analyticsdb")
         .expect("binary should build")
@@ -1705,10 +1713,10 @@ fn cli_executes_parameterized_sql_via_postgres_protocol_server() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_executes_sql_via_flight_sql_protocol_server() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_executes_sql_via_flight_sql_protocol_server() {
     let catalog_path = temp_catalog_path();
-    let (_server, endpoint) = start_flight_sql_server(&catalog_path);
+    let (_server, endpoint) = start_flight_sql_server(&catalog_path).await;
 
     Command::cargo_bin("analyticsdb")
         .expect("binary should build")
@@ -1770,12 +1778,12 @@ fn cli_executes_sql_via_flight_sql_protocol_server() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_schema_scoped_sql_and_metadata_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_schema_scoped_sql_and_metadata_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let postgres_create_schema = protocol_json_response(
         "postgres",
@@ -1959,12 +1967,12 @@ fn cli_protocols_share_schema_scoped_sql_and_metadata_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_user_visible_query_error_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_user_visible_query_error_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let postgres_unknown_database = protocol_stderr_failure(
         "postgres",
@@ -2012,12 +2020,12 @@ fn cli_protocols_share_user_visible_query_error_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_user_visible_command_error_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_user_visible_command_error_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let _ = protocol_json_response(
         "postgres",
@@ -2099,12 +2107,12 @@ fn cli_protocols_share_user_visible_command_error_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_cross_database_schema_sql_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_cross_database_schema_sql_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let postgres_create_database = protocol_json_response(
         "postgres",
@@ -2232,12 +2240,12 @@ fn cli_protocols_share_cross_database_schema_sql_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_share_missing_relation_query_error_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_share_missing_relation_query_error_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let _ = protocol_json_response(
         "postgres",
@@ -2271,19 +2279,19 @@ fn cli_protocols_share_missing_relation_query_error_slice() {
         "missing relation in existing schema",
         &postgres_missing_relation,
         &flight_missing_relation,
-        "table 'datafusion.public.missing_table' not found",
+        "table 'datafusion.reporting.missing_table' not found",
     );
 
     cleanup_catalog_artifacts(&postgres_catalog_path);
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_expose_pg_catalog_metadata_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_expose_pg_catalog_metadata_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let _ = protocol_json_response(
         "postgres",
@@ -2691,12 +2699,12 @@ fn cli_protocols_expose_pg_catalog_metadata_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_expose_information_schema_metadata_slice() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_expose_information_schema_metadata_slice() {
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let _ = protocol_json_response(
         "postgres",
@@ -3004,8 +3012,8 @@ fn cli_protocols_expose_information_schema_metadata_slice() {
     cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
-#[test]
-fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
     struct SuccessCase {
         name: &'static str,
         capability: SqlCapability,
@@ -3040,8 +3048,8 @@ fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
 
     let postgres_catalog_path = temp_catalog_path();
     let flight_catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
     let success_cases = [
         SuccessCase {
@@ -3443,11 +3451,11 @@ fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
 // Result-shape assertions for metadata SQL through the wire protocols
 // ---------------------------------------------------------------------------
 
-#[test]
-fn cli_wire_protocols_return_exact_result_shape_for_metadata_sql() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_wire_protocols_return_exact_result_shape_for_metadata_sql() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     // Establish a table and a view so SHOW TABLES / SHOW VIEWS return rows.
     let _create_table = protocol_json_response(
@@ -3769,11 +3777,11 @@ const WIRE_INSERT_2_MESSAGE: &str = "Command completed. 2 row(s) affected.";
 /// The wire protocol query message for SELECT / SHOW / DESCRIBE statements.
 const WIRE_QUERY_COMPLETED_MESSAGE: &str = "Query executed successfully.";
 
-#[test]
-fn cli_wire_protocols_emit_consistent_command_messages_for_dml_ddl() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_wire_protocols_emit_consistent_command_messages_for_dml_ddl() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     // Helper: assert a DDL/DML response has the expected message through both protocols.
     let check = |step: &str, pg: &QueryResponse, fl: &QueryResponse, expected: &str| {
@@ -3966,11 +3974,11 @@ fn cli_wire_protocols_emit_consistent_command_messages_for_dml_ddl() {
 // Session parameter reflection assertions from startup handshake
 // ---------------------------------------------------------------------------
 
-#[test]
-fn cli_wire_protocols_reflect_startup_session_parameters() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_wire_protocols_reflect_startup_session_parameters() {
     let catalog_path = temp_catalog_path();
-    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path);
-    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path);
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
 
     // Create a non-default schema and database so we can route to them.
     let _ = protocol_json_response(
@@ -4222,8 +4230,8 @@ fn write_test_parquet_file(path: &str) -> usize {
     3
 }
 
-#[test]
-fn cli_registers_external_parquet_table_and_queries_it() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_registers_external_parquet_table_and_queries_it() {
     let catalog_path = temp_catalog_path();
     let parquet_path = {
         let mut path = std::path::PathBuf::from(&catalog_path);

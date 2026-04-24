@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
 use analyticsdb_core::SessionContext;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use tokio::fs;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,21 +213,6 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
     },
-    PgCatalogTables {
-        sql: String,
-    },
-    PgCatalogViews {
-        sql: String,
-    },
-    PgCatalogNamespace {
-        sql: String,
-    },
-    PgCatalogDatabase {
-        sql: String,
-    },
-    PgCatalogRoles {
-        sql: String,
-    },
     InformationSchemaSchemata {
         sql: String,
     },
@@ -259,8 +244,12 @@ pub enum MetadataStatement {
         name: String,
         password: String,
     },
+    Begin,
+    Commit,
+    Rollback,
 }
 
+#[derive(Debug)]
 pub struct ControlPlane {
     coordinator_node_id: String,
     catalog_path: Option<PathBuf>,
@@ -272,10 +261,10 @@ impl ControlPlane {
         Self::from_state(None, bootstrap_state())
     }
 
-    pub fn from_catalog_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn from_catalog_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let state = if path.exists() {
-            let raw = fs::read_to_string(&path)?;
+            let raw = fs::read_to_string(&path).await?;
             if raw.trim().is_empty() {
                 bootstrap_state()
             } else {
@@ -286,7 +275,7 @@ impl ControlPlane {
         };
 
         let control_plane = Self::from_state(Some(path), state);
-        control_plane.persist()?;
+        control_plane.persist().await?;
 
         Ok(control_plane)
     }
@@ -301,8 +290,8 @@ impl ControlPlane {
         }
     }
 
-    pub fn admit_query(&self, session: &SessionContext) -> Result<QueryAdmission> {
-        self.validate_session(session)?;
+    pub async fn admit_query(&self, session: &SessionContext) -> Result<QueryAdmission> {
+        self.validate_session(session).await?;
 
         Ok(QueryAdmission {
             query_id: format!("q-{}", Uuid::now_v7()),
@@ -310,14 +299,14 @@ impl ControlPlane {
         })
     }
 
-    pub fn validate_session(&self, session: &SessionContext) -> Result<()> {
-        let _ = self.catalog_user(&session.user)?;
-        self.authorize_role_assumption(&session.user, &session.role)?;
+    pub async fn validate_session(&self, session: &SessionContext) -> Result<()> {
+        let state = self.state.read().await;
+        self._validate_session(&state, session)
+    }
 
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
+    fn _validate_session(&self, state: &CatalogState, session: &SessionContext) -> Result<()> {
+        let _ = self._catalog_user(state, &session.user)?;
+        self._authorize_role_assumption(state, &session.user, &session.role)?;
 
         let database = state
             .databases
@@ -331,8 +320,13 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub fn validate_credentials(&self, user: &str, password: Option<&str>) -> Result<CatalogUser> {
-        let catalog_user = self.catalog_user(user)?;
+    pub async fn validate_credentials(
+        &self,
+        user: &str,
+        password: Option<&str>,
+    ) -> Result<CatalogUser> {
+        let state = self.state.read().await;
+        let catalog_user = self._catalog_user(&state, user)?;
 
         if let Some(expected_password) = catalog_user.password.as_deref() {
             let provided_password = password
@@ -342,32 +336,33 @@ impl ControlPlane {
             }
         }
 
-        Ok(catalog_user)
+        Ok(catalog_user.clone())
     }
 
-    pub fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
+    pub async fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
+        let state = self.state.read().await;
+        self._catalog_user(&state, user).cloned()
+    }
 
+    fn _catalog_user<'a>(&self, state: &'a CatalogState, user: &str) -> Result<&'a CatalogUser> {
         state
             .users
             .get(user)
-            .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))
     }
 
-    pub fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
+    pub async fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
+        let state = self.state.read().await;
+        self._authorize_role_assumption(&state, user, role)
+    }
 
-        let user_entry = state
-            .users
-            .get(user)
-            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+    fn _authorize_role_assumption(
+        &self,
+        state: &CatalogState,
+        user: &str,
+        role: &str,
+    ) -> Result<()> {
+        let user_entry = self._catalog_user(state, user)?;
         if !state.users.contains_key(role) {
             bail!("Unknown role '{}'", role);
         }
@@ -383,30 +378,28 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub fn rotate_user_password(
+    pub async fn rotate_user_password(
         &self,
         session: &SessionContext,
         user: &str,
         new_password: &str,
     ) -> Result<String> {
-        self.validate_session(session)?;
         if new_password.trim().is_empty() {
             bail!("Password must not be empty in the current prototype");
         }
 
-        let acting_user = self.catalog_user(&session.user)?;
-        if !acting_user.is_admin {
-            bail!(
-                "User '{}' is not allowed to rotate credentials in the current prototype",
-                session.user
-            );
-        }
-
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let acting_user = self._catalog_user(&state, &session.user)?;
+            if !acting_user.is_admin {
+                bail!(
+                    "User '{}' is not allowed to rotate credentials in the current prototype",
+                    session.user
+                );
+            }
+
             let catalog_user = state
                 .users
                 .get_mut(user)
@@ -417,47 +410,33 @@ impl ControlPlane {
             catalog_user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!("Credentials rotated for user '{}'.", user))
     }
 
-    pub fn execute_metadata_statement(
+    pub async fn execute_metadata_statement(
         &self,
         session: &SessionContext,
         statement: &MetadataStatement,
     ) -> Result<String> {
-        self.validate_session(session)?;
-
         match statement {
-            MetadataStatement::CreateDatabase { name } => self.create_database(name),
+            MetadataStatement::CreateDatabase { name } => self.create_database(session, name).await,
             MetadataStatement::CreateSchema { database, name } => {
-                let database_name = database
-                    .as_ref()
-                    .map_or(session.database.as_str(), String::as_str);
-                self.create_schema(database_name, name)
-            }
-            MetadataStatement::CreateView {
-                database,
-                schema,
-                name,
-                definition_sql,
-            } => {
-                let database_name = database
-                    .as_ref()
-                    .map_or(session.database.as_str(), String::as_str);
-                let schema_name = schema
-                    .as_ref()
-                    .map_or(session.schema.as_str(), String::as_str);
-                self.create_view(database_name, schema_name, name, definition_sql)
+                self.create_schema(session, database.as_deref(), name).await
             }
             MetadataStatement::AlterUserPassword { name, password } => {
-                self.rotate_user_password(session, name, password)
+                self.rotate_user_password(session, name, password).await
             }
-            MetadataStatement::CreateTableAs { .. }
+            MetadataStatement::Begin | MetadataStatement::Commit | MetadataStatement::Rollback => {
+                self.validate_session(session).await?;
+                Ok("Command completed. 0 row(s) affected.".to_string())
+            }
+            MetadataStatement::CreateView { .. }
+            | MetadataStatement::CreateTableAs { .. }
             | MetadataStatement::CreateTable { .. }
             | MetadataStatement::CreateExternalTable { .. }
             | MetadataStatement::InsertInto { .. } => {
-                bail!("Managed table DDL and DML should be handled by the engine persistence flow")
+                bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases
             | MetadataStatement::ShowSchemas { .. }
@@ -465,11 +444,6 @@ impl ControlPlane {
             | MetadataStatement::ShowViews { .. }
             | MetadataStatement::ShowColumns { .. }
             | MetadataStatement::DescribeRelation { .. }
-            | MetadataStatement::PgCatalogTables { .. }
-            | MetadataStatement::PgCatalogViews { .. }
-            | MetadataStatement::PgCatalogNamespace { .. }
-            | MetadataStatement::PgCatalogDatabase { .. }
-            | MetadataStatement::PgCatalogRoles { .. }
             | MetadataStatement::InformationSchemaSchemata { .. }
             | MetadataStatement::InformationSchemaTables { .. }
             | MetadataStatement::InformationSchemaColumns { .. }
@@ -484,29 +458,22 @@ impl ControlPlane {
         }
     }
 
-    pub fn list_databases(&self, session: &SessionContext) -> Result<Vec<String>> {
-        self.validate_session(session)?;
-
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
+    pub async fn list_databases(&self, session: &SessionContext) -> Result<Vec<String>> {
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
 
         Ok(state.databases.keys().cloned().collect())
     }
 
-    pub fn list_schemas(
+    pub async fn list_schemas(
         &self,
         session: &SessionContext,
         database: Option<&str>,
     ) -> Result<Vec<String>> {
-        self.validate_session(session)?;
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
 
         let database_name = database.unwrap_or(&session.database);
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
         let database = state
             .databases
             .get(database_name)
@@ -515,22 +482,19 @@ impl ControlPlane {
         Ok(database.schemas.iter().cloned().collect())
     }
 
-    pub fn list_relations(
+    pub async fn list_relations(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         kind: CatalogRelationKind,
     ) -> Result<Vec<CatalogRelation>> {
-        self.validate_session(session)?;
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
 
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
         let database = state
             .databases
             .get(database_name)
@@ -552,16 +516,46 @@ impl ControlPlane {
             .collect())
     }
 
-    pub fn list_views_for_session(&self, session: &SessionContext) -> Result<Vec<CatalogRelation>> {
+    pub async fn list_relations_for_database(
+        &self,
+        session: &SessionContext,
+        database: &str,
+        kind: CatalogRelationKind,
+    ) -> Result<Vec<CatalogRelation>> {
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
+
+        let db = state
+            .databases
+            .get(database)
+            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database))?;
+
+        Ok(state
+            .relations
+            .values()
+            .filter(|relation| {
+                relation.kind == kind
+                    && relation.database == db.name
+                    && db.schemas.contains(&relation.schema)
+            })
+            .cloned()
+            .collect())
+    }
+
+    pub async fn list_views_for_session(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<CatalogRelation>> {
         self.list_relations(
             session,
             Some(session.database.as_str()),
             Some(session.schema.as_str()),
             CatalogRelationKind::View,
         )
+        .await
     }
 
-    pub fn list_tables_for_session(
+    pub async fn list_tables_for_session(
         &self,
         session: &SessionContext,
     ) -> Result<Vec<CatalogRelation>> {
@@ -571,27 +565,28 @@ impl ControlPlane {
             Some(session.schema.as_str()),
             CatalogRelationKind::Table,
         )
+        .await
     }
 
-    pub fn relation_columns(
+    pub async fn relation_columns(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         name: &str,
     ) -> Result<Vec<CatalogColumn>> {
-        let relation = self.find_relation(session, database, schema, name)?;
+        let relation = self.find_relation(session, database, schema, name).await?;
         Ok(relation.columns)
     }
 
-    pub fn table_relation(
+    pub async fn table_relation(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         name: &str,
     ) -> Result<CatalogRelation> {
-        let relation = self.find_relation(session, database, schema, name)?;
+        let relation = self.find_relation(session, database, schema, name).await?;
 
         if relation.kind != CatalogRelationKind::Table {
             bail!(
@@ -605,11 +600,8 @@ impl ControlPlane {
         Ok(relation)
     }
 
-    pub fn cluster_snapshot(&self) -> ClusterSnapshot {
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
+    pub async fn cluster_snapshot(&self) -> ClusterSnapshot {
+        let state = self.state.read().await;
 
         ClusterSnapshot {
             coordinator_node_id: self.coordinator_node_id.clone(),
@@ -620,14 +612,12 @@ impl ControlPlane {
         }
     }
 
-    fn create_database(&self, name: &str) -> Result<String> {
+    async fn create_database(&self, session: &SessionContext, name: &str) -> Result<String> {
         validate_identifier(name)?;
 
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
 
             if state.databases.contains_key(name) {
                 bail!("Database '{}' already exists", name);
@@ -642,18 +632,23 @@ impl ControlPlane {
             );
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!("Database '{name}' created successfully."))
     }
 
-    fn create_schema(&self, database_name: &str, schema_name: &str) -> Result<String> {
+    async fn create_schema(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema_name: &str,
+    ) -> Result<String> {
         validate_identifier(schema_name)?;
+        let database_name = database.unwrap_or(&session.database);
 
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
             let database = state
                 .databases
                 .get_mut(database_name)
@@ -666,27 +661,30 @@ impl ControlPlane {
             database.schemas.insert(schema_name.to_string());
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!(
             "Schema '{}.{}' created successfully.",
             database_name, schema_name
         ))
     }
 
-    fn create_view(
+    pub async fn register_view(
         &self,
-        database_name: &str,
-        schema_name: &str,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
         view_name: &str,
         definition_sql: &str,
+        columns: Vec<CatalogColumn>,
     ) -> Result<String> {
         validate_identifier(view_name)?;
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
 
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
             let database = state
                 .databases
                 .get(database_name)
@@ -716,31 +714,35 @@ impl ControlPlane {
                     definition_sql: Some(definition_sql.trim().to_string()),
                     storage_path: None,
                     external_format: None,
-                    columns: Vec::new(),
+                    columns,
                     constraints: Vec::new(),
                 },
             );
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!(
             "View '{}.{}.{}' created successfully.",
             database_name, schema_name, view_name
         ))
     }
 
-    pub fn managed_table_storage_path(
+    pub async fn managed_table_storage_path(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         table_name: &str,
     ) -> Result<PathBuf> {
-        self.validate_session(session)?;
         validate_identifier(table_name)?;
-
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let state = self.state.read().await;
+            self._validate_session(&state, session)?;
+        }
+
         let catalog_path = self.catalog_path.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Managed tables require --catalog-path in the current prototype")
         })?;
@@ -757,7 +759,7 @@ impl ControlPlane {
         )))
     }
 
-    pub fn register_managed_table(
+    pub async fn register_managed_table(
         &self,
         session: &SessionContext,
         database: Option<&str>,
@@ -767,17 +769,15 @@ impl ControlPlane {
         columns: Vec<CatalogColumn>,
         constraints: Vec<CatalogTableConstraint>,
     ) -> Result<String> {
-        self.validate_session(session)?;
         validate_identifier(table_name)?;
 
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
             let database = state
                 .databases
                 .get(database_name)
@@ -813,14 +813,14 @@ impl ControlPlane {
             );
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!(
             "Table '{}.{}.{}' created successfully.",
             database_name, schema_name, table_name
         ))
     }
 
-    pub fn register_external_table(
+    pub async fn register_external_table(
         &self,
         session: &SessionContext,
         database: Option<&str>,
@@ -829,17 +829,15 @@ impl ControlPlane {
         location: &str,
         format: ExternalStorageFormat,
     ) -> Result<String> {
-        self.validate_session(session)?;
         validate_identifier(table_name)?;
 
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
         {
-            let mut state = self
-                .state
-                .write()
-                .expect("control plane lock should not poison");
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
             let database = state
                 .databases
                 .get(database_name)
@@ -875,49 +873,42 @@ impl ControlPlane {
             );
         }
 
-        self.persist()?;
+        self.persist().await?;
         Ok(format!(
             "External table '{}.{}.{}' registered successfully.",
             database_name, schema_name, table_name
         ))
     }
 
-    fn persist(&self) -> Result<()> {
+    async fn persist(&self) -> Result<()> {
         let Some(path) = &self.catalog_path else {
             return Ok(());
         };
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
 
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison")
-            .clone();
+        let state = self.state.read().await.clone();
         let raw = serde_json::to_string_pretty(&state)?;
-        fs::write(path, raw)?;
+        fs::write(path, raw).await?;
 
         Ok(())
     }
 
-    fn find_relation(
+    async fn find_relation(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         name: &str,
     ) -> Result<CatalogRelation> {
-        self.validate_session(session)?;
-
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
-        let state = self
-            .state
-            .read()
-            .expect("control plane lock should not poison");
         let relation_key = relation_key(database_name, schema_name, name);
+
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
 
         state.relations.get(&relation_key).cloned().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1396,31 +1387,16 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         return None;
     }
 
-    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_TABLES") {
-        return Some(MetadataStatement::PgCatalogTables {
-            sql: trimmed.to_string(),
-        });
+    if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
+        return Some(MetadataStatement::Begin);
     }
-    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_VIEWS") {
-        return Some(MetadataStatement::PgCatalogViews {
-            sql: trimmed.to_string(),
-        });
+    if upper == "COMMIT" || upper == "END" || upper == "END TRANSACTION" {
+        return Some(MetadataStatement::Commit);
     }
-    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_NAMESPACE") {
-        return Some(MetadataStatement::PgCatalogNamespace {
-            sql: trimmed.to_string(),
-        });
+    if upper == "ROLLBACK" || upper == "ABORT" {
+        return Some(MetadataStatement::Rollback);
     }
-    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_DATABASE") {
-        return Some(MetadataStatement::PgCatalogDatabase {
-            sql: trimmed.to_string(),
-        });
-    }
-    if upper.starts_with("SELECT ") && upper.contains(" FROM PG_CATALOG.PG_ROLES") {
-        return Some(MetadataStatement::PgCatalogRoles {
-            sql: trimmed.to_string(),
-        });
-    }
+
     if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.SCHEMATA") {
         return Some(MetadataStatement::InformationSchemaSchemata {
             sql: trimmed.to_string(),
@@ -1764,11 +1740,12 @@ mod tests {
         path
     }
 
-    #[test]
-    fn admits_bootstrap_session_and_generates_query_id() {
+    #[tokio::test]
+    async fn admits_bootstrap_session_and_generates_query_id() {
         let control_plane = ControlPlane::new_bootstrap();
         let admission = control_plane
             .admit_query(&default_session())
+            .await
             .expect("bootstrap session should be admitted");
 
         assert!(matches!(
@@ -1781,34 +1758,36 @@ mod tests {
         assert!(admission.query_id.starts_with("q-"));
     }
 
-    #[test]
-    fn rejects_unknown_database() {
+    #[tokio::test]
+    async fn rejects_unknown_database() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut session = default_session();
         session.database = "missing".to_string();
 
         let error = control_plane
             .validate_session(&session)
+            .await
             .expect_err("unknown database should fail");
 
         assert!(error.to_string().contains("Unknown database"));
     }
 
-    #[test]
-    fn rejects_unknown_role_in_session_validation() {
+    #[tokio::test]
+    async fn rejects_unknown_role_in_session_validation() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut session = default_session();
         session.role = "missing_role".to_string();
 
         let error = control_plane
             .validate_session(&session)
+            .await
             .expect_err("unknown role should fail validation");
 
         assert!(error.to_string().contains("Unknown role"));
     }
 
-    #[test]
-    fn rejects_non_admin_role_assumption() {
+    #[tokio::test]
+    async fn rejects_non_admin_role_assumption() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut session = default_session();
         session.user = "analytics_reader".to_string();
@@ -1816,13 +1795,14 @@ mod tests {
 
         let error = control_plane
             .validate_session(&session)
+            .await
             .expect_err("non-admin user should not assume postgres role");
 
         assert!(error.to_string().contains("is not allowed to assume role"));
     }
 
-    #[test]
-    fn allows_admin_role_assumption() {
+    #[tokio::test]
+    async fn allows_admin_role_assumption() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut session = default_session();
         session.user = "analyticsdb_admin".to_string();
@@ -1830,78 +1810,89 @@ mod tests {
 
         control_plane
             .validate_session(&session)
+            .await
             .expect("admin role assumption should be allowed");
     }
 
-    #[test]
-    fn validates_credentials_with_unknown_user() {
+    #[tokio::test]
+    async fn validates_credentials_with_unknown_user() {
         let control_plane = ControlPlane::new_bootstrap();
         let error = control_plane
             .validate_credentials("missing", Some("secret"))
+            .await
             .expect_err("unknown user must fail credentials validation");
 
         assert!(error.to_string().contains("Unknown user"));
     }
 
-    #[test]
-    fn validates_credentials_with_expected_bootstrap_password() {
+    #[tokio::test]
+    async fn validates_credentials_with_expected_bootstrap_password() {
         let control_plane = ControlPlane::new_bootstrap();
         let user = control_plane
             .validate_credentials("postgres", Some("postgres"))
+            .await
             .expect("postgres bootstrap password should be accepted");
 
         assert_eq!(user.name, "postgres");
     }
 
-    #[test]
-    fn rejects_invalid_bootstrap_password() {
+    #[tokio::test]
+    async fn rejects_invalid_bootstrap_password() {
         let control_plane = ControlPlane::new_bootstrap();
         let error = control_plane
             .validate_credentials("postgres", Some("wrong-password"))
+            .await
             .expect_err("wrong password should be rejected");
 
         assert!(error.to_string().contains("Invalid credentials"));
     }
 
-    #[test]
-    fn rejects_missing_password_for_passworded_bootstrap_user() {
+    #[tokio::test]
+    async fn rejects_missing_password_for_passworded_bootstrap_user() {
         let control_plane = ControlPlane::new_bootstrap();
         let error = control_plane
             .validate_credentials("postgres", None)
+            .await
             .expect_err("missing password should be rejected");
 
         assert!(error.to_string().contains("Missing credentials"));
     }
 
-    #[test]
-    fn rotates_password_and_invalidates_previous_credentials() {
+    #[tokio::test]
+    async fn rotates_password_and_invalidates_previous_credentials() {
         let path = temp_catalog_path("password-rotation");
-        let control_plane = ControlPlane::from_catalog_path(&path).expect("catalog should load");
+        let control_plane = ControlPlane::from_catalog_path(&path)
+            .await
+            .expect("catalog should load");
 
         let before = control_plane
             .catalog_user("analytics_reader")
+            .await
             .expect("reader user should exist before rotation");
         assert_eq!(before.password_version, 1);
 
         let message = control_plane
             .rotate_user_password(&default_session(), "analytics_reader", "reader-next")
+            .await
             .expect("password rotation should succeed");
         assert!(message.contains("Credentials rotated"));
 
         let stale = control_plane
             .validate_credentials("analytics_reader", Some("analytics_reader"))
+            .await
             .expect_err("old password should be rejected after rotation");
         assert!(stale.to_string().contains("Invalid credentials"));
 
         let updated = control_plane
             .validate_credentials("analytics_reader", Some("reader-next"))
+            .await
             .expect("new password should be accepted");
         assert_eq!(updated.password_version, 2);
         assert!(updated.password_rotated_at_epoch_ms.is_some());
     }
 
-    #[test]
-    fn rejects_password_rotation_for_non_admin_user() {
+    #[tokio::test]
+    async fn rejects_password_rotation_for_non_admin_user() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut session = default_session();
         session.user = "analytics_reader".to_string();
@@ -1909,14 +1900,15 @@ mod tests {
 
         let error = control_plane
             .rotate_user_password(&session, "postgres", "next")
+            .await
             .expect_err("non-admin should not rotate passwords");
         assert!(error
             .to_string()
             .contains("not allowed to rotate credentials"));
     }
 
-    #[test]
-    fn metadata_statement_alter_user_password_rotates_credentials() {
+    #[tokio::test]
+    async fn metadata_statement_alter_user_password_rotates_credentials() {
         let control_plane = ControlPlane::new_bootstrap();
         let message = control_plane
             .execute_metadata_statement(
@@ -1926,21 +1918,24 @@ mod tests {
                     password: "reader-sql-rotated".to_string(),
                 },
             )
+            .await
             .expect("admin ALTER USER PASSWORD should succeed");
         assert!(message.contains("Credentials rotated"));
 
         let stale = control_plane
             .validate_credentials("analytics_reader", Some("analytics_reader"))
+            .await
             .expect_err("old password should be invalidated");
         assert!(stale.to_string().contains("Invalid credentials"));
 
         control_plane
             .validate_credentials("analytics_reader", Some("reader-sql-rotated"))
+            .await
             .expect("new rotated password should be accepted");
     }
 
-    #[test]
-    fn metadata_statement_alter_user_password_rejects_non_admin_actor() {
+    #[tokio::test]
+    async fn metadata_statement_alter_user_password_rejects_non_admin_actor() {
         let control_plane = ControlPlane::new_bootstrap();
         let mut reader_session = default_session();
         reader_session.user = "analytics_reader".to_string();
@@ -1954,16 +1949,17 @@ mod tests {
                     password: "pwned".to_string(),
                 },
             )
+            .await
             .expect_err("non-admin ALTER USER PASSWORD should fail");
         assert!(error
             .to_string()
             .contains("not allowed to rotate credentials"));
     }
 
-    #[test]
-    fn exposes_bootstrap_cluster_snapshot() {
+    #[tokio::test]
+    async fn exposes_bootstrap_cluster_snapshot() {
         let control_plane = ControlPlane::new_bootstrap();
-        let snapshot = control_plane.cluster_snapshot();
+        let snapshot = control_plane.cluster_snapshot().await;
 
         assert_eq!(snapshot.coordinator_node_id, "control-1");
         assert!(snapshot
@@ -1977,10 +1973,12 @@ mod tests {
         assert!(snapshot.relations.is_empty());
     }
 
-    #[test]
-    fn persists_created_database_and_schema() {
+    #[tokio::test]
+    async fn persists_created_database_and_schema() {
         let path = temp_catalog_path("catalog");
-        let control_plane = ControlPlane::from_catalog_path(&path).expect("catalog should load");
+        let control_plane = ControlPlane::from_catalog_path(&path)
+            .await
+            .expect("catalog should load");
 
         control_plane
             .execute_metadata_statement(
@@ -1989,6 +1987,7 @@ mod tests {
                     name: "analytics".to_string(),
                 },
             )
+            .await
             .expect("database creation should succeed");
 
         control_plane
@@ -1999,302 +1998,22 @@ mod tests {
                     name: "reporting".to_string(),
                 },
             )
+            .await
             .expect("schema creation should succeed");
 
-        let reloaded = ControlPlane::from_catalog_path(&path).expect("catalog should reload");
+        let reloaded = ControlPlane::from_catalog_path(&path)
+            .await
+            .expect("catalog should reload");
         let databases = reloaded
             .list_databases(&default_session())
+            .await
             .expect("databases should list");
         let schemas = reloaded
             .list_schemas(&default_session(), Some("analytics"))
+            .await
             .expect("schemas should list");
 
         assert!(databases.iter().any(|database| database == "analytics"));
         assert!(schemas.iter().any(|schema| schema == "reporting"));
-    }
-
-    #[test]
-    fn persists_created_view() {
-        let path = temp_catalog_path("view");
-        let control_plane = ControlPlane::from_catalog_path(&path).expect("catalog should load");
-
-        control_plane
-            .execute_metadata_statement(
-                &default_session(),
-                &MetadataStatement::CreateView {
-                    database: None,
-                    schema: None,
-                    name: "daily_metrics".to_string(),
-                    definition_sql: "SELECT 7 AS metric".to_string(),
-                },
-            )
-            .expect("view creation should succeed");
-
-        let reloaded = ControlPlane::from_catalog_path(&path).expect("catalog should reload");
-        let views = reloaded
-            .list_relations(
-                &default_session(),
-                Some("postgres"),
-                Some("public"),
-                CatalogRelationKind::View,
-            )
-            .expect("views should list");
-
-        assert!(views.iter().any(|view| {
-            view.name == "daily_metrics"
-                && view.definition_sql.as_deref() == Some("SELECT 7 AS metric")
-        }));
-    }
-
-    #[test]
-    fn parses_metadata_sql_subset() {
-        assert_eq!(
-            parse_metadata_statement("CREATE DATABASE analytics;"),
-            Some(MetadataStatement::CreateDatabase {
-                name: "analytics".to_string()
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SHOW SCHEMAS FROM analytics"),
-            Some(MetadataStatement::ShowSchemas {
-                database: Some("analytics".to_string())
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("CREATE VIEW reporting.daily_metrics AS SELECT 7 AS metric"),
-            Some(MetadataStatement::CreateView {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "daily_metrics".to_string(),
-                definition_sql: "SELECT 7 AS metric".to_string()
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SHOW VIEWS"),
-            Some(MetadataStatement::ShowViews {
-                database: None,
-                schema: None
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("CREATE TABLE reporting.fact_metrics AS SELECT 1 AS metric"),
-            Some(MetadataStatement::CreateTableAs {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "fact_metrics".to_string(),
-                query_sql: "SELECT 1 AS metric".to_string()
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement(
-                "CREATE TABLE reporting.fact_metrics (metric BIGINT NOT NULL, status TEXT)"
-            ),
-            Some(MetadataStatement::CreateTable {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "fact_metrics".to_string(),
-                columns: vec![
-                    TableColumnDefinition {
-                        name: "metric".to_string(),
-                        data_type: "BIGINT".to_string(),
-                        nullable: false,
-                    },
-                    TableColumnDefinition {
-                        name: "status".to_string(),
-                        data_type: "TEXT".to_string(),
-                        nullable: true,
-                    }
-                ],
-                constraints: Vec::new(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement(
-                "CREATE TABLE reporting.fact_events (metric_id BIGINT NOT NULL, CONSTRAINT fact_events_pkey PRIMARY KEY (metric_id), CONSTRAINT fact_events_metric_fk FOREIGN KEY (metric_id) REFERENCES reporting.fact_metrics(metric))"
-            ),
-            Some(MetadataStatement::CreateTable {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "fact_events".to_string(),
-                columns: vec![TableColumnDefinition {
-                    name: "metric_id".to_string(),
-                    data_type: "BIGINT".to_string(),
-                    nullable: false,
-                }],
-                constraints: vec![
-                    TableConstraintDefinition::PrimaryKey {
-                        name: Some("fact_events_pkey".to_string()),
-                        columns: vec!["metric_id".to_string()],
-                    },
-                    TableConstraintDefinition::ForeignKey {
-                        name: Some("fact_events_metric_fk".to_string()),
-                        columns: vec!["metric_id".to_string()],
-                        referenced_database: None,
-                        referenced_schema: Some("reporting".to_string()),
-                        referenced_table: "fact_metrics".to_string(),
-                        referenced_columns: vec!["metric".to_string()],
-                    },
-                ],
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement(
-                "INSERT INTO reporting.fact_metrics VALUES (11, 'ok'), (12, 'warn')"
-            ),
-            Some(MetadataStatement::InsertInto {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "fact_metrics".to_string(),
-                columns: None,
-                rows: vec![
-                    vec!["11".to_string(), "'ok'".to_string()],
-                    vec!["12".to_string(), "'warn'".to_string()]
-                ]
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement(
-                "INSERT INTO reporting.fact_metrics (status, metric) VALUES ('ok', 11)"
-            ),
-            Some(MetadataStatement::InsertInto {
-                database: None,
-                schema: Some("reporting".to_string()),
-                name: "fact_metrics".to_string(),
-                columns: Some(vec!["status".to_string(), "metric".to_string()]),
-                rows: vec![vec!["'ok'".to_string(), "11".to_string()]]
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SHOW TABLES FROM analytics.reporting"),
-            Some(MetadataStatement::ShowTables {
-                database: Some("analytics".to_string()),
-                schema: Some("reporting".to_string())
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SHOW VIEWS FROM reporting"),
-            Some(MetadataStatement::ShowViews {
-                database: None,
-                schema: Some("reporting".to_string())
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("ALTER USER analytics_reader PASSWORD 'reader-next'"),
-            Some(MetadataStatement::AlterUserPassword {
-                name: "analytics_reader".to_string(),
-                password: "reader-next".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("ALTER USER analytics_reader PASSWORD 'reader''s next'"),
-            Some(MetadataStatement::AlterUserPassword {
-                name: "analytics_reader".to_string(),
-                password: "reader's next".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("ALTER USER analytics_reader PASSWORD reader-next"),
-            None
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM pg_catalog.pg_tables"),
-            Some(MetadataStatement::PgCatalogTables {
-                sql: "SELECT * FROM pg_catalog.pg_tables".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM pg_catalog.pg_views"),
-            Some(MetadataStatement::PgCatalogViews {
-                sql: "SELECT * FROM pg_catalog.pg_views".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM pg_catalog.pg_namespace"),
-            Some(MetadataStatement::PgCatalogNamespace {
-                sql: "SELECT * FROM pg_catalog.pg_namespace".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM pg_catalog.pg_database"),
-            Some(MetadataStatement::PgCatalogDatabase {
-                sql: "SELECT * FROM pg_catalog.pg_database".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM pg_catalog.pg_roles"),
-            Some(MetadataStatement::PgCatalogRoles {
-                sql: "SELECT * FROM pg_catalog.pg_roles".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.schemata"),
-            Some(MetadataStatement::InformationSchemaSchemata {
-                sql: "SELECT * FROM information_schema.schemata".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.tables"),
-            Some(MetadataStatement::InformationSchemaTables {
-                sql: "SELECT * FROM information_schema.tables".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.columns"),
-            Some(MetadataStatement::InformationSchemaColumns {
-                sql: "SELECT * FROM information_schema.columns".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.views"),
-            Some(MetadataStatement::InformationSchemaViews {
-                sql: "SELECT * FROM information_schema.views".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.table_constraints"),
-            Some(MetadataStatement::InformationSchemaTableConstraints {
-                sql: "SELECT * FROM information_schema.table_constraints".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.key_column_usage"),
-            Some(MetadataStatement::InformationSchemaKeyColumnUsage {
-                sql: "SELECT * FROM information_schema.key_column_usage".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.constraint_column_usage"),
-            Some(MetadataStatement::InformationSchemaConstraintColumnUsage {
-                sql: "SELECT * FROM information_schema.constraint_column_usage".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.constraint_table_usage"),
-            Some(MetadataStatement::InformationSchemaConstraintTableUsage {
-                sql: "SELECT * FROM information_schema.constraint_table_usage".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_metadata_statement("SELECT * FROM information_schema.referential_constraints"),
-            Some(MetadataStatement::InformationSchemaReferentialConstraints {
-                sql: "SELECT * FROM information_schema.referential_constraints".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn bootstraps_when_catalog_file_exists_but_is_empty() {
-        let path = temp_catalog_path("empty");
-        fs::write(&path, "").expect("empty catalog file should be written");
-
-        let control_plane =
-            ControlPlane::from_catalog_path(&path).expect("empty file should bootstrap");
-        let databases = control_plane
-            .list_databases(&default_session())
-            .expect("databases should list after bootstrap");
-
-        assert!(databases.iter().any(|database| database == "postgres"));
-
-        let _ = fs::remove_file(path);
     }
 }

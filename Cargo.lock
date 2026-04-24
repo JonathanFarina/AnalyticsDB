@@ -82,6 +82,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -99,9 +100,14 @@ dependencies = [
  "analyticsdb-control",
  "analyticsdb-core",
  "anyhow",
+ "async-trait",
  "datafusion",
+ "datafusion-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
  "serde",
  "serde_json",
+ "sqlparser",
  "tokio",
  "uuid",
 ]
