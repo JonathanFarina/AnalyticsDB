@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, fmt};
 
+use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
 use analyticsdb_core::QueryResponse;
 use analyticsdb_engine::PrototypeEngine;
 use analyticsdb_protocol::{serve_flight_sql, serve_postgres_wire};
@@ -22,9 +23,12 @@ enum SqlCapability {
     CreateViewQualified,
     InsertValues,
     InsertValuesColumnList,
+    Delete,
+    Truncate,
     ShowDatabases,
     ShowSchemas,
     ShowSchemasFromDatabase,
+    ShowNodes,
     ShowTables,
     ShowTablesFromSchema,
     ShowTablesFromDatabaseSchema,
@@ -34,6 +38,14 @@ enum SqlCapability {
     ShowColumns,
     Describe,
     AlterUserPassword,
+    DropTable,
+    DropView,
+    DropSchema,
+    DropDatabase,
+    Update,
+    AlterTable,
+    Explain,
+    AlterSchema,
 }
 
 impl fmt::Display for SqlCapability {
@@ -62,30 +74,46 @@ fn documented_sql_capabilities_from_readme() -> BTreeSet<SqlCapability> {
 
         let capability = if line.starts_with("- `CREATE DATABASE") {
             SqlCapability::CreateDatabase
-        } else if line.starts_with("- `CREATE SCHEMA <database>.<name>") {
-            SqlCapability::CreateSchemaQualified
-        } else if line.starts_with("- `CREATE SCHEMA <name>") {
+        } else if line.starts_with("- `CREATE SCHEMA <name>`") {
             SqlCapability::CreateSchema
-        } else if line.starts_with("- `CREATE TABLE <schema>.<name> AS") {
-            SqlCapability::CreateTableQualifiedAs
+        } else if line.starts_with("- `CREATE SCHEMA <database>.<name>`") {
+            SqlCapability::CreateSchemaQualified
+        } else if line.starts_with("- `ALTER SCHEMA <name> RENAME TO") {
+            SqlCapability::AlterSchema
+        } else if line.starts_with("- `ALTER SCHEMA <database>.<name> RENAME TO") {
+            SqlCapability::AlterSchema
         } else if line.starts_with("- `CREATE TABLE <name> AS") {
             SqlCapability::CreateTableAs
-        } else if line.starts_with("- `CREATE TABLE <schema>.<name> (") {
-            SqlCapability::CreateTableQualifiedDefined
+        } else if line.starts_with("- `CREATE TABLE <schema>.<name> AS") {
+            SqlCapability::CreateTableQualifiedAs
         } else if line.starts_with("- `CREATE TABLE <name> (") {
             SqlCapability::CreateTableDefined
-        } else if line.starts_with("- `CREATE VIEW <schema>.<name>") {
-            SqlCapability::CreateViewQualified
-        } else if line.starts_with("- `CREATE VIEW <name>") {
+        } else if line.starts_with("- `CREATE TABLE <schema>.<name> (") {
+            SqlCapability::CreateTableQualifiedDefined
+        } else if line.starts_with("- `CREATE VIEW <name> AS") {
             SqlCapability::CreateView
-        } else if line.starts_with("- `INSERT INTO <table> (<column>") {
-            SqlCapability::InsertValuesColumnList
+        } else if line.starts_with("- `CREATE VIEW <schema>.<name> AS") {
+            SqlCapability::CreateViewQualified
         } else if line.starts_with("- `INSERT INTO <table> VALUES") {
             SqlCapability::InsertValues
+        } else if line.starts_with("- `INSERT INTO <table> (<column>") {
+            SqlCapability::InsertValuesColumnList
+        } else if line.starts_with("- `UPDATE <table>") {
+            SqlCapability::Update
+        } else if line.starts_with("- `DELETE FROM <table>") {
+            SqlCapability::Delete
+        } else if line.starts_with("- `TRUNCATE TABLE <table>") {
+            SqlCapability::Truncate
+        } else if line.starts_with("- `ALTER TABLE <table> ADD COLUMN") {
+            SqlCapability::AlterTable
+        } else if line.starts_with("- `ALTER TABLE <table> RENAME TO") {
+            SqlCapability::AlterTable
         } else if line.starts_with("- `SHOW DATABASES`") {
             SqlCapability::ShowDatabases
         } else if line.starts_with("- `SHOW SCHEMAS FROM <database>`") {
             SqlCapability::ShowSchemasFromDatabase
+        } else if line.starts_with("- `SHOW NODES`") {
+            SqlCapability::ShowNodes
         } else if line.starts_with("- `SHOW SCHEMAS`") {
             SqlCapability::ShowSchemas
         } else if line.starts_with("- `SHOW TABLES FROM <database>.<schema>`") {
@@ -106,6 +134,16 @@ fn documented_sql_capabilities_from_readme() -> BTreeSet<SqlCapability> {
             SqlCapability::Describe
         } else if line.starts_with("- `ALTER USER <name> PASSWORD '<new>'`") {
             SqlCapability::AlterUserPassword
+        } else if line.starts_with("- `EXPLAIN <query>`") {
+            SqlCapability::Explain
+        } else if line.starts_with("- `DROP DATABASE <name>`") {
+            SqlCapability::DropDatabase
+        } else if line.starts_with("- `DROP SCHEMA <name>`") {
+            SqlCapability::DropSchema
+        } else if line.starts_with("- `DROP TABLE <table>`") {
+            SqlCapability::DropTable
+        } else if line.starts_with("- `DROP VIEW <view>`") {
+            SqlCapability::DropView
         } else {
             panic!("Unmapped README SQL bullet in supported subset: {line}");
         };
@@ -129,9 +167,14 @@ fn parity_matrix_sql_capabilities() -> BTreeSet<SqlCapability> {
         SqlCapability::CreateViewQualified,
         SqlCapability::InsertValues,
         SqlCapability::InsertValuesColumnList,
+        SqlCapability::Update,
+        SqlCapability::Delete,
+        SqlCapability::Truncate,
+        SqlCapability::AlterTable,
         SqlCapability::ShowDatabases,
         SqlCapability::ShowSchemas,
         SqlCapability::ShowSchemasFromDatabase,
+        SqlCapability::ShowNodes,
         SqlCapability::ShowTables,
         SqlCapability::ShowTablesFromSchema,
         SqlCapability::ShowTablesFromDatabaseSchema,
@@ -141,6 +184,12 @@ fn parity_matrix_sql_capabilities() -> BTreeSet<SqlCapability> {
         SqlCapability::ShowColumns,
         SqlCapability::Describe,
         SqlCapability::AlterUserPassword,
+        SqlCapability::DropTable,
+        SqlCapability::DropView,
+        SqlCapability::DropSchema,
+        SqlCapability::DropDatabase,
+        SqlCapability::Explain,
+        SqlCapability::AlterSchema,
     ])
 }
 
@@ -219,7 +268,7 @@ async fn start_flight_sql_server(catalog_path: &str) -> (FlightBackgroundServer,
             .await
             .expect("engine should initialize"),
     );
-    let task = tokio::spawn(serve_flight_sql(listener, engine));
+    let task = tokio::spawn(serve_flight_sql(listener, engine, None));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3032,6 +3081,7 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
 
     enum CommandErrorExpectation {
         Exact(&'static str),
+        Substring(&'static str),
         AnyKeyword(&'static [&'static str]),
     }
 
@@ -3051,7 +3101,7 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
     let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
     let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
 
-    let success_cases = [
+    let setup_cases = [
         SuccessCase {
             name: "create analytics database",
             capability: SqlCapability::CreateDatabase,
@@ -3093,6 +3143,13 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             database: None,
             schema: None,
             sql: "SHOW SCHEMAS FROM analytics",
+        },
+        SuccessCase {
+            name: "show nodes",
+            capability: SqlCapability::ShowNodes,
+            database: None,
+            schema: None,
+            sql: "SHOW NODES",
         },
         SuccessCase {
             name: "create ctas table",
@@ -3165,6 +3222,13 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             sql: "DESCRIBE fact_ctas",
         },
         SuccessCase {
+            name: "explain query",
+            capability: SqlCapability::Explain,
+            database: None,
+            schema: None,
+            sql: "EXPLAIN SELECT 1",
+        },
+        SuccessCase {
             name: "query persisted view",
             capability: SqlCapability::Describe,
             database: None,
@@ -3207,6 +3271,27 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             sql: "SELECT metric, status FROM fact_errors ORDER BY metric",
         },
         SuccessCase {
+            name: "delete from typed table",
+            capability: SqlCapability::Delete,
+            database: None,
+            schema: None,
+            sql: "DELETE FROM fact_errors WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "truncate typed table",
+            capability: SqlCapability::Truncate,
+            database: None,
+            schema: None,
+            sql: "TRUNCATE TABLE fact_errors",
+        },
+        SuccessCase {
+            name: "re-insert into typed table after truncate",
+            capability: SqlCapability::InsertValues,
+            database: None,
+            schema: None,
+            sql: "INSERT INTO fact_errors VALUES (11, 'ok')",
+        },
+        SuccessCase {
             name: "create cross-database qualified table",
             capability: SqlCapability::CreateTableQualifiedDefined,
             database: Some("analytics"),
@@ -3243,8 +3328,138 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
         },
     ];
 
-    let covered_capabilities = success_cases
+    let drop_cases = [
+        SuccessCase {
+            name: "update typed table",
+            capability: SqlCapability::Update,
+            database: None,
+            schema: None,
+            sql: "UPDATE fact_errors SET status = 'updated' WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "alter table add column",
+            capability: SqlCapability::AlterTable,
+            database: None,
+            schema: None,
+            sql: "ALTER TABLE fact_errors ADD COLUMN is_active BOOLEAN DEFAULT true",
+        },
+        SuccessCase {
+            name: "query table after alter",
+            capability: SqlCapability::Update,
+            database: None,
+            schema: None,
+            sql: "SELECT metric, status, CASE WHEN is_active THEN 'true' ELSE 'false' END AS is_active FROM fact_errors WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "update new column",
+            capability: SqlCapability::Update,
+            database: None,
+            schema: None,
+            sql: "UPDATE fact_errors SET is_active = false WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "query table after update boolean",
+            capability: SqlCapability::Update,
+            database: None,
+            schema: None,
+            sql: "SELECT metric, status, CASE WHEN is_active THEN 'true' ELSE 'false' END AS is_active FROM fact_errors WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "rename table",
+            capability: SqlCapability::AlterTable,
+            database: None,
+            schema: None,
+            sql: "ALTER TABLE fact_errors RENAME TO fact_errors_renamed",
+        },
+        SuccessCase {
+            name: "query renamed table",
+            capability: SqlCapability::Update,
+            database: None,
+            schema: None,
+            sql: "SELECT metric, status, CASE WHEN is_active THEN 'true' ELSE 'false' END AS is_active FROM fact_errors_renamed WHERE metric = 11",
+        },
+        SuccessCase {
+            name: "create schema to rename",
+            capability: SqlCapability::CreateSchema,
+            database: None,
+            schema: None,
+            sql: "CREATE SCHEMA to_be_renamed",
+        },
+        SuccessCase {
+            name: "rename schema",
+            capability: SqlCapability::AlterSchema,
+            database: None,
+            schema: None,
+            sql: "ALTER SCHEMA to_be_renamed RENAME TO renamed_schema",
+        },
+        SuccessCase {
+            name: "show tables in renamed schema",
+            capability: SqlCapability::ShowTablesFromSchema,
+            database: None,
+            schema: None,
+            sql: "SHOW TABLES FROM renamed_schema",
+        },
+        SuccessCase {
+            name: "drop renamed schema",
+            capability: SqlCapability::DropSchema,
+            database: None,
+            schema: None,
+            sql: "DROP SCHEMA renamed_schema",
+        },
+        SuccessCase {
+            name: "drop qualified view",
+            capability: SqlCapability::DropView,
+            database: None,
+            schema: None,
+            sql: "DROP VIEW reporting.daily_metrics_reporting",
+        },
+        SuccessCase {
+            name: "drop view",
+            capability: SqlCapability::DropView,
+            database: None,
+            schema: None,
+            sql: "DROP VIEW daily_metrics",
+        },
+        SuccessCase {
+            name: "drop qualified table",
+            capability: SqlCapability::DropTable,
+            database: None,
+            schema: None,
+            sql: "DROP TABLE reporting.fact_ctas_reporting",
+        },
+        SuccessCase {
+            name: "drop table",
+            capability: SqlCapability::DropTable,
+            database: None,
+            schema: None,
+            sql: "DROP TABLE fact_ctas",
+        },
+        SuccessCase {
+            name: "drop qualified schema",
+            capability: SqlCapability::DropSchema,
+            database: None,
+            schema: None,
+            sql: "DROP SCHEMA analytics.reporting CASCADE",
+        },
+        SuccessCase {
+            name: "drop schema",
+            capability: SqlCapability::DropSchema,
+            database: None,
+            schema: None,
+            sql: "DROP SCHEMA reporting CASCADE",
+        },
+        SuccessCase {
+            name: "drop database",
+            capability: SqlCapability::DropDatabase,
+            database: None,
+            schema: None,
+            sql: "DROP DATABASE analytics",
+        },
+    ];
+
+    let covered_capabilities = setup_cases
         .iter()
+        .chain(drop_cases.iter())
         .map(|case| case.capability)
         .collect::<BTreeSet<_>>();
     assert_eq!(
@@ -3258,7 +3473,7 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
         "matrix cases and README supported SQL subset diverged"
     );
 
-    for case in success_cases {
+    for case in setup_cases {
         let postgres = protocol_json_response_with_context(
             "postgres",
             &postgres_endpoint,
@@ -3400,6 +3615,36 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             sql: "ALTER USER postgres PASSWORD 'next'",
             expectation: CommandErrorExpectation::Exact("not allowed to rotate credentials"),
         },
+        CommandErrorCase {
+            name: "rename missing table error",
+            database: None,
+            schema: None,
+            user: "postgres",
+            role: Some("postgres"),
+            password: Some("postgres"),
+            sql: "ALTER TABLE missing_table RENAME TO new_name",
+            expectation: CommandErrorExpectation::Substring("not found"),
+        },
+        CommandErrorCase {
+            name: "rename table to existing error",
+            database: None,
+            schema: None,
+            user: "postgres",
+            role: Some("postgres"),
+            password: Some("postgres"),
+            sql: "ALTER TABLE fact_ctas RENAME TO fact_ctas",
+            expectation: CommandErrorExpectation::Substring("already exists"),
+        },
+        CommandErrorCase {
+            name: "rename missing schema error",
+            database: None,
+            schema: None,
+            user: "postgres",
+            role: Some("postgres"),
+            password: Some("postgres"),
+            sql: "ALTER SCHEMA missing_schema RENAME TO new_name",
+            expectation: CommandErrorExpectation::Substring("not found"),
+        },
     ];
 
     for case in command_error_cases {
@@ -3432,6 +3677,14 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
                     expected_substring,
                 );
             }
+            CommandErrorExpectation::Substring(expected_substring) => {
+                assert_supported_protocol_command_error_equivalence(
+                    case.name,
+                    &postgres,
+                    &flight_sql,
+                    expected_substring,
+                );
+            }
             CommandErrorExpectation::AnyKeyword(keywords) => {
                 assert_supported_protocol_command_error_contains_any(
                     case.name,
@@ -3441,6 +3694,24 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
                 );
             }
         }
+    }
+
+    for case in drop_cases {
+        let postgres = protocol_json_response_with_context(
+            "postgres",
+            &postgres_endpoint,
+            case.database,
+            case.schema,
+            case.sql,
+        );
+        let flight_sql = protocol_json_response_with_context(
+            "flight-sql",
+            &flight_endpoint,
+            case.database,
+            case.schema,
+            case.sql,
+        );
+        assert_supported_protocol_equivalence(case.name, &postgres, &flight_sql);
     }
 
     cleanup_catalog_artifacts(&postgres_catalog_path);
@@ -4341,4 +4612,161 @@ async fn cli_registers_external_parquet_table_and_queries_it() {
 
     cleanup_catalog_artifacts(&catalog_path);
     let _ = std::fs::remove_file(&parquet_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_ddl_comprehensive_lifecycle() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    let ddl_sequence = [
+        // 1. Database Lifecycle
+        "CREATE DATABASE corp_data",
+        "SHOW DATABASES",
+        // 2. Schema Lifecycle
+        "CREATE SCHEMA corp_data.finance",
+        "SHOW SCHEMAS FROM corp_data",
+        // 3. Table Lifecycle (Managed with constraints/defaults)
+        "CREATE TABLE corp_data.finance.ledger (
+            entry_id INT PRIMARY KEY,
+            account_name TEXT NOT NULL,
+            amount DOUBLE PRECISION DEFAULT 0.0,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        "SHOW TABLES FROM corp_data.finance",
+        "DESCRIBE corp_data.finance.ledger",
+        // 4. Data sanity check
+        "INSERT INTO corp_data.finance.ledger (entry_id, account_name) VALUES (1, 'Cash')",
+        "SELECT entry_id, account_name, amount FROM corp_data.finance.ledger",
+        // 5. View Lifecycle
+        "CREATE VIEW corp_data.finance.summary AS SELECT account_name, SUM(amount) FROM corp_data.finance.ledger GROUP BY account_name",
+        "SHOW VIEWS FROM corp_data.finance",
+        // 6. Cleanup Lifecycle (CASCADE and IF EXISTS)
+        "DROP VIEW corp_data.finance.summary",
+        "DROP TABLE IF EXISTS corp_data.finance.ledger",
+        "DROP SCHEMA corp_data.finance CASCADE",
+        "DROP DATABASE corp_data",
+    ];
+
+    for sql in ddl_sequence {
+        let response = protocol_json_response("postgres", &endpoint, None, sql);
+        assert!(!response.message.is_empty(), "DDL command '{}' should return a success message", sql);
+    }
+
+    // Final verification that DB is gone
+    let final_dbs = protocol_json_response("postgres", &endpoint, None, "SHOW DATABASES");
+    let has_corp = final_dbs.rows.iter().any(|row| row[0] == "corp_data");
+    assert!(!has_corp, "corp_data database should have been dropped");
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_omitted_column_with_default() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. Create table with the user's exact SQL (variant with parentheses)
+    protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "CREATE TABLE customers_v2 (
+    id INT PRIMARY KEY,
+    first_name VARCHAR(50) NOT NULL,
+    last_name VARCHAR(50) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)",
+    );
+
+    // 2. Insert row omitting created_at
+    protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "INSERT INTO customers_v2 (id, first_name, last_name, email) VALUES (8, 'Jane', 'Smith', 'jane.smith@example.com')",
+    );
+
+    // 3. Verify results
+    let response = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT id, first_name, last_name, email, created_at FROM customers_v2",
+    );
+
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0][0], "8");
+    assert_eq!(response.rows[0][4].contains('T'), true);
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_single_endpoint_routing_via_control_plane() {
+    let catalog_path = temp_catalog_path();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("local addr should exist");
+    
+    let engine = Arc::new(
+        PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize"),
+    );
+
+    // 1. Register a specific node ID
+    let expected_node_id = "test-coordinator-42";
+    engine.control_plane().register_node(ClusterNode {
+        id: expected_node_id.to_string(),
+        role: NodeRole::Control,
+        endpoint: addr.to_string(),
+        status: NodeStatus::Ready,
+        last_heartbeat_at_epoch_ms: 0,
+    }).await.expect("node registration should succeed");
+
+    let task = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 2. Query and verify the node is registered
+    let response = protocol_json_response(
+        "postgres",
+        &format!("127.0.0.1:{}", addr.port()),
+        None,
+        "SHOW NODES",
+    );
+
+    // Columns: node_id, role, endpoint, status
+    let node_ids: Vec<String> = response.rows.iter().map(|r| r[0].clone()).collect();
+    assert!(node_ids.contains(&expected_node_id.to_string()));
+
+    task.abort();
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_multi_endpoint_failover() {
+    let catalog_path = temp_catalog_path();
+    
+    // 1. Start one server and then kill it to simulate failure
+    let (server1, addr1) = start_postgres_server(&catalog_path).await;
+    drop(server1); // Kill it immediately
+
+    // 2. Start a second server that is healthy
+    let (_server2, addr2) = start_postgres_server(&catalog_path).await;
+
+    // 3. Query with both endpoints, expecting failover to work
+    let response = protocol_json_response(
+        "postgres",
+        &format!("{},{}", addr1, addr2),
+        None,
+        "SELECT 1",
+    );
+
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0][0], "1");
+
+    cleanup_catalog_artifacts(&catalog_path);
 }

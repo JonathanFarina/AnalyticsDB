@@ -83,23 +83,24 @@ The repository now contains a real prototype foundation. Today that means:
 - a protocol crate and prototype server binary for PostgreSQL wire and Arrow Flight SQL listeners
 - a CLI that can submit SQL in embedded mode and can also act as a PostgreSQL wire or Arrow Flight SQL client
 - a small metadata SQL subset for databases, schemas, views, and prototype `ALTER USER ... PASSWORD ...` rotation
-- a managed-table prototype for `CREATE TABLE ... AS SELECT ...` backed by persisted column-oriented JSON snapshots
-- a managed-table prototype for explicit `CREATE TABLE (...)` definitions and `INSERT INTO ... VALUES ...` writes backed by the same persisted column-oriented JSON snapshots
+- a managed-table prototype for `CREATE TABLE ... AS SELECT ...` backed by directories of native Parquet files
+- a managed-table prototype for explicit `CREATE TABLE (...)` definitions and `INSERT INTO ... VALUES ...` writes backed by the same native Parquet directories
 - persisted views that can be created through SQL and queried later through the CLI in embedded mode
 - persisted managed tables that can be materialized through SQL and queried later through the CLI in embedded mode
-- persisted managed tables that can be defined, inserted into, introspected, and queried later through the CLI in embedded mode
+- persisted managed tables that can be defined, inserted into, updated via `DELETE`/`TRUNCATE`, introspected, and queried later through the CLI in embedded mode
 - current managed-table inserts support whole-row values plus column-list value insertion for the tested embedded prototype subset
 - current metadata listing supports schema-scoped `SHOW TABLES FROM ...` and `SHOW VIEWS FROM ...` for the tested embedded prototype subset
 - persisted managed tables that can describe their columns through SQL in later CLI sessions
 - a PostgreSQL wire prototype that supports connection startup, simple queries, and a tested parameterized extended-query subset against the current engine path
-- an Arrow Flight SQL prototype that supports statement query, statement update, and basic metadata discovery for catalogs, schemas, tables, and table types
+- an Arrow Flight SQL prototype that supports statement query, statement update, **prepared statements** (with schema planning), **TLS encryption**, and basic metadata discovery for catalogs, schemas, tables, and table types
+- integrated **structured logging and tracing** via the `tracing` crate, with `RUST_LOG` support
 - build/test automation that verifies current SQL behavior through the CLI
 
 Everything beyond that remains early-stage. In particular:
 
 - no distributed execution exists yet
-- no native managed storage exists yet
-- no external Parquet or Iceberg table path exists yet
+- no native managed storage exists yet (currently local Parquet directories)
+- no external Iceberg table path exists yet
 - no web console exists yet
 - no Kubernetes deployment assets exist yet
 - no benchmark claims are valid yet
@@ -107,10 +108,10 @@ Everything beyond that remains early-stage. In particular:
 - no broad PostgreSQL extended query compatibility support exists yet
 - PostgreSQL startup and Flight SQL handshake now share a prototype auth-hook bootstrap with control-plane user lookup and bootstrap catalog passwords, but no production credential storage/rotation policy or full protocol auth coverage exists yet
 - prototype role-assumption checks now exist at session admission, but no full role/group authorization model exists yet
-- Flight SQL prepared statement scaffold exists (handler returns unimplemented) but full bind/execute/close protocol cycle is not yet complete
-- no broad Flight SQL `SqlInfo` coverage exists yet beyond the current basic prototype subset
+- Flight SQL now supports the full bind/execute/close protocol cycle for prepared statements, enabling JDBC/ODBC connectivity
+- broad Flight SQL `SqlInfo` coverage exists for core server identification and SQL dialect metadata
 - no roles/groups implementation exists yet
-- no object-storage-backed production columnar managed-table storage exists yet
+- no object-storage-backed production columnar managed-table storage exists yet (Parquet files are currently stored in a local `.managed` directory)
 
 ## Required Behaviors For Agents
 

@@ -1,26 +1,28 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use analyticsdb_control::{
-    parse_metadata_statement, CatalogColumn, CatalogRelationKind,
-    CatalogTableConstraint, CatalogTableConstraintKind, ControlPlane, ExternalStorageFormat,
+    parse_metadata_statement, AlterTableOperation, CatalogColumn, CatalogRelationKind,
+    CatalogTableConstraint, CatalogTableConstraintKind, ControlPlane,
     MetadataStatement, QueryAdmission, TableColumnDefinition, TableConstraintDefinition,
 };
 use analyticsdb_core::{QueryRequest, QueryResponse};
 use anyhow::Result;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeStringArray, NullArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, RecordBatchReader, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
-use datafusion::catalog::MemorySchemaProvider;
-use datafusion::datasource::MemTable;
+use datafusion::catalog::{CatalogProvider, MemorySchemaProvider};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use serde::{Deserialize, Serialize};
 
 pub mod functions;
 pub mod postgres_compatibility;
@@ -29,56 +31,6 @@ pub mod system_catalog;
 
 use functions::register_postgres_functions;
 use system_catalog::PgCatalogSchemaProvider;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedTableFile {
-    storage_layout: PersistedStorageLayout,
-    schema: Vec<PersistedField>,
-    columns: Vec<PersistedColumn>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedField {
-    name: String,
-    data_type: PersistedDataType,
-    nullable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-enum PersistedStorageLayout {
-    Columnar,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedColumn {
-    values: Vec<PersistedScalarValue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum PersistedDataType {
-    Boolean,
-    Float32,
-    Float64,
-    Int32,
-    Int64,
-    Null,
-    UInt32,
-    UInt64,
-    Utf8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum PersistedScalarValue {
-    Boolean(bool),
-    Float32(f32),
-    Float64(f64),
-    Int32(i32),
-    Int64(i64),
-    Null,
-    UInt32(u32),
-    UInt64(u64),
-    Utf8(String),
-}
 
 pub struct PrototypeEngine {
     control_plane: Arc<ControlPlane>,
@@ -153,6 +105,7 @@ impl PrototypeEngine {
         config.options_mut().sql_parser.enable_ident_normalization = false;
         config.options_mut().sql_parser.parse_float_as_decimal = true;
         config.options_mut().optimizer.skip_failed_rules = true;
+        config.options_mut().execution.parquet.schema_force_view_types = false;
 
         // Use the session's schema as the default for resolution.
         let config = config
@@ -165,31 +118,48 @@ impl PrototypeEngine {
 
         register_postgres_functions(&context);
 
-        let default_catalog = context
-            .catalog("datafusion")
-            .expect("default catalog should exist");
+        // Register ALL databases from the ControlPlane as top-level Catalogs in DataFusion
+        let snapshot = self.control_plane.cluster_snapshot().await;
+        for database in snapshot.databases {
+            // Register every database as a top-level catalog for 'db.schema.table' resolution
+            let catalog_provider = Arc::new(datafusion::catalog::MemoryCatalogProvider::new());
+            context.register_catalog(&database.name, catalog_provider.clone());
 
-        // Always ensure public schema exists
-        if default_catalog.schema("public").is_none() {
-            default_catalog.register_schema("public", Arc::new(MemorySchemaProvider::new()))?;
-        }
-        
-        // Ensure all schemas in the database are registered in DataFusion
-        let schemas = self.control_plane.list_schemas(session, Some(&session.database)).await?;
-        for schema_name in schemas {
-            if default_catalog.schema(&schema_name).is_none() {
-                default_catalog.register_schema(&schema_name, Arc::new(MemorySchemaProvider::new()))?;
+            for schema_name in database.schemas {
+                if catalog_provider.schema(&schema_name).is_none() {
+                    catalog_provider.register_schema(&schema_name, Arc::new(MemorySchemaProvider::new()))?;
+                }
+                
+                // If it's the current session database, mirror schemas in the default 'datafusion' catalog
+                if database.name == session.database {
+                    let default_catalog = context.catalog("datafusion").unwrap();
+                    if default_catalog.schema(&schema_name).is_none() {
+                        default_catalog.register_schema(&schema_name, Arc::new(MemorySchemaProvider::new()))?;
+                    }
+                }
+            }
+            
+            // Always register pg_catalog in every database for parity
+            if catalog_provider.schema("pg_catalog").is_none() {
+                catalog_provider.register_schema(
+                    "pg_catalog",
+                    Arc::new(PgCatalogSchemaProvider::new(Arc::clone(&self.control_plane))),
+                )?;
             }
         }
+        
+        // Also register pg_catalog in default catalog for standard unqualified UDF resolution
+        let default_catalog = context.catalog("datafusion").unwrap();
+        if default_catalog.schema("pg_catalog").is_none() {
+             default_catalog.register_schema(
+                "pg_catalog",
+                Arc::new(PgCatalogSchemaProvider::new(Arc::clone(&self.control_plane))),
+            )?;
+        }
 
-        default_catalog.register_schema(
-            "pg_catalog",
-            Arc::new(PgCatalogSchemaProvider::new(Arc::clone(&self.control_plane))),
-        )?;
-
-        // Register relations for the entire database into their respective schemas in DataFusion
-        register_persisted_tables(&context, &self.control_plane, session).await?;
-        register_persisted_views(&context, &self.control_plane, session).await?;
+        // Register ALL relations from ALL databases into their respective catalogs/schemas in DataFusion
+        register_persisted_tables_comprehensive(&context, &self.control_plane, session).await?;
+        register_persisted_views_comprehensive(&context, &self.control_plane, session).await?;
 
         Ok(context)
     }
@@ -246,6 +216,45 @@ impl PrototypeEngine {
             message: format!("Query executed successfully. {row_count} row(s) returned."),
             execution_time_ms: started.elapsed().as_millis(),
         })
+    }
+
+    pub async fn plan_query_schema(&self, request: &QueryRequest) -> Result<Option<SchemaRef>> {
+        if let Some(statement) = parse_metadata_statement(&request.sql) {
+            match statement {
+                MetadataStatement::ShowDatabases
+                | MetadataStatement::ShowSchemas { .. }
+                | MetadataStatement::ShowTables { .. }
+                | MetadataStatement::ShowViews { .. }
+                | MetadataStatement::ShowColumns { .. }
+                | MetadataStatement::InformationSchemaSchemata { .. }
+                | MetadataStatement::InformationSchemaTables { .. }
+                | MetadataStatement::InformationSchemaColumns { .. }
+                | MetadataStatement::InformationSchemaViews { .. }
+                | MetadataStatement::InformationSchemaTableConstraints { .. }
+                | MetadataStatement::InformationSchemaKeyColumnUsage { .. }
+                | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
+                | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
+                | MetadataStatement::InformationSchemaReferentialConstraints { .. } => {
+                    // These return schemas, but for simplicity in prototype we can just 
+                    // return None and let execute handle it, or return specific schemas.
+                    // For now, return None to imply "not a simple table query".
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let control_plane = Arc::clone(&self.control_plane);
+        let sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
+            &request.sql,
+            &control_plane,
+            &request.session,
+        )
+        .await?;
+
+        let context = self.create_session_context(&request.session).await?;
+        let dataframe = context.sql(&sql).await?;
+        Ok(Some(Arc::new(dataframe.schema().as_arrow().as_ref().clone())))
     }
 
     async fn execute_metadata_query(
@@ -623,8 +632,8 @@ impl PrototypeEngine {
                 let storage_path_for_write = storage_path.clone();
                 let (row_count, columns_metadata) = async move {
                     let context = SessionContext::new();
-                    register_persisted_tables(&context, &control_plane, &session).await?;
-                    register_persisted_views(&context, &control_plane, &session).await?;
+                    register_persisted_tables_comprehensive(&context, &control_plane, &session).await?;
+                    register_persisted_views_comprehensive(&context, &control_plane, &session).await?;
                     let dataframe = context.sql(&query_sql).await?;
                     let arrow_schema = dataframe.schema().as_arrow().clone();
                     let batches = dataframe.collect().await?;
@@ -672,7 +681,7 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let arrow_schema = build_arrow_schema_from_definitions(&columns)?;
+                let arrow_schema = build_arrow_schema_from_definitions(&columns, false)?;
 
                 persist_empty_table_snapshot(&storage_path, &arrow_schema)?;
 
@@ -721,8 +730,20 @@ impl PrototypeEngine {
                         relation.name
                     )
                 })?;
+
+                let column_definitions: Vec<TableColumnDefinition> = relation.columns.iter().map(|c| {
+                    TableColumnDefinition {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                        nullable: c.nullable,
+                        default_value: c.default_value.clone(),
+                    }
+                }).collect();
+                let arrow_schema = build_arrow_schema_from_definitions(&column_definitions, false)?;
+
                 let inserted_row_count = append_rows_to_table_snapshot(
                     Path::new(storage_path),
+                    &arrow_schema,
                     columns.as_deref(),
                     &rows,
                 )?;
@@ -733,6 +754,455 @@ impl PrototypeEngine {
                     format!(
                         "Inserted {inserted_row_count} row(s) into '{}.{}.{}'.",
                         relation.database, relation.schema, relation.name
+                    ),
+                )
+            }
+            MetadataStatement::Delete {
+                database,
+                schema,
+                name,
+                selection_sql,
+            } => {
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+                let storage_path_str = relation.storage_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Managed table '{}.{}.{}' is missing a storage path",
+                        relation.database,
+                        relation.schema,
+                        relation.name
+                    )
+                })?;
+                let storage_path = Path::new(storage_path_str);
+
+                // 1. Get initial count
+                let initial_batch = load_persisted_table_snapshot(storage_path)?;
+                let initial_count = initial_batch.num_rows();
+
+                // 2. Filter rows to KEEP using DataFusion
+                let session = request.session.clone();
+                let context = self.create_session_context(&session).await?;
+
+                let filter_clause = match selection_sql {
+                    Some(sql) => format!("NOT ({})", sql),
+                    None => "FALSE".to_string(), // DELETE without WHERE means keep nothing
+                };
+
+                let sql = format!(
+                    "SELECT * FROM \"{}\".\"{}\".\"{}\" WHERE {}",
+                    relation.database, relation.schema, relation.name, filter_clause
+                );
+
+                let dataframe = context.sql(&sql).await?;
+                let remaining_batches = dataframe.collect().await?;
+                let remaining_count: usize = remaining_batches.iter().map(|b| b.num_rows()).sum();
+                let deleted_count = initial_count - remaining_count;
+
+                // 3. Overwrite the table directory with the new snapshot
+                // First, remove old files
+                if storage_path.exists() {
+                    for entry in fs::read_dir(storage_path)? {
+                        let entry = entry?;
+                        if entry.path().is_file() {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                }
+
+                if remaining_count > 0 {
+                    persist_table_snapshot(storage_path, &initial_batch.schema(), &remaining_batches)?;
+                } else {
+                    persist_empty_table_snapshot(storage_path, &initial_batch.schema())?;
+                }
+
+                // 4. Re-register to refresh DataFusion's view of the directory
+                register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!(
+                        "DELETE completed. {deleted_count} row(s) affected on '{}.{}.{}'.",
+                        relation.database, relation.schema, relation.name
+                    ),
+                )
+            }
+            MetadataStatement::Truncate {
+                database,
+                schema,
+                name,
+            } => {
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+                let storage_path_str = relation.storage_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Managed table '{}.{}.{}' is missing a storage path",
+                        relation.database,
+                        relation.schema,
+                        relation.name
+                    )
+                })?;
+                let storage_path = Path::new(storage_path_str);
+
+                // 1. Clear the directory
+                if storage_path.exists() {
+                    for entry in fs::read_dir(storage_path)? {
+                        let entry = entry?;
+                        if entry.path().is_file() {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                } else {
+                    fs::create_dir_all(storage_path)?;
+                }
+
+                // 2. Write empty snapshot to maintain schema
+                let column_definitions: Vec<TableColumnDefinition> = relation
+                    .columns
+                    .iter()
+                    .map(|c| TableColumnDefinition {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                        nullable: c.nullable,
+                        default_value: c.default_value.clone(),
+                    })
+                    .collect();
+                let arrow_schema = build_arrow_schema_from_definitions(&column_definitions, false)?;
+                persist_empty_table_snapshot(storage_path, &arrow_schema)?;
+
+                // 3. Re-register
+                let session = request.session.clone();
+                let context = self.create_session_context(&session).await?;
+                register_persisted_tables_comprehensive(&context, &self.control_plane, &session)
+                    .await?;
+
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!(
+                        "TRUNCATE completed on '{}.{}.{}'.",
+                        relation.database, relation.schema, relation.name
+                    ),
+                )
+            }
+            MetadataStatement::Update {
+                database,
+                schema,
+                name,
+                assignments,
+                selection_sql,
+            } => {
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+                let storage_path_str = relation.storage_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Managed table '{}.{}.{}' is missing a storage path",
+                        relation.database,
+                        relation.schema,
+                        relation.name
+                    )
+                })?;
+                let storage_path = Path::new(storage_path_str);
+
+                // 1. Get initial count
+                let initial_batch = load_persisted_table_snapshot(storage_path)?;
+                let initial_count = initial_batch.num_rows();
+
+                // 2. Perform UPDATE using DataFusion SELECT CASE
+                let session = request.session.clone();
+                let context = self.create_session_context(&session).await?;
+
+                let mut select_expressions = Vec::new();
+                for col in &relation.columns {
+                    if let Some((_, new_expr)) = assignments.iter().find(|(c, _)| c == &col.name) {
+                        let filter = selection_sql.as_deref().unwrap_or("TRUE");
+                        select_expressions.push(format!(
+                            "CASE WHEN {} THEN ({}) ELSE \"{}\" END AS \"{}\"",
+                            filter, new_expr, col.name, col.name
+                        ));
+                    } else {
+                        select_expressions.push(format!("\"{}\"", col.name));
+                    }
+                }
+
+                let sql = format!(
+                    "SELECT {} FROM \"{}\".\"{}\".\"{}\"",
+                    select_expressions.join(", "),
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
+
+                let dataframe = context.sql(&sql).await?;
+                let updated_batches = dataframe.collect().await?;
+                let updated_count: usize = updated_batches.iter().map(|b| b.num_rows()).sum();
+
+                // 3. Overwrite the table directory with the new snapshot
+                if storage_path.exists() {
+                    for entry in fs::read_dir(storage_path)? {
+                        let entry = entry?;
+                        if entry.path().is_file() {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                }
+
+                if updated_count > 0 {
+                    persist_table_snapshot(storage_path, &updated_batches[0].schema(), &updated_batches)?;
+                } else {
+                    persist_empty_table_snapshot(storage_path, &initial_batch.schema())?;
+                }
+
+                // 4. Re-register
+                register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!(
+                        "UPDATE completed. {initial_count} row(s) updated on '{}.{}.{}'.",
+                        relation.database, relation.schema, relation.name
+                    ),
+                )
+            }
+            MetadataStatement::AlterTable {
+                database,
+                schema,
+                name,
+                operation,
+            } => {
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+
+                match operation {
+                    AlterTableOperation::AddColumn { column } => {
+                        let new_column_name = column.name.clone();
+                        // 1. Update Catalog
+                        let catalog_column = CatalogColumn {
+                            name: column.name.clone(),
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                            default_value: column.default_value.clone(),
+                        };
+                        self.control_plane
+                            .add_column(
+                                &request.session,
+                                database.as_deref(),
+                                schema.as_deref(),
+                                &name,
+                                catalog_column,
+                            )
+                            .await?;
+
+                        // 2. Physically update Parquet files (if table is managed)
+                        if let Some(storage_path_str) = &relation.storage_path {
+                            let storage_path = Path::new(storage_path_str);
+                            if storage_path.exists() {
+                                let session = request.session.clone();
+                                let context = self.create_session_context(&session).await?;
+
+                                // Refresh to see the new column in metadata (though physically not there yet)
+                                register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+
+                                let mut select_expressions = Vec::new();
+                                for col in &relation.columns {
+                                    select_expressions.push(format!("\"{}\"", col.name));
+                                }
+                                // Add the new column as NULL or default
+                                let default_expr = column.default_value.as_deref().unwrap_or("NULL");
+                                select_expressions.push(format!("CAST({} AS {}) AS \"{}\"", default_expr, column.data_type, column.name));
+
+                                let sql = format!(
+                                    "SELECT {} FROM \"{}\".\"{}\".\"{}\"",
+                                    select_expressions.join(", "),
+                                    relation.database,
+                                    relation.schema,
+                                    relation.name
+                                );
+
+                                let dataframe = context.sql(&sql).await?;
+                                let new_batches = dataframe.collect().await?;
+
+                                // Overwrite
+                                for entry in fs::read_dir(storage_path)? {
+                                    let entry = entry?;
+                                    if entry.path().is_file() {
+                                        fs::remove_file(entry.path())?;
+                                    }
+                                }
+                                if !new_batches.is_empty() {
+                                    persist_table_snapshot(storage_path, &new_batches[0].schema(), &new_batches)?;
+                                } else {
+                                    // Handle empty table case
+                                    let column_definitions: Vec<TableColumnDefinition> = relation.columns.iter().map(|c| TableColumnDefinition {
+                                        name: c.name.clone(),
+                                        data_type: c.data_type.clone(),
+                                        nullable: c.nullable,
+                                        default_value: c.default_value.clone(),
+                                    }).collect();
+                                    // Add the new column definition
+                                    let mut updated_defs = column_definitions;
+                                    updated_defs.push(column);
+                                    let arrow_schema = build_arrow_schema_from_definitions(&updated_defs, false)?;
+                                    persist_empty_table_snapshot(storage_path, &arrow_schema)?;
+                                }
+                                
+                                // Re-register again to see the physical change
+                                register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+                            }
+                        }
+
+                        (
+                            Arc::new(Schema::empty()),
+                            Vec::new(),
+                            format!(
+                                "ALTER TABLE completed. Column '{}' added to '{}.{}.{}'.",
+                                new_column_name, relation.database, relation.schema, relation.name
+                            ),
+                        )
+                    }
+                    AlterTableOperation::RenameTable { new_name } => {
+                        // 1. Rename catalog metadata
+                        self.control_plane
+                            .rename_relation(
+                                &request.session,
+                                database.as_deref(),
+                                schema.as_deref(),
+                                &name,
+                                &new_name,
+                            )
+                            .await?;
+
+                        // 2. Physically rename managed directory if it exists
+                        if let Some(storage_path_str) = &relation.storage_path {
+                            let old_path = Path::new(storage_path_str);
+                            if old_path.exists() {
+                                // Calculate new path by replacing the table name part
+                                // Managed tables use names like <db>__<schema>__<table>.table.parquet
+                                let file_name = old_path.file_name().unwrap().to_str().unwrap();
+                                let old_suffix = format!("{}.table.parquet", name);
+                                let new_suffix = format!("{}.table.parquet", new_name);
+                                let new_file_name = file_name.replace(&old_suffix, &new_suffix);
+                                let new_path = old_path.with_file_name(new_file_name);
+
+                                fs::rename(old_path, &new_path)?;
+
+                                // 3. Update the storage path in catalog after physical rename
+                                self.control_plane
+                                    .update_relation_storage_path(
+                                        &request.session,
+                                        database.as_deref(),
+                                        schema.as_deref(),
+                                        &new_name,
+                                        new_path.to_str().unwrap(),
+                                    )
+                                    .await?;
+                            }
+                        }
+
+                        // 4. Re-register relations
+                        let session = request.session.clone();
+                        let context = self.create_session_context(&session).await?;
+                        register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+
+                        (
+                            Arc::new(Schema::empty()),
+                            Vec::new(),
+                            format!(
+                                "ALTER TABLE completed. Relation '{}.{}.{}' renamed to '{}'.",
+                                relation.database, relation.schema, relation.name, new_name
+                            ),
+                        )
+                    }
+                }
+            }
+            MetadataStatement::AlterSchema {
+                database,
+                name,
+                new_name,
+            } => {
+                // 1. Get all relations in this schema to update their physical paths if managed
+                let relations = self
+                    .control_plane
+                    .list_relations(
+                        &request.session,
+                        database.as_deref(),
+                        Some(&name),
+                        CatalogRelationKind::Table,
+                    )
+                    .await?;
+
+                // 2. Rename schema in catalog
+                self.control_plane
+                    .rename_schema(&request.session, database.as_deref(), &name, &new_name)
+                    .await?;
+
+                // 3. Physically rename managed directories and update metadata
+                let database_name = database.as_deref().unwrap_or(&request.session.database);
+                for relation in relations {
+                    if let Some(storage_path_str) = &relation.storage_path {
+                        let old_path = Path::new(storage_path_str);
+                        if old_path.exists() {
+                            let file_name = old_path.file_name().unwrap().to_str().unwrap();
+                            let old_prefix = format!("{}__{}__", database_name, name);
+                            let new_prefix = format!("{}__{}__", database_name, new_name);
+                            let new_file_name = file_name.replace(&old_prefix, &new_prefix);
+                            let new_path = old_path.with_file_name(new_file_name);
+
+                            fs::rename(old_path, &new_path)?;
+
+                            self.control_plane
+                                .update_relation_storage_path(
+                                    &request.session,
+                                    Some(database_name),
+                                    Some(&new_name),
+                                    &relation.name,
+                                    new_path.to_str().unwrap(),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+
+                // 4. Re-register relations
+                let session = request.session.clone();
+                let context = self.create_session_context(&session).await?;
+                register_persisted_tables_comprehensive(&context, &self.control_plane, &session).await?;
+
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!(
+                        "ALTER SCHEMA completed. Schema '{}.{}' renamed to '{}'.",
+                        database_name, name, new_name
                     ),
                 )
             }
@@ -766,6 +1236,27 @@ impl PrototypeEngine {
                     batch.schema(),
                     vec![batch],
                     format!("{row_count} schema(s) listed successfully."),
+                )
+            }
+            MetadataStatement::ShowNodes => {
+                let nodes = self.control_plane.list_nodes().await?;
+                let rows = nodes
+                    .into_iter()
+                    .map(|node| {
+                        vec![
+                            node.id,
+                            format!("{:?}", node.role),
+                            node.endpoint,
+                            format!("{:?}", node.status),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let row_count = rows.len();
+                let batch = utf8_record_batch(&["node_id", "role", "endpoint", "status"], &rows)?;
+                (
+                    batch.schema(),
+                    vec![batch],
+                    format!("{row_count} node(s) listed successfully."),
                 )
             }
             MetadataStatement::ShowTables { database, schema } => {
@@ -814,11 +1305,6 @@ impl PrototypeEngine {
                 database,
                 schema,
                 name,
-            }
-            | MetadataStatement::DescribeRelation {
-                database,
-                schema,
-                name,
             } => {
                 let rows = self
                     .control_plane
@@ -849,6 +1335,112 @@ impl PrototypeEngine {
                     vec![batch],
                     format!("{row_count} column(s) described successfully."),
                 )
+            }
+            MetadataStatement::DropTable {
+                database,
+                schema,
+                name,
+                if_exists,
+                cascade: _,
+            } => {
+                let relation = match self
+                    .control_plane
+                    .find_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await
+                {
+                    Ok(rel) => {
+                        if rel.kind != CatalogRelationKind::Table {
+                            anyhow::bail!("Relation '{}' is not a table", name);
+                        }
+                        Some(rel)
+                    }
+                    Err(_) => {
+                        if if_exists {
+                            None
+                        } else {
+                            anyhow::bail!("Table '{}' not found", name);
+                        }
+                    }
+                };
+
+                if let Some(rel) = relation {
+                    // For managed tables, delete the storage directory
+                    if rel.external_format.is_none() {
+                        if let Some(path_str) = &rel.storage_path {
+                            let path = Path::new(path_str);
+                            if path.exists() {
+                                fs::remove_dir_all(path)?;
+                            }
+                        }
+                    }
+                }
+
+                let message = self
+                    .control_plane
+                    .drop_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                        CatalogRelationKind::Table,
+                        if_exists,
+                    )
+                    .await?;
+
+                (Arc::new(Schema::empty()), Vec::new(), message)
+            }
+            MetadataStatement::DropView {
+                database,
+                schema,
+                name,
+                if_exists,
+                cascade: _,
+            } => {
+                let message = self
+                    .control_plane
+                    .drop_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                        CatalogRelationKind::View,
+                        if_exists,
+                    )
+                    .await?;
+
+                (Arc::new(Schema::empty()), Vec::new(), message)
+            }
+            MetadataStatement::DropDatabase { name, if_exists } => {
+                let message = self
+                    .control_plane
+                    .drop_database(&request.session, &name, if_exists)
+                    .await?;
+
+                (Arc::new(Schema::empty()), Vec::new(), message)
+            }
+            MetadataStatement::DropSchema {
+                database,
+                name,
+                if_exists,
+                cascade,
+            } => {
+                let message = self
+                    .control_plane
+                    .drop_schema(
+                        &request.session,
+                        database.as_deref(),
+                        &name,
+                        if_exists,
+                        cascade,
+                    )
+                    .await?;
+
+                (Arc::new(Schema::empty()), Vec::new(), message)
             }
         };
 
@@ -1274,6 +1866,20 @@ impl PrototypeEngine {
                             referenced_unique_constraint_name,
                         });
                     }
+                    CatalogTableConstraintKind::Unique => {
+                        constraints.push(InformationSchemaConstraintRow {
+                            table_catalog: relation.database.clone(),
+                            table_schema: relation.schema.clone(),
+                            table_name: relation.name.clone(),
+                            columns: relation_constraint.columns.clone(),
+                            constraint_name: relation_constraint.name.clone(),
+                            constraint_type: "UNIQUE".to_string(),
+                            referenced_catalog: None,
+                            referenced_schema: None,
+                            referenced_table: None,
+                            referenced_unique_constraint_name: None,
+                        })
+                    }
                 }
             }
         }
@@ -1602,24 +2208,6 @@ fn parse_single_quoted_sql_literal(raw: &str) -> Result<String> {
     Ok(out)
 }
 
-impl PersistedField {
-    fn from_arrow(field: &Field) -> Result<Self> {
-        Ok(Self {
-            name: field.name().to_string(),
-            data_type: PersistedDataType::from_arrow(field.data_type())?,
-            nullable: field.is_nullable(),
-        })
-    }
-
-    fn to_arrow_field(&self) -> Field {
-        Field::new(
-            self.name.clone(),
-            self.data_type.to_arrow_data_type(),
-            self.nullable,
-        )
-    }
-}
-
 fn catalog_columns_from_schema(schema: &Schema) -> Vec<CatalogColumn> {
     schema
         .fields()
@@ -1628,12 +2216,13 @@ fn catalog_columns_from_schema(schema: &Schema) -> Vec<CatalogColumn> {
             name: field.name().to_string(),
             data_type: field.data_type().to_string(),
             nullable: field.is_nullable(),
+            default_value: field.metadata().get("default_value").cloned(),
         })
         .collect()
 }
 
-fn build_arrow_schema_from_definitions(columns: &[TableColumnDefinition]) -> Result<Schema> {
-    if columns.is_empty() {
+fn build_arrow_schema_from_definitions(columns: &[TableColumnDefinition], is_external: bool) -> Result<Schema> {
+    if !is_external && columns.is_empty() {
         anyhow::bail!("Managed tables must define at least one column");
     }
 
@@ -1649,11 +2238,16 @@ fn build_arrow_schema_from_definitions(columns: &[TableColumnDefinition]) -> Res
                 );
             }
 
+            let mut metadata = HashMap::new();
+            if let Some(dv) = &column.default_value {
+                metadata.insert("default_value".to_string(), dv.clone());
+            }
+
             Ok(Field::new(
                 column.name.clone(),
                 sql_type_to_arrow_data_type(&column.data_type)?,
                 column.nullable,
-            ))
+            ).with_metadata(metadata))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1718,32 +2312,55 @@ fn catalog_constraints_from_definitions(
                     referenced_columns: referenced_columns.clone(),
                 })
             }
+            TableConstraintDefinition::Unique { name, columns } => {
+                if columns.is_empty() {
+                    anyhow::bail!("UNIQUE constraint requires at least one column")
+                }
+                Ok(CatalogTableConstraint {
+                    name: name
+                        .clone()
+                        .unwrap_or_else(|| format!("{table_name}_{}_key", columns.join("_"))),
+                    kind: CatalogTableConstraintKind::Unique,
+                    columns: columns.clone(),
+                    referenced_database: None,
+                    referenced_schema: None,
+                    referenced_table: None,
+                    referenced_columns: Vec::new(),
+                })
+            }
         })
         .collect()
 }
 
 fn sql_type_to_arrow_data_type(raw: &str) -> Result<DataType> {
-    let normalized = raw.trim().to_ascii_uppercase();
+    let trimmed = raw.trim();
+    let normalized = trimmed.to_ascii_uppercase();
+    
+    // Extract the base type: e.g. "VARCHAR(50)" -> "VARCHAR", "INT PRIMARY KEY" -> "INT"
+    let base_type = normalized
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
 
-    let data_type = if normalized.starts_with("VARCHAR(")
-        || normalized.starts_with("CHAR(")
-        || normalized.starts_with("CHARACTER VARYING(")
-    {
-        DataType::Utf8
-    } else {
-        match normalized.as_str() {
-            "BOOL" | "BOOLEAN" => DataType::Boolean,
-            "FLOAT" | "FLOAT4" | "REAL" => DataType::Float32,
-            "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => DataType::Float64,
-            "SMALLINT" | "INT2" | "INT" | "INTEGER" | "INT4" => DataType::Int32,
-            "BIGINT" | "INT8" => DataType::Int64,
-            "STRING" | "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "CHARACTER VARYING" => {
+    let data_type = match base_type {
+        "BOOL" | "BOOLEAN" => DataType::Boolean,
+        "FLOAT" | "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
+        "DOUBLE" | "PRECISION" | "FLOAT8" | "FLOAT64" => DataType::Float64,
+        "SMALLINT" | "INT2" | "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
+        "BIGINT" | "INT8" | "INT64" => DataType::Int64,
+        "TIMESTAMP" | "TIMESTAMPTZ" => {
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None)
+        }
+        "STRING" | "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "VARYING" | "UTF8" => DataType::Utf8,
+        _ => {
+            if normalized.contains("DOUBLE PRECISION") {
+                DataType::Float64
+            } else if normalized.contains("CHARACTER VARYING") {
                 DataType::Utf8
-            }
-            unsupported => {
+            } else {
                 anyhow::bail!(
                     "Unsupported SQL column type '{}' in the current prototype",
-                    unsupported
+                    trimmed
                 )
             }
         }
@@ -1752,480 +2369,307 @@ fn sql_type_to_arrow_data_type(raw: &str) -> Result<DataType> {
     Ok(data_type)
 }
 
-impl PersistedDataType {
-    fn from_arrow(data_type: &DataType) -> Result<Self> {
-        Ok(match data_type {
-            DataType::Boolean => Self::Boolean,
-            DataType::Float32 => Self::Float32,
-            DataType::Float64 => Self::Float64,
-            DataType::Int32 => Self::Int32,
-            DataType::Int64 => Self::Int64,
-            DataType::Null => Self::Null,
-            DataType::UInt32 => Self::UInt32,
-            DataType::UInt64 => Self::UInt64,
-            DataType::Utf8 | DataType::LargeUtf8 => Self::Utf8,
-            unsupported => {
-                anyhow::bail!(
-                    "Unsupported managed table data type in current prototype: {unsupported:?}"
-                )
-            }
-        })
-    }
-
-    fn to_arrow_data_type(&self) -> DataType {
-        match self {
-            Self::Boolean => DataType::Boolean,
-            Self::Float32 => DataType::Float32,
-            Self::Float64 => DataType::Float64,
-            Self::Int32 => DataType::Int32,
-            Self::Int64 => DataType::Int64,
-            Self::Null => DataType::Null,
-            Self::UInt32 => DataType::UInt32,
-            Self::UInt64 => DataType::UInt64,
-            Self::Utf8 => DataType::Utf8,
-        }
-    }
-}
-
-impl PersistedScalarValue {
-    fn from_array(array: &ArrayRef, row_index: usize) -> Result<Self> {
-        if array.is_null(row_index) {
-            return Ok(Self::Null);
-        }
-
-        let value = match array.data_type() {
-            DataType::Boolean => Self::Boolean(
-                array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("boolean array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::Float32 => Self::Float32(
-                array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .expect("float32 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::Float64 => Self::Float64(
-                array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .expect("float64 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::Int32 => Self::Int32(
-                array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("int32 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::Int64 => Self::Int64(
-                array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("int64 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::UInt32 => Self::UInt32(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .expect("uint32 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::UInt64 => Self::UInt64(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .expect("uint64 array downcast should succeed")
-                    .value(row_index),
-            ),
-            DataType::Utf8 => Self::Utf8(
-                array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("utf8 array downcast should succeed")
-                    .value(row_index)
-                    .to_string(),
-            ),
-            DataType::LargeUtf8 => Self::Utf8(
-                array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .expect("large utf8 array downcast should succeed")
-                    .value(row_index)
-                    .to_string(),
-            ),
-            DataType::Null => Self::Null,
-            unsupported => {
-                anyhow::bail!(
-                    "Unsupported managed table value type in current prototype: {unsupported:?}"
-                )
-            }
-        };
-
-        Ok(value)
-    }
-
-    fn from_sql_literal(raw: &str, data_type: &PersistedDataType, nullable: bool) -> Result<Self> {
-        let trimmed = raw.trim();
-
-        if trimmed.eq_ignore_ascii_case("NULL") {
-            if !nullable {
-                anyhow::bail!("NULL is not allowed for a NOT NULL column");
-            }
-
-            return Ok(Self::Null);
-        }
-
-        let value = match data_type {
-            PersistedDataType::Boolean => {
-                if trimmed.eq_ignore_ascii_case("TRUE") {
-                    Self::Boolean(true)
-                } else if trimmed.eq_ignore_ascii_case("FALSE") {
-                    Self::Boolean(false)
-                } else {
-                    anyhow::bail!("Expected BOOLEAN literal, found '{}'", trimmed);
-                }
-            }
-            PersistedDataType::Float32 => Self::Float32(trimmed.parse::<f32>()?),
-            PersistedDataType::Float64 => Self::Float64(trimmed.parse::<f64>()?),
-            PersistedDataType::Int32 => Self::Int32(trimmed.parse::<i32>()?),
-            PersistedDataType::Int64 => Self::Int64(trimmed.parse::<i64>()?),
-            PersistedDataType::Null => {
-                anyhow::bail!("NULL-only columns are not writable in the current prototype")
-            }
-            PersistedDataType::UInt32 => Self::UInt32(trimmed.parse::<u32>()?),
-            PersistedDataType::UInt64 => Self::UInt64(trimmed.parse::<u64>()?),
-            PersistedDataType::Utf8 => Self::Utf8(parse_sql_string_literal(trimmed)?),
-        };
-
-        Ok(value)
-    }
-}
-
-impl PersistedTableFile {
-    fn empty_from_schema(schema: &Schema) -> Result<Self> {
-        Ok(Self {
-            storage_layout: PersistedStorageLayout::Columnar,
-            schema: schema
-                .fields()
-                .iter()
-                .map(|field| PersistedField::from_arrow(field.as_ref()))
-                .collect::<Result<Vec<_>>>()?,
-            columns: schema
-                .fields()
-                .iter()
-                .map(|_| PersistedColumn { values: Vec::new() })
-                .collect(),
-        })
-    }
-
-    fn from_batches(schema: &Schema, batches: &[RecordBatch]) -> Result<Self> {
-        let persisted_schema = schema
-            .fields()
-            .iter()
-            .map(|field| PersistedField::from_arrow(field.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut columns = Vec::with_capacity(schema.fields().len());
-
-        for column_index in 0..schema.fields().len() {
-            let mut values = Vec::new();
-
-            for batch in batches {
-                for row_index in 0..batch.num_rows() {
-                    let value =
-                        PersistedScalarValue::from_array(batch.column(column_index), row_index)?;
-                    values.push(value);
-                }
-            }
-
-            columns.push(PersistedColumn { values });
-        }
-
-        Ok(Self {
-            storage_layout: PersistedStorageLayout::Columnar,
-            schema: persisted_schema,
-            columns,
-        })
-    }
-
-    fn to_record_batch(&self) -> Result<RecordBatch> {
-        if self.storage_layout != PersistedStorageLayout::Columnar {
-            anyhow::bail!("Unsupported managed table storage layout");
-        }
-
-        let schema = Arc::new(Schema::new(
-            self.schema
-                .iter()
-                .map(PersistedField::to_arrow_field)
-                .collect::<Vec<_>>(),
-        ));
-        let arrays = self
-            .schema
-            .iter()
-            .enumerate()
-            .map(|(column_index, field)| self.build_array(column_index, field))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(RecordBatch::try_new(schema, arrays)?)
-    }
-
-    fn build_array(&self, column_index: usize, field: &PersistedField) -> Result<ArrayRef> {
-        let column = self
-            .columns
-            .get(column_index)
-            .ok_or_else(|| anyhow::anyhow!("Missing column at column index {column_index}"))?;
-
-        let array: ArrayRef = match field.data_type {
-            PersistedDataType::Boolean => Arc::new(BooleanArray::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Boolean(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected boolean value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Float32 => Arc::new(Float32Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Float32(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected float32 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Float64 => Arc::new(Float64Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Float64(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected float64 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Int32 => Arc::new(Int32Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Int32(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected int32 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Int64 => Arc::new(Int64Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Int64(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected int64 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::UInt32 => Arc::new(UInt32Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::UInt32(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected uint32 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::UInt64 => Arc::new(UInt64Array::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::UInt64(value) => Ok(Some(*value)),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected uint64 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Utf8 => Arc::new(StringArray::from(self.collect_optional(
-                column,
-                |value| match value {
-                    PersistedScalarValue::Utf8(value) => Ok(Some(value.as_str())),
-                    PersistedScalarValue::Null => Ok(None),
-                    other => anyhow::bail!("Expected utf8 value, found {other:?}"),
-                },
-            )?)),
-            PersistedDataType::Null => Arc::new(NullArray::new(column.values.len())),
-        };
-
-        Ok(array)
-    }
-
-    fn collect_optional<'a, T>(
-        &'a self,
-        column: &'a PersistedColumn,
-        mapper: impl Fn(&'a PersistedScalarValue) -> Result<Option<T>>,
-    ) -> Result<Vec<Option<T>>> {
-        column.values.iter().map(mapper).collect()
-    }
-
-    fn row_count(&self) -> usize {
-        self.columns.first().map_or(0, |column| column.values.len())
-    }
-
-    fn append_rows(
-        &mut self,
-        selected_columns: Option<&[String]>,
-        rows: &[Vec<String>],
-    ) -> Result<usize> {
-        let mut column_order = Vec::new();
-
-        match selected_columns {
-            Some(selected_columns) => {
-                let mut seen = BTreeSet::new();
-
-                for selected_column in selected_columns {
-                    let normalized_name = selected_column.to_ascii_lowercase();
-                    if !seen.insert(normalized_name) {
-                        anyhow::bail!("Duplicate column '{}' in INSERT target", selected_column);
-                    }
-
-                    let column_index = self
-                        .schema
-                        .iter()
-                        .position(|field| field.name.eq_ignore_ascii_case(selected_column))
-                        .ok_or_else(|| anyhow::anyhow!("Unknown column '{}'", selected_column))?;
-                    column_order.push(column_index);
-                }
-            }
-            None => column_order.extend(0..self.schema.len()),
-        }
-
-        for row in rows {
-            if row.len() != column_order.len() {
-                anyhow::bail!(
-                    "Expected {} value(s) per row, found {}",
-                    column_order.len(),
-                    row.len()
-                );
-            }
-
-            let mut row_values = vec![PersistedScalarValue::Null; self.schema.len()];
-            let mut assigned_columns = vec![false; self.schema.len()];
-
-            for (value_index, raw_value) in row.iter().enumerate() {
-                let column_index = column_order[value_index];
-                let field = self
-                    .schema
-                    .get(column_index)
-                    .ok_or_else(|| anyhow::anyhow!("Missing field at index {column_index}"))?;
-                let value = PersistedScalarValue::from_sql_literal(
-                    raw_value,
-                    &field.data_type,
-                    field.nullable,
-                )?;
-                row_values[column_index] = value;
-                assigned_columns[column_index] = true;
-            }
-
-            for (column_index, field) in self.schema.iter().enumerate() {
-                if !assigned_columns[column_index] && !field.nullable {
-                    anyhow::bail!(
-                        "Column '{}' must be provided because it is NOT NULL",
-                        field.name
-                    );
-                }
-
-                self.columns
-                    .get_mut(column_index)
-                    .ok_or_else(|| anyhow::anyhow!("Missing column at index {column_index}"))?
-                    .values
-                    .push(row_values[column_index].clone());
-            }
-        }
-
-        Ok(rows.len())
-    }
-}
-
 fn persist_table_snapshot(path: &Path, schema: &Schema, batches: &[RecordBatch]) -> Result<usize> {
-    let snapshot = PersistedTableFile::from_batches(schema, batches)?;
-    write_table_snapshot(path, &snapshot)?;
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
 
-    Ok(snapshot.row_count())
+    let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+    let file_path = path.join(file_name);
+    let row_count = batches.iter().map(|b| b.num_rows()).sum();
+
+    write_parquet_file(&file_path, schema, batches)?;
+
+    Ok(row_count)
 }
 
 fn persist_empty_table_snapshot(path: &Path, schema: &Schema) -> Result<()> {
-    let snapshot = PersistedTableFile::empty_from_schema(schema)?;
-    write_table_snapshot(path, &snapshot)
-}
-
-fn write_table_snapshot(path: &Path, snapshot: &PersistedTableFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    if !path.exists() {
+        fs::create_dir_all(path)?;
     }
 
-    fs::write(path, serde_json::to_string_pretty(snapshot)?)?;
+    let file_name = "_empty.parquet";
+    let file_path = path.join(file_name);
 
+    write_parquet_file(&file_path, schema, &[])
+}
+
+fn write_parquet_file(path: &Path, schema: &Schema, batches: &[RecordBatch]) -> Result<()> {
+    let file = fs::File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))?;
+
+    for batch in batches {
+        writer.write(batch)?;
+    }
+
+    writer.close()?;
     Ok(())
 }
 
 fn append_rows_to_table_snapshot(
     path: &Path,
+    schema: &Schema,
     selected_columns: Option<&[String]>,
     rows: &[Vec<String>],
 ) -> Result<usize> {
-    let mut snapshot = load_persisted_table_file(path)?;
-    let inserted_row_count = snapshot.append_rows(selected_columns, rows)?;
-    write_table_snapshot(path, &snapshot)?;
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
 
-    Ok(inserted_row_count)
+    let batch = parse_rows_to_batch(schema, selected_columns, rows)?;
+    let row_count = batch.num_rows();
+
+    let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+    let file_path = path.join(file_name);
+
+    write_parquet_file(&file_path, schema, &[batch])?;
+
+    Ok(row_count)
 }
 
-fn load_persisted_table_file(path: &Path) -> Result<PersistedTableFile> {
-    let raw = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
+fn parse_rows_to_batch(
+    schema: &Schema,
+    selected_columns: Option<&[String]>,
+    rows: &[Vec<String>],
+) -> Result<RecordBatch> {
+    let mut column_order = Vec::new();
+
+    match selected_columns {
+        Some(selected_columns) => {
+            let mut seen = BTreeSet::new();
+
+            for selected_column in selected_columns {
+                let normalized_name = selected_column.to_ascii_lowercase();
+                if !seen.insert(normalized_name) {
+                    anyhow::bail!("Duplicate column '{}' in INSERT target", selected_column);
+                }
+
+                let column_index = schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name().eq_ignore_ascii_case(selected_column))
+                    .ok_or_else(|| anyhow::anyhow!("Unknown column '{}'", selected_column))?;
+                column_order.push(column_index);
+            }
+        }
+        None => column_order.extend(0..schema.fields().len()),
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+    for row in rows {
+        if row.len() != column_order.len() {
+            anyhow::bail!(
+                "Expected {} value(s) per row, found {}",
+                column_order.len(),
+                row.len()
+            );
+        }
+    }
+
+    for (column_index, field) in schema.fields().iter().enumerate() {
+        let mut values = Vec::with_capacity(rows.len());
+
+        let input_index = column_order.iter().position(|&idx| idx == column_index);
+
+        for row in rows {
+            let raw_value = if let Some(idx) = input_index {
+                row.get(idx).map(|s| s.as_str())
+            } else {
+                None
+            };
+
+            let value = match raw_value {
+                Some(v) if v.eq_ignore_ascii_case("NULL") => None,
+                Some(v) => {
+                    if v.starts_with('\'') && v.ends_with('\'') {
+                        Some(v[1..v.len() - 1].replace("''", "'"))
+                    } else {
+                        Some(v.to_string())
+                    }
+                }
+                None => field.metadata().get("default_value").cloned(),
+            };
+
+            if value.is_none() && !field.is_nullable() {
+                anyhow::bail!(
+                    "Column '{}' must be provided because it is NOT NULL and has no DEFAULT",
+                    field.name()
+                );
+            }
+            values.push(value);
+        }
+
+        let array: ArrayRef = match field.data_type() {
+            DataType::Boolean => Arc::new(BooleanArray::from(
+                values
+                    .into_iter()
+                    .map(|v| {
+                        v.map(|s| s.eq_ignore_ascii_case("TRUE"))
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(
+                values
+                    .into_iter()
+                    .map(|v| v.and_then(|s| s.parse::<i32>().ok()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from(
+                values
+                    .into_iter()
+                    .map(|v| v.and_then(|s| s.parse::<i64>().ok()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Float32 => Arc::new(Float32Array::from(
+                values
+                    .into_iter()
+                    .map(|v| v.and_then(|s| s.parse::<f32>().ok()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Float64 => Arc::new(Float64Array::from(
+                values
+                    .into_iter()
+                    .map(|v| v.and_then(|s| s.parse::<f64>().ok()))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Utf8 => Arc::new(StringArray::from(values)),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, _) => {
+                Arc::new(datafusion::arrow::array::TimestampNanosecondArray::from(
+                    values
+                        .into_iter()
+                        .map(|v| {
+                            v.and_then(|s| {
+                                if s.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                                    || s.eq_ignore_ascii_case("CURRENT_TIMESTAMP()")
+                                    || s.eq_ignore_ascii_case("NOW()")
+                                {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .ok()
+                                        .map(|d| d.as_nanos() as i64)
+                                } else {
+                                    let s_clean = if s.starts_with('\'') && s.ends_with('\'') {
+                                        &s[1..s.len() - 1]
+                                    } else {
+                                        &s
+                                    };
+                                    chrono::DateTime::parse_from_rfc3339(s_clean)
+                                        .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
+                                        .or_else(|_| {
+                                            chrono::NaiveDateTime::parse_from_str(
+                                                s_clean,
+                                                "%Y-%m-%d %H:%M:%S",
+                                            )
+                                            .map(|dt| {
+                                                dt.and_utc().timestamp_nanos_opt().unwrap_or(0)
+                                            })
+                                        })
+                                        .ok()
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            unsupported => anyhow::bail!("Unsupported data type for Parquet migration: {unsupported:?}"),
+        };
+        columns.push(array);
+    }
+
+    Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
 }
 
 fn load_persisted_table_snapshot(path: &Path) -> Result<RecordBatch> {
-    let snapshot = load_persisted_table_file(path)?;
-    snapshot.to_record_batch()
-}
+    // Note: This loads the entire directory into one batch for prototype simplicity.
+    // Real engines would stream this.
+    let mut batches = Vec::new();
+    let mut schema = None;
 
-fn parse_sql_string_literal(raw: &str) -> Result<String> {
-    if !(raw.starts_with('\'') && raw.ends_with('\'')) {
-        anyhow::bail!("Expected quoted string literal, found '{}'", raw);
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_path = entry.path();
+            if file_path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+                let file = fs::File::open(file_path)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                let mut reader = builder.build()?;
+                if schema.is_none() {
+                    schema = Some(reader.schema());
+                }
+                while let Some(batch) = reader.next() {
+                    batches.push(batch?);
+                }
+            }
+        }
     }
 
-    Ok(raw[1..raw.len() - 1].replace("''", "'"))
+    let schema = schema.ok_or_else(|| anyhow::anyhow!("No Parquet files found in {:?}", path))?;
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    Ok(datafusion::arrow::compute::concat_batches(&schema, &batches)?)
 }
 
-async fn register_persisted_tables(
+async fn register_persisted_tables_comprehensive(
     context: &SessionContext,
     control_plane: &ControlPlane,
     session: &analyticsdb_core::SessionContext,
 ) -> Result<()> {
-    for table in control_plane
-        .list_relations_for_database(session, &session.database, CatalogRelationKind::Table)
-        .await?
-    {
+    let snapshot = control_plane.cluster_snapshot().await;
+    for table in snapshot.relations {
+        if table.kind != CatalogRelationKind::Table {
+            continue;
+        }
         let Some(storage_path) = table.storage_path.as_deref() else {
-            anyhow::bail!(
-                "Table '{}.{}.{}' is missing a storage path",
-                table.database,
-                table.schema,
-                table.name
-            );
+             continue;
         };
 
-        // Always register with schema-qualified name to allow cross-schema joins.
-        // Also register with short name to support standard resolution.
-        let names = vec![table.name.clone(), format!("{}.{}", table.schema, table.name)];
+        let mut targets = Vec::new();
+        // Target 1: The database-named catalog (standard catalog.schema.table resolution)
+        if let Some(catalog) = context.catalog(&table.database) {
+            targets.push(catalog);
+        }
 
-        for name in names {
-            if context.table_exist(&name)? {
-                continue;
+        // Target 2: The default catalog if it matches session.database (for schema.table or table)
+        if table.database == session.database {
+            if let Some(catalog) = context.catalog("datafusion") {
+                targets.push(catalog);
             }
-            match table.external_format {
-                Some(ExternalStorageFormat::Parquet) => {
-                    context
-                        .register_parquet(&name, storage_path, Default::default())
-                        .await?;
-                }
-                None => {
-                    let batch = load_persisted_table_snapshot(Path::new(storage_path))?;
-                    let provider = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-                    context.register_table(name, Arc::new(provider))?;
+        }
+
+        for catalog in targets {
+            if catalog.schema(&table.schema).is_none() {
+                 catalog.register_schema(&table.schema, Arc::new(MemorySchemaProvider::new()))?;
+            }
+            let schema = catalog.schema(&table.schema).unwrap();
+
+            if schema.table(&table.name).await?.is_some() {
+                 continue;
+            }
+
+            // Both managed and external Parquet tables use the same SQL registration path now.
+            // This provides native DataFusion performance for both.
+            let statement = format!(
+                "CREATE EXTERNAL TABLE IF NOT EXISTS \"{}\".\"{}\".\"{}\" STORED AS PARQUET LOCATION '{}'",
+                table.database, table.schema, table.name, storage_path
+            );
+            if let Ok(df) = context.sql(&statement).await {
+                let _ = df.collect().await;
+            }
+
+            if table.database == session.database {
+                let default_stmt = format!(
+                    "CREATE EXTERNAL TABLE IF NOT EXISTS \"{}\".\"{}\" STORED AS PARQUET LOCATION '{}'",
+                    table.schema, table.name, storage_path
+                );
+                if let Ok(df) = context.sql(&default_stmt).await {
+                    let _ = df.collect().await;
                 }
             }
         }
@@ -2234,23 +2678,44 @@ async fn register_persisted_tables(
     Ok(())
 }
 
-async fn register_persisted_views(
+async fn register_persisted_views_comprehensive(
     context: &SessionContext,
     control_plane: &ControlPlane,
     session: &analyticsdb_core::SessionContext,
 ) -> Result<()> {
-    for view in control_plane
-        .list_relations_for_database(session, &session.database, CatalogRelationKind::View)
-        .await?
-    {
-        if let Some(definition_sql) = view.definition_sql.as_deref() {
-            // Always register both short name and schema-qualified name
-            let names = vec![view.name.clone(), format!("{}.{}", view.schema, view.name)];
-            for name in names {
-                if !context.table_exist(&name)? {
-                    let statement = format!("CREATE VIEW {} AS {}", name, definition_sql);
-                    context.sql(&statement).await?.collect().await?;
-                }
+    let snapshot = control_plane.cluster_snapshot().await;
+    for view in snapshot.relations {
+        if view.kind != CatalogRelationKind::View {
+            continue;
+        }
+        let Some(definition_sql) = view.definition_sql.as_deref() else {
+            continue;
+        };
+
+        let rewritten_sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
+            definition_sql,
+            control_plane,
+            session,
+        )
+        .await?;
+
+        // Prototype simplification for views: register via SQL to handle cross-catalog correctly
+        let mut names = Vec::new();
+        // Fully qualified
+        names.push(format!("\"{}\".\"{}\".\"{}\"", view.database, view.schema, view.name));
+        
+        if view.database == session.database {
+            // Short names for current DB
+            names.push(format!("\"{}\".\"{}\"", view.schema, view.name));
+            names.push(format!("\"{}\"", view.name));
+        }
+
+        for name in names {
+            let statement = format!("CREATE VIEW {} AS {}", name, rewritten_sql);
+            // We ignore errors here because some names might overlap or fail planning 
+            // if dependencies aren't registered yet. A real engine would use a DAG.
+            if let Ok(df) = context.sql(&statement).await {
+                let _ = df.collect().await;
             }
         }
     }
@@ -2307,9 +2772,8 @@ fn utf8_record_batch(columns: &[&str], rows: &[Vec<String>]) -> Result<RecordBat
 #[cfg(test)]
 mod tests {
     use analyticsdb_core::{Protocol, QueryRequest, SessionContext};
-    use serde_json::Value;
 
-    use super::{PersistedStorageLayout, PrototypeEngine};
+    use super::PrototypeEngine;
 
     #[tokio::test]
     async fn executes_scalar_select() {
@@ -2387,7 +2851,7 @@ mod tests {
             })
             .await
             .expect("alter user password should execute through metadata path");
-        assert!(response.message.contains("Credentials rotated"));
+        assert!(response.message.contains("rotated successfully"));
 
         let control_plane = engine.control_plane();
         let stale = control_plane
@@ -2879,21 +3343,16 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("catalog file stem should be present")
         ));
-        let table_file = managed_dir.join("postgres__public__fact_metrics.table.json");
-        let raw = std::fs::read_to_string(&table_file).expect("table snapshot should exist");
-        let parsed: Value = serde_json::from_str(&raw).expect("table snapshot should be json");
+        let table_dir = managed_dir.join("postgres__public__fact_metrics.table.parquet");
+        assert!(table_dir.exists());
+        assert!(table_dir.is_dir());
 
-        assert_eq!(
-            parsed
-                .get("storage_layout")
-                .and_then(Value::as_str)
-                .expect("storage layout should be present"),
-            match PersistedStorageLayout::Columnar {
-                PersistedStorageLayout::Columnar => "Columnar",
-            }
-        );
-        assert!(parsed.get("columns").and_then(Value::as_array).is_some());
-        assert!(parsed.get("rows").is_none());
+        let mut parquet_files = std::fs::read_dir(&table_dir)
+            .expect("should be able to read table directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("parquet"));
+
+        assert!(parquet_files.next().is_some());
 
         let _ = std::fs::remove_file(&catalog_path);
         let _ = std::fs::remove_dir_all(managed_dir);

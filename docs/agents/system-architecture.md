@@ -119,7 +119,7 @@ Rules:
 
 Responsibilities:
 
-- native columnar table storage on object storage
+- native columnar table storage using Parquet (local directory prototype)
 - external table abstraction for Parquet and Iceberg
 - replication workflow and durability policy
 - metadata-backed snapshot management
@@ -129,6 +129,7 @@ Responsibilities:
 Rules:
 
 - native and external tables must share one SQL surface
+- native storage uses Parquet for high-performance columnar scanning
 - storage policy selection may be automatic, but must always be inspectable
 - node-local disks may be used for cache or spill, not as the primary durable database store
 
@@ -136,8 +137,8 @@ Rules:
 
 Responsibilities:
 
-- query lifecycle logging
-- distributed tracing
+- query lifecycle logging using the `tracing` crate
+- distributed tracing and correlation
 - metrics emission
 - audit logging for auth and DDL
 - operator-facing diagnostics

@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 
-use analyticsdb_control::ControlPlane;
+use analyticsdb_control::{CatalogTableConstraintKind, ControlPlane};
 
 pub struct PgCatalogSchemaProvider {
     _control_plane: Arc<ControlPlane>,
@@ -60,6 +60,22 @@ impl PgCatalogSchemaProvider {
         tables.insert(
             "pg_attribute".to_string(),
             Arc::new(PgAttributeTable::new(Arc::clone(&control_plane))),
+        );
+        tables.insert(
+            "pg_description".to_string(),
+            Arc::new(PgDescriptionTable::new(Arc::clone(&control_plane))),
+        );
+        tables.insert(
+            "pg_attrdef".to_string(),
+            Arc::new(PgAttrdefTable::new(Arc::clone(&control_plane))),
+        );
+        tables.insert(
+            "pg_depend".to_string(),
+            Arc::new(PgDependTable::new(Arc::clone(&control_plane))),
+        );
+        tables.insert(
+            "pg_constraint".to_string(),
+            Arc::new(PgConstraintTable::new(Arc::clone(&control_plane))),
         );
 
         Self {
@@ -573,13 +589,22 @@ impl PgTypeTable {
             Field::new("oid", DataType::UInt32, false),
             Field::new("typname", DataType::Utf8, false),
             Field::new("typnamespace", DataType::UInt32, false),
+            Field::new("typowner", DataType::UInt32, false),
             Field::new("typlen", DataType::Int16, false),
             Field::new("typbyval", DataType::Boolean, false),
             Field::new("typtype", DataType::Utf8, false),
             Field::new("typcategory", DataType::Utf8, false),
+            Field::new("typispreferred", DataType::Boolean, false),
+            Field::new("typisdefined", DataType::Boolean, false),
+            Field::new("typdelim", DataType::Utf8, false),
             Field::new("typrelid", DataType::UInt32, false),
             Field::new("typelem", DataType::UInt32, false),
+            Field::new("typarray", DataType::UInt32, false),
             Field::new("typinput", DataType::Utf8, false),
+            Field::new("typbasetype", DataType::UInt32, false),
+            Field::new("typtypmod", DataType::Int32, false),
+            Field::new("typndims", DataType::Int32, false),
+            Field::new("typcollation", DataType::UInt32, false),
         ]));
         Self {
             _control_plane: control_plane,
@@ -626,25 +651,43 @@ impl TableProvider for PgTypeTable {
         let mut oid = Vec::new();
         let mut typname = Vec::new();
         let mut typnamespace = Vec::new();
+        let mut typowner = Vec::new();
         let mut typlen = Vec::new();
         let mut typbyval = Vec::new();
         let mut typtype = Vec::new();
         let mut typcategory = Vec::new();
+        let mut typispreferred = Vec::new();
+        let mut typisdefined = Vec::new();
+        let mut typdelim = Vec::new();
         let mut typrelid = Vec::new();
         let mut typelem = Vec::new();
+        let mut typarray = Vec::new();
         let mut typinput = Vec::new();
+        let mut typbasetype = Vec::new();
+        let mut typtypmod = Vec::new();
+        let mut typndims = Vec::new();
+        let mut typcollation = Vec::new();
 
         for (o, name, len, byval, t, cat) in types {
             oid.push(o as u32);
             typname.push(name.to_string());
             typnamespace.push(11_u32); // pg_catalog
+            typowner.push(10_u32);
             typlen.push(len as i16);
             typbyval.push(byval);
             typtype.push(t.to_string());
             typcategory.push(cat.to_string());
+            typispreferred.push(false);
+            typisdefined.push(true);
+            typdelim.push(",".to_string());
             typrelid.push(0_u32);
             typelem.push(0_u32);
+            typarray.push(0_u32);
             typinput.push("-".to_string());
+            typbasetype.push(0_u32);
+            typtypmod.push(-1_i32);
+            typndims.push(0_i32);
+            typcollation.push(0_u32);
         }
 
         let batch = RecordBatch::try_new(
@@ -653,13 +696,22 @@ impl TableProvider for PgTypeTable {
                 Arc::new(UInt32Array::from(oid)),
                 Arc::new(StringArray::from(typname)),
                 Arc::new(UInt32Array::from(typnamespace)),
+                Arc::new(UInt32Array::from(typowner)),
                 Arc::new(Int16Array::from(typlen)),
                 Arc::new(BooleanArray::from(typbyval)),
                 Arc::new(StringArray::from(typtype)),
                 Arc::new(StringArray::from(typcategory)),
+                Arc::new(BooleanArray::from(typispreferred)),
+                Arc::new(BooleanArray::from(typisdefined)),
+                Arc::new(StringArray::from(typdelim)),
                 Arc::new(UInt32Array::from(typrelid)),
                 Arc::new(UInt32Array::from(typelem)),
+                Arc::new(UInt32Array::from(typarray)),
                 Arc::new(StringArray::from(typinput)),
+                Arc::new(UInt32Array::from(typbasetype)),
+                Arc::new(Int32Array::from(typtypmod)),
+                Arc::new(Int32Array::from(typndims)),
+                Arc::new(UInt32Array::from(typcollation)),
             ],
         )?;
 
@@ -679,8 +731,34 @@ impl PgClassTable {
             Field::new("oid", DataType::UInt32, false),
             Field::new("relname", DataType::Utf8, false),
             Field::new("relnamespace", DataType::UInt32, false),
-            Field::new("relkind", DataType::Utf8, false),
+            Field::new("reltype", DataType::UInt32, false),
+            Field::new("reloftype", DataType::UInt32, false),
             Field::new("relowner", DataType::UInt32, false),
+            Field::new("relam", DataType::UInt32, false),
+            Field::new("relfilenode", DataType::UInt32, false),
+            Field::new("reltablespace", DataType::UInt32, false),
+            Field::new("relpages", DataType::Int32, false),
+            Field::new("reltuples", DataType::Float32, false),
+            Field::new("relallvisible", DataType::Int32, false),
+            Field::new("reltoastrelid", DataType::UInt32, false),
+            Field::new("relhasindex", DataType::Boolean, false),
+            Field::new("relisshared", DataType::Boolean, false),
+            Field::new("relpersistence", DataType::Utf8, false),
+            Field::new("relkind", DataType::Utf8, false),
+            Field::new("relnatts", DataType::Int16, false),
+            Field::new("relchecks", DataType::Int16, false),
+            Field::new("relhasrules", DataType::Boolean, false),
+            Field::new("relhastriggers", DataType::Boolean, false),
+            Field::new("relhassubclass", DataType::Boolean, false),
+            Field::new("relrowsecurity", DataType::Boolean, false),
+            Field::new("relforcerowsecurity", DataType::Boolean, false),
+            Field::new("relispartition", DataType::Boolean, false),
+            Field::new("relrewrite", DataType::UInt32, false),
+            Field::new("relfrozenxid", DataType::UInt32, false),
+            Field::new("relminmxid", DataType::UInt32, false),
+            Field::new("relacl", DataType::Utf8, true),
+            Field::new("reloptions", DataType::Utf8, true),
+            Field::new("relpartbound", DataType::Utf8, true),
         ]));
         Self {
             control_plane,
@@ -716,19 +794,71 @@ impl TableProvider for PgClassTable {
         let mut oid = Vec::new();
         let mut relname = Vec::new();
         let mut relnamespace = Vec::new();
-        let mut relkind = Vec::new();
+        let mut reltype = Vec::new();
+        let mut reloftype = Vec::new();
         let mut relowner = Vec::new();
+        let mut relam = Vec::new();
+        let mut relfilenode = Vec::new();
+        let mut reltablespace = Vec::new();
+        let mut relpages = Vec::new();
+        let mut reltuples = Vec::new();
+        let mut relallvisible = Vec::new();
+        let mut reltoastrelid = Vec::new();
+        let mut relhasindex = Vec::new();
+        let mut relisshared = Vec::new();
+        let mut relpersistence = Vec::new();
+        let mut relkind = Vec::new();
+        let mut relnatts = Vec::new();
+        let mut relchecks = Vec::new();
+        let mut relhasrules = Vec::new();
+        let mut relhastriggers = Vec::new();
+        let mut relhassubclass = Vec::new();
+        let mut relrowsecurity = Vec::new();
+        let mut relforcerowsecurity = Vec::new();
+        let mut relispartition = Vec::new();
+        let mut relrewrite = Vec::new();
+        let mut relfrozenxid = Vec::new();
+        let mut relminmxid = Vec::new();
+        let mut relacl = Vec::new();
+        let mut reloptions = Vec::new();
+        let mut relpartbound = Vec::new();
 
         for rel in &cluster.relations {
             if rel.database == session.database {
                 oid.push(synthetic_relation_oid(&rel.database, &rel.schema, &rel.name));
                 relname.push(rel.name.clone());
                 relnamespace.push(synthetic_namespace_oid(&rel.database, &rel.schema));
+                reltype.push(0_u32);
+                reloftype.push(0_u32);
+                relowner.push(10_u32);
+                relam.push(0_u32);
+                relfilenode.push(0_u32);
+                reltablespace.push(0_u32);
+                relpages.push(0_i32);
+                reltuples.push(0.0_f32);
+                relallvisible.push(0_i32);
+                reltoastrelid.push(0_u32);
+                relhasindex.push(false);
+                relisshared.push(false);
+                relpersistence.push("p".to_string());
                 relkind.push(match rel.kind {
                     analyticsdb_control::CatalogRelationKind::Table => "r".to_string(),
                     analyticsdb_control::CatalogRelationKind::View => "v".to_string(),
                 });
-                relowner.push(10_u32);
+                relnatts.push(rel.columns.len() as i16);
+                relchecks.push(0_i16);
+                relhasrules.push(false);
+                relhastriggers.push(false);
+                relhassubclass.push(false);
+                relrowsecurity.push(false);
+                relforcerowsecurity.push(false);
+                relispartition.push(false);
+                relrewrite.push(0_u32);
+                relfrozenxid.push(0_u32);
+                relminmxid.push(0_u32);
+                relacl.push(None::<String>);
+                reloptions.push(None::<String>);
+                relpartbound.push(None::<String>);
             }
         }
 
@@ -738,8 +868,34 @@ impl TableProvider for PgClassTable {
                 Arc::new(UInt32Array::from(oid)),
                 Arc::new(StringArray::from(relname)),
                 Arc::new(UInt32Array::from(relnamespace)),
-                Arc::new(StringArray::from(relkind)),
+                Arc::new(UInt32Array::from(reltype)),
+                Arc::new(UInt32Array::from(reloftype)),
                 Arc::new(UInt32Array::from(relowner)),
+                Arc::new(UInt32Array::from(relam)),
+                Arc::new(UInt32Array::from(relfilenode)),
+                Arc::new(UInt32Array::from(reltablespace)),
+                Arc::new(datafusion::arrow::array::Int32Array::from(relpages)),
+                Arc::new(datafusion::arrow::array::Float32Array::from(reltuples)),
+                Arc::new(datafusion::arrow::array::Int32Array::from(relallvisible)),
+                Arc::new(UInt32Array::from(reltoastrelid)),
+                Arc::new(BooleanArray::from(relhasindex)),
+                Arc::new(BooleanArray::from(relisshared)),
+                Arc::new(StringArray::from(relpersistence)),
+                Arc::new(StringArray::from(relkind)),
+                Arc::new(Int16Array::from(relnatts)),
+                Arc::new(Int16Array::from(relchecks)),
+                Arc::new(BooleanArray::from(relhasrules)),
+                Arc::new(BooleanArray::from(relhastriggers)),
+                Arc::new(BooleanArray::from(relhassubclass)),
+                Arc::new(BooleanArray::from(relrowsecurity)),
+                Arc::new(BooleanArray::from(relforcerowsecurity)),
+                Arc::new(BooleanArray::from(relispartition)),
+                Arc::new(UInt32Array::from(relrewrite)),
+                Arc::new(UInt32Array::from(relfrozenxid)),
+                Arc::new(UInt32Array::from(relminmxid)),
+                Arc::new(StringArray::from(relacl)),
+                Arc::new(StringArray::from(reloptions)),
+                Arc::new(StringArray::from(relpartbound)),
             ],
         )?;
 
@@ -761,6 +917,15 @@ impl PgAttributeTable {
             Field::new("atttypid", DataType::UInt32, false),
             Field::new("attnum", DataType::Int16, false),
             Field::new("attnotnull", DataType::Boolean, false),
+            Field::new("atttypmod", DataType::Int32, false),
+            Field::new("attndims", DataType::Int32, false),
+            Field::new("atthasdef", DataType::Boolean, false),
+            Field::new("attidentity", DataType::Utf8, false),
+            Field::new("attgenerated", DataType::Utf8, false),
+            Field::new("attisdropped", DataType::Boolean, false),
+            Field::new("attislocal", DataType::Boolean, false),
+            Field::new("attinhcount", DataType::Int32, false),
+            Field::new("attcollation", DataType::UInt32, false),
         ]));
         Self {
             control_plane,
@@ -798,6 +963,15 @@ impl TableProvider for PgAttributeTable {
         let mut atttypid = Vec::new();
         let mut attnum = Vec::new();
         let mut attnotnull = Vec::new();
+        let mut atttypmod = Vec::new();
+        let mut attndims = Vec::new();
+        let mut atthasdef = Vec::new();
+        let mut attidentity = Vec::new();
+        let mut attgenerated = Vec::new();
+        let mut attisdropped = Vec::new();
+        let mut attislocal = Vec::new();
+        let mut attinhcount = Vec::new();
+        let mut attcollation = Vec::new();
 
         for rel in &cluster.relations {
             if rel.database == session.database {
@@ -816,6 +990,15 @@ impl TableProvider for PgAttributeTable {
                     });
                     attnum.push((idx + 1) as i16);
                     attnotnull.push(!col.nullable);
+                    atttypmod.push(-1_i32);
+                    attndims.push(0_i32);
+                    atthasdef.push(col.default_value.is_some());
+                    attidentity.push(" ".to_string());
+                    attgenerated.push(" ".to_string());
+                    attisdropped.push(false);
+                    attislocal.push(true);
+                    attinhcount.push(0_i32);
+                    attcollation.push(0_u32);
                 }
             }
         }
@@ -828,6 +1011,15 @@ impl TableProvider for PgAttributeTable {
                 Arc::new(UInt32Array::from(atttypid)),
                 Arc::new(Int16Array::from(attnum)),
                 Arc::new(BooleanArray::from(attnotnull)),
+                Arc::new(Int32Array::from(atttypmod)),
+                Arc::new(Int32Array::from(attndims)),
+                Arc::new(BooleanArray::from(atthasdef)),
+                Arc::new(StringArray::from(attidentity)),
+                Arc::new(StringArray::from(attgenerated)),
+                Arc::new(BooleanArray::from(attisdropped)),
+                Arc::new(BooleanArray::from(attislocal)),
+                Arc::new(Int32Array::from(attinhcount)),
+                Arc::new(UInt32Array::from(attcollation)),
             ],
         )?;
 
@@ -915,6 +1107,338 @@ impl ExecutionPlan for SystemCatalogExec {
     }
 }
 
+#[derive(Debug)]
+struct PgDescriptionTable {
+    _control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgDescriptionTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("objoid", DataType::UInt32, false),
+            Field::new("classoid", DataType::UInt32, false),
+            Field::new("objsubid", DataType::Int32, false),
+            Field::new("description", DataType::Utf8, false),
+        ]));
+        Self {
+            _control_plane: control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgDescriptionTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Return empty for now
+        let batch = RecordBatch::new_empty(Arc::clone(&self.schema));
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+    }
+}
+
+#[derive(Debug)]
+struct PgAttrdefTable {
+    control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgAttrdefTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::UInt32, false),
+            Field::new("adrelid", DataType::UInt32, false),
+            Field::new("adnum", DataType::Int16, false),
+            Field::new("adbin", DataType::Utf8, true),
+        ]));
+        Self {
+            control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgAttrdefTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let session = postgres_session_from_state(state);
+        let cluster = self.control_plane.cluster_snapshot().await;
+
+        let mut oid = Vec::new();
+        let mut adrelid = Vec::new();
+        let mut adnum = Vec::new();
+        let mut adbin = Vec::new();
+
+        for rel in &cluster.relations {
+            if rel.database == session.database {
+                let rel_oid = synthetic_relation_oid(&rel.database, &rel.schema, &rel.name);
+                for (idx, col) in rel.columns.iter().enumerate() {
+                    if let Some(default_val) = &col.default_value {
+                        oid.push(synthetic_attrdef_oid(rel_oid, (idx + 1) as i16));
+                        adrelid.push(rel_oid);
+                        adnum.push((idx + 1) as i16);
+                        adbin.push(Some(default_val.clone()));
+                    }
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                Arc::new(UInt32Array::from(oid)),
+                Arc::new(UInt32Array::from(adrelid)),
+                Arc::new(Int16Array::from(adnum)),
+                Arc::new(StringArray::from(adbin)),
+            ],
+        )?;
+
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+    }
+}
+
+#[derive(Debug)]
+struct PgDependTable {
+    _control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgDependTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("classid", DataType::UInt32, false),
+            Field::new("objid", DataType::UInt32, false),
+            Field::new("objsubid", DataType::Int32, false),
+            Field::new("refclassid", DataType::UInt32, false),
+            Field::new("refobjid", DataType::UInt32, false),
+            Field::new("refobjsubid", DataType::Int32, false),
+            Field::new("deptype", DataType::Utf8, false),
+        ]));
+        Self {
+            _control_plane: control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgDependTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Return empty for now to satisfy joins
+        let batch = RecordBatch::new_empty(Arc::clone(&self.schema));
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+    }
+}
+
+#[derive(Debug)]
+struct PgConstraintTable {
+    control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgConstraintTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::UInt32, false),
+            Field::new("conname", DataType::Utf8, false),
+            Field::new("connamespace", DataType::UInt32, false),
+            Field::new("contype", DataType::Utf8, false),
+            Field::new("condeferrable", DataType::Boolean, false),
+            Field::new("condeferred", DataType::Boolean, false),
+            Field::new("convalidated", DataType::Boolean, false),
+            Field::new("conrelid", DataType::UInt32, false),
+            Field::new("contypid", DataType::UInt32, false),
+            Field::new("conindid", DataType::UInt32, false),
+            Field::new("confrelid", DataType::UInt32, false),
+            Field::new("confupdtype", DataType::Utf8, false),
+            Field::new("confdeltype", DataType::Utf8, false),
+            Field::new("confmatchtype", DataType::Utf8, false),
+            Field::new("conislocal", DataType::Boolean, false),
+            Field::new("coninhcount", DataType::Int32, false),
+            Field::new("connoinherit", DataType::Boolean, false),
+            // Standard PostgreSQL uses int2[] and int2[] for these. 
+            // We provide them as NULL for now to satisfy basic JDBC discovery.
+            Field::new("conkey", DataType::Utf8, true),
+            Field::new("confkey", DataType::Utf8, true),
+        ]));
+        Self {
+            control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgConstraintTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let session = postgres_session_from_state(state);
+        let cluster = self.control_plane.cluster_snapshot().await;
+
+        let mut oid = Vec::new();
+        let mut conname = Vec::new();
+        let mut connamespace = Vec::new();
+        let mut contype = Vec::new();
+        let mut condeferrable = Vec::new();
+        let mut condeferred = Vec::new();
+        let mut convalidated = Vec::new();
+        let mut conrelid = Vec::new();
+        let mut contypid = Vec::new();
+        let mut conindid = Vec::new();
+        let mut confrelid = Vec::new();
+        let mut confupdtype = Vec::new();
+        let mut confdeltype = Vec::new();
+        let mut confmatchtype = Vec::new();
+        let mut conislocal = Vec::new();
+        let mut coninhcount = Vec::new();
+        let mut connoinherit = Vec::new();
+        let mut conkey: Vec<Option<String>> = Vec::new();
+        let mut confkey: Vec<Option<String>> = Vec::new();
+
+        for rel in &cluster.relations {
+            if rel.database == session.database {
+                let rel_oid = synthetic_relation_oid(&rel.database, &rel.schema, &rel.name);
+                let nsp_oid = synthetic_namespace_oid(&rel.database, &rel.schema);
+
+                for constraint in &rel.constraints {
+                    oid.push(synthetic_constraint_oid(rel_oid, &constraint.name));
+                    conname.push(constraint.name.clone());
+                    connamespace.push(nsp_oid);
+                    contype.push(match constraint.kind {
+                        CatalogTableConstraintKind::PrimaryKey => "p".to_string(),
+                        CatalogTableConstraintKind::ForeignKey => "f".to_string(),
+                        CatalogTableConstraintKind::Unique => "u".to_string(),
+                    });
+                    condeferrable.push(false);
+                    condeferred.push(false);
+                    convalidated.push(true);
+                    conrelid.push(rel_oid);
+                    contypid.push(0_u32);
+                    conindid.push(0_u32);
+                    
+                    let frel_oid = if let Some(ref_table) = &constraint.referenced_table {
+                         let ref_db = constraint.referenced_database.as_ref().unwrap_or(&rel.database);
+                         let ref_sch = constraint.referenced_schema.as_ref().unwrap_or(&rel.schema);
+                         synthetic_relation_oid(ref_db, ref_sch, ref_table)
+                    } else {
+                        0_u32
+                    };
+                    confrelid.push(frel_oid);
+                    
+                    confupdtype.push("a".to_string());
+                    confdeltype.push("a".to_string());
+                    confmatchtype.push("s".to_string());
+                    conislocal.push(true);
+                    coninhcount.push(0_i32);
+                    connoinherit.push(true);
+                    
+                    // Prototype simplification: arrays not provided yet
+                    conkey.push(None);
+                    confkey.push(None);
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                Arc::new(UInt32Array::from(oid)),
+                Arc::new(StringArray::from(conname)),
+                Arc::new(UInt32Array::from(connamespace)),
+                Arc::new(StringArray::from(contype)),
+                Arc::new(BooleanArray::from(condeferrable)),
+                Arc::new(BooleanArray::from(condeferred)),
+                Arc::new(BooleanArray::from(convalidated)),
+                Arc::new(UInt32Array::from(conrelid)),
+                Arc::new(UInt32Array::from(contypid)),
+                Arc::new(UInt32Array::from(conindid)),
+                Arc::new(UInt32Array::from(confrelid)),
+                Arc::new(StringArray::from(confupdtype)),
+                Arc::new(StringArray::from(confdeltype)),
+                Arc::new(StringArray::from(confmatchtype)),
+                Arc::new(BooleanArray::from(conislocal)),
+                Arc::new(Int32Array::from(coninhcount)),
+                Arc::new(BooleanArray::from(connoinherit)),
+                Arc::new(StringArray::from(conkey)),
+                Arc::new(StringArray::from(confkey)),
+            ],
+        )?;
+
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+    }
+}
+
 fn postgres_session_from_state(state: &dyn Session) -> analyticsdb_core::SessionContext {
     state
         .config()
@@ -978,6 +1502,32 @@ fn synthetic_relation_oid(database: &str, schema: &str, name: &str) -> u32 {
         .chain([b'.'])
         .chain(name.bytes())
     {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    if hash < 16384 {
+        hash + 16384
+    } else {
+        hash
+    }
+}
+
+fn synthetic_attrdef_oid(rel_oid: u32, attnum: i16) -> u32 {
+    let mut hash = 2166136261_u32;
+    for byte in rel_oid.to_le_bytes().iter().copied().chain(attnum.to_le_bytes().iter().copied()) {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    if hash < 16384 {
+        hash + 16384
+    } else {
+        hash
+    }
+}
+
+fn synthetic_constraint_oid(rel_oid: u32, conname: &str) -> u32 {
+    let mut hash = 2166136261_u32;
+    for byte in rel_oid.to_le_bytes().iter().copied().chain(conname.bytes()) {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16777619);
     }

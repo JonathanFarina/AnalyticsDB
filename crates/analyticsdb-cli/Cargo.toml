@@ -25,6 +25,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+analyticsdb-control = { path = "../analyticsdb-control" }
 analyticsdb-protocol = { path = "../analyticsdb-protocol" }
 parquet = { version = "58", default-features = false, features = ["arrow"] }
 tokio.workspace = true

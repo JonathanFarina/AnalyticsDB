@@ -49,8 +49,10 @@ Outputs:
 Current evidence:
 
 - embedded control-plane crate exists
-- bootstrap node metadata exists
-- query admission now issues query ids before execution
+- cluster membership model supports **node registration and discovery** via SQL (**SHOW NODES**)
+- **high-availability strategy** implemented with background **heartbeats and node pruning** in the control plane
+- query admission now issues query ids and **round-robin routes to registered coordinators**
+- **CLI supports automatic failover** across multiple comma-separated endpoints for both PostgreSQL and Flight SQL
 - bootstrap users, databases, and schemas are validated on the query path
 - JSON-backed catalog persistence exists for databases and schemas
 - metadata SQL subset exists for creating and listing databases, schemas, and views
@@ -59,12 +61,15 @@ Current evidence:
 - prototype managed tables can also be defined with explicit columns and populated through `INSERT INTO ... VALUES ...`
 - prototype managed-table inserts now support tested column-list insertion with omitted nullable columns
 - prototype metadata listing now supports tested schema-scoped table and view discovery
-- prototype managed table snapshots are now column-oriented on disk
+- prototype managed table snapshots are now stored as native Parquet files in schema-scoped directories
+- prototype managed tables now support **UPDATE**, **DELETE**, **TRUNCATE**, **DROP**, and **RENAME** operations
 - prototype managed tables now expose persisted column metadata through SQL introspection
+- **ALTER SCHEMA RENAME TO** is supported and tested for managed relations physically
+- **EXPLAIN** is supported across protocols to expose query plans
 
 Remaining gaps before this phase should be considered `Partial` overall:
 
-- no object-storage-backed production columnar managed-table storage yet
+- no object-storage-backed production columnar managed-table storage yet (local Parquet only)
 - no roles/groups yet
 - no storage policy model yet
 
@@ -145,6 +150,7 @@ Current evidence:
 - prototype Flight SQL listener exists
 - statement query and statement update flows are tested
 - catalogs, schemas, tables, and table-types metadata flows are implemented in the prototype
+- Flight SQL now supports **TLS encryption** and **Prepared Statements** (including schema planning), satisfying standard JDBC/ODBC drivers
 - basic Flight SQL `SqlInfo` metadata responses are implemented and protocol-tested
 - CLI-driven SQL tests now validate Flight SQL execution against a live listener
 - CLI-driven paired tests now prove a narrow protocol-equivalent slice with PostgreSQL wire for non-parameterized SQL execution, requested schema routing, schema-scoped and cross-database metadata/DDL SQL statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors

@@ -10,14 +10,15 @@ anyhow.workspace = true
 async-trait.workspace = true
 analyticsdb-core = { path = "../analyticsdb-core" }
 analyticsdb-control = { path = "../analyticsdb-control" }
+chrono.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-physical-plan.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlparser = "0.61.0"
+sqlparser.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-uuid.workspace = true

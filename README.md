@@ -32,6 +32,8 @@ Current metadata SQL subset:
 - `CREATE DATABASE <name>`
 - `CREATE SCHEMA <name>`
 - `CREATE SCHEMA <database>.<name>`
+- `ALTER SCHEMA <name> RENAME TO <new_name>`
+- `ALTER SCHEMA <database>.<name> RENAME TO <new_name>`
 - `CREATE TABLE <name> AS <select>`
 - `CREATE TABLE <schema>.<name> AS <select>`
 - `CREATE TABLE <name> (<column> <type> [, ...])`
@@ -40,9 +42,15 @@ Current metadata SQL subset:
 - `CREATE VIEW <schema>.<name> AS <select>`
 - `INSERT INTO <table> VALUES (...)[, (...)]`
 - `INSERT INTO <table> (<column>[, ...]) VALUES (...)[, (...)]`
+- `UPDATE <table> SET <column> = <value> [, ...] [WHERE <condition>]`
+- `DELETE FROM <table> [WHERE <condition>]`
+- `TRUNCATE TABLE <table>`
+- `ALTER TABLE <table> ADD COLUMN <column> <type> [<constraints>]`
+- `ALTER TABLE <table> RENAME TO <new_name>`
 - `SHOW DATABASES`
 - `SHOW SCHEMAS`
 - `SHOW SCHEMAS FROM <database>`
+- `SHOW NODES`
 - `SHOW TABLES`
 - `SHOW TABLES FROM <schema>`
 - `SHOW TABLES FROM <database>.<schema>`
@@ -52,18 +60,22 @@ Current metadata SQL subset:
 - `SHOW COLUMNS FROM <table>`
 - `DESCRIBE <table>`
 - `ALTER USER <name> PASSWORD '<new>'`
+- `EXPLAIN <query>`
+- `DROP DATABASE <name>`
+- `DROP SCHEMA <name>`
+- `DROP TABLE <table>`
+- `DROP VIEW <view>`
 
 What does not exist yet:
 
 - distributed scheduling and execution
-- object-storage-backed production columnar managed-table storage
+- object-storage-backed production columnar managed-table storage (currently local Parquet directories)
 - object-storage-backed native tables
-- external Parquet or Iceberg integration
+- external Iceberg integration
 - web console
 - Kubernetes deployment assets
 - PostgreSQL prepared statements beyond the current parameterized prototype subset, real auth, and broad compatibility coverage
-- Flight SQL prepared statements and broad parity coverage
-- broad Flight SQL `SqlInfo` coverage beyond the current basic prototype subset
+- broad Flight SQL parity coverage beyond standard JDBC query/prepare flows
 
 ## Current Protocol-Equivalent Slice
 
@@ -73,7 +85,8 @@ Included today:
 
 - non-parameterized SQL query and update execution through both protocol listeners
 - requested schema/session routing for unqualified SQL in the tested prototype slice
-- schema-scoped managed table creation, insertion, querying, and persisted view querying in the tested prototype slice
+- schema-scoped managed table creation, insertion, deletion, truncation, and querying in the tested prototype slice
+- managed tables are now stored as **directories of native Parquet files**, providing columnar performance and DataFusion disk-scan execution
 - metadata exposed through the current SQL subset, including `SHOW TABLES`, `SHOW VIEWS`, `SHOW COLUMNS`, and `DESCRIBE`
 - PostgreSQL catalog-compatibility schema for `pg_catalog.pg_tables`, `pg_catalog.pg_views`, `pg_catalog.pg_namespace`, `pg_catalog.pg_database`, and `pg_catalog.pg_roles` is now integrated via DataFusion `TableProvider`s, enabling complex metadata queries, joins, and filters
 - initial `information_schema` compatibility SQL slice for `information_schema.schemata`, `information_schema.tables`, `information_schema.columns`, `information_schema.views`, `information_schema.table_constraints`, `information_schema.key_column_usage`, `information_schema.constraint_column_usage`, `information_schema.constraint_table_usage`, and `information_schema.referential_constraints`, including tested `SELECT *` plus constrained projection/filter/order forms (`WHERE <column> = '<value>'`, `WHERE <column> IN ('a', 'b', ...)`, `ORDER BY <column> [ASC|DESC][, <column> [ASC|DESC] ...]`) through both PostgreSQL wire and Flight SQL SQL execution paths
@@ -88,6 +101,8 @@ Included today:
 - prototype PostgreSQL wire introspection-query compatibility for common JDBC-style probes (`SELECT version()`, `SELECT current_database()`, `SELECT current_schema()`, `SELECT current_user`, `SELECT session_user`, `SELECT current_setting('<name>')`) is now implemented via real DataFusion UDFs
 - prototype PostgreSQL transaction-statement support for `BEGIN`, `COMMIT`, and `ROLLBACK` as successful no-ops to support standard client lifecycles
 - prototype PostgreSQL extended-query placeholder rendering now avoids rewriting parameter markers inside SQL string literals (for example, `SELECT '$1', $1`)
+- prototype Flight SQL support for **TLS encryption** (`--tls-cert` and `--tls-key`) and **Prepared Statements**, enabling standard JDBC/ODBC client connectivity
+- integrated **structured logging** via `tracing`, controllable through `RUST_LOG` env variable
 
 Explicitly not included yet:
 

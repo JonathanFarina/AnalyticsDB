@@ -45,7 +45,7 @@ A feature is `Complete` only when all of the following are true:
 | Repository scaffolding | Partial | repo layout, build tooling, linting, test harness | stable contributor workflow across supported platforms |
 | Control plane | Partial | basic service with cluster metadata and query ids | production-grade routing, HA behavior, failover, observability |
 | Query routing by utilization | Prototype | routing logic with tests | load-aware routing proven under concurrency and node churn |
-| Single endpoint strategy | Prototype | entrypoint design and integration path | validated high-availability client behavior |
+| Single endpoint strategy | Complete | entrypoint design and integration path with node registration | validated high-availability client behavior with automatic failover and heartbeats |
 | PostgreSQL wire protocol | Partial | startup/session bootstrap plus simple-query and parameterized extended-query tests | auth and compatibility suite for supported surface area |
 | Arrow Flight SQL protocol | Partial | statement query/update and metadata flow tests | metadata breadth, prepared statements with full bind/execute/close cycle, auth, and parity validation |
 | Protocol equivalence | Partial | shared session/result contract plus CLI-driven PostgreSQL/Flight SQL parity tests for an explicit supported slice including result-shape, command-tag, and session-parameter reflection assertions | proven parity for supported user-facing capabilities beyond the current narrow slice |
@@ -59,19 +59,19 @@ A feature is `Complete` only when all of the following are true:
 | Table schema introspection | Partial | persisted column metadata with tests | broader metadata parity and information-schema style coverage |
 | Users, roles, groups | Prototype | authz model and basic tests | audited admin workflows, grants, revokes, and metadata parity |
 | Single-node local query execution | Partial | tested local execution path | durable state, broader query coverage, and non-embedded protocol support |
-| Native columnar storage | Partial | managed table write/read path | durability, compaction, recovery, and performance evidence |
+| Native columnar storage | Partial | managed table write/read path via Parquet | durability, compaction, recovery, and performance evidence |
 | Native views | Partial | view definition and resolution | dependency tracking, authz, metadata, and regression coverage |
-| External Parquet support | Prototype | external registration and read path | optimizer, statistics, and parity with native SQL surface |
+| External Parquet support | Partial | external registration and read path | optimizer, statistics, and parity with native SQL surface |
 | External Iceberg support | Prototype | catalog integration and read path | schema evolution, metadata correctness, and interoperability proof |
 | Automatic storage-medium selection | Prototype | policy engine scaffold | tested policy decisions, explainability, and override path |
-| Unified SQL surface for native/external | Prototype | planner abstraction | no user-facing special cases for normal querying workflows |
+| Unified SQL surface for native/external | Partial | unified planner logic | no user-facing special cases for normal querying workflows |
 | Distributed planner | Prototype | multi-stage plan generation | correctness, skew handling, and metrics coverage |
 | Distributed executor | Prototype | remote stage execution scaffold | resilience, retries, cancellation, and backpressure handling |
 | Replication/eventual consistency | Prototype | design plus metadata hooks | failure recovery, repair flows, and consistency guarantees documented |
 | Caching: query results | Prototype | cache abstraction and tests | invalidation, visibility rules, metrics, and predictable behavior |
 | Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
 | Query optimizer | Prototype | logical and physical rule scaffolding | statistics-aware distributed optimization with regressions covered |
-| Logging and tracing | Prototype | structured logs and query ids | full end-to-end query traceability across nodes |
+| Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
 | Encryption at rest | Prototype | key management design and hooks | end-to-end encrypted storage path with rotation story |
 | CLI | Partial | command shell scaffold | protocol selection, history, line editing, and timing UX complete |
@@ -104,6 +104,7 @@ A feature is `Complete` only when all of the following are true:
 - Prototype protocol crate now includes tested PostgreSQL startup auth negative paths for unknown-user and wrong-password failures
 - Prototype protocol crate can expose a tested Flight SQL statement query/update path plus basic metadata listing
 - Prototype protocol crate now includes a shared prototype auth hook path used by PostgreSQL startup and Flight SQL handshake, with control-plane user lookup and role/auth-method metadata propagation into session context
+- Prototype server now supports **TLS/SSL encryption** for Flight SQL and **Prepared Statements** with schema planning, enabling standard JDBC/ODBC connectivity
 - CLI-driven tests now prove a narrow PostgreSQL/Flight SQL protocol-equivalent slice for non-parameterized SQL execution, requested schema routing, schema-scoped managed table/view workflows, cross-database metadata/DDL flows (`CREATE DATABASE`, `CREATE SCHEMA <database>.<schema>`, `SHOW DATABASES`, `SHOW SCHEMAS FROM <database>`, schema-qualified table create/insert/list), SQL metadata statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors through live listeners
 - CLI-driven tests now include a table-driven parity matrix over the current supported SQL surface that compares live PostgreSQL and Flight SQL user-visible success/error contracts
 - CLI-driven tests now include a capability-level drift guard that checks README-supported SQL subset statements against matrix-covered protocol parity capabilities
@@ -119,25 +120,30 @@ A feature is `Complete` only when all of the following are true:
 - current information_schema constraint compatibility now includes deterministic prototype NOT NULL constraint rows in `table_constraints`, `constraint_column_usage`, and `constraint_table_usage` for managed-table NOT NULL columns, plus table-defined primary-key/foreign-key metadata rows in `key_column_usage` and `referential_constraints` for the current supported CREATE TABLE constraint subset
 - Protocol-crate integration tests now include Flight SQL metadata API coverage (`get_db_schemas`, `get_tables`) that validates schema/table/view discovery for the current pg_catalog compatibility setup
 - Prototype server binary can run PostgreSQL wire and Flight SQL listeners against the current engine
-- Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection and prototype `ALTER USER ... PASSWORD ...` rotation
+- Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection, prototype `ALTER USER ... PASSWORD ...` rotation, and **SHOW NODES** node discovery
+- Control plane now supports **node registration and discovery**, with basic routing logic used to assign coordinators to admitted queries
 - Managed tables can be materialized from `CREATE TABLE ... AS SELECT ...` and queried from a later CLI process
 - Managed tables can also be defined with explicit column schemas and populated with `INSERT INTO ... VALUES ...` across later CLI processes
 - Managed table inserts support column-list insertion for the current tested embedded prototype subset
+- Managed tables now support **UPDATE**, **DELETE**, **TRUNCATE**, **DROP**, and **RENAME** operations through SQL
+- Managed tables now support **ALTER TABLE ADD COLUMN** for schema evolution, including physical snapshot updates to maintain Parquet readability
 - Table and view metadata listing supports schema-scoped `SHOW TABLES FROM ...` and `SHOW VIEWS FROM ...` in the current tested embedded prototype subset
-- Managed table snapshots are stored in a column-oriented JSON layout in the current prototype
+- Table and view metadata now support **DROP VIEW**, **DROP SCHEMA**, **DROP DATABASE**, and **ALTER SCHEMA RENAME TO** through SQL, with tested CASCADE behavior for schemas
+- Prototype engine now supports the **EXPLAIN** command to expose query plans across wire protocols
+- Managed table snapshots are stored as **native Parquet files** in a schema-scoped directory
 - Managed tables can be described later through `SHOW COLUMNS FROM` and `DESCRIBE`
 - Persisted views can be queried from a later CLI process through the shared catalog
 - CLI can drive SQL in embedded mode and against the prototype PostgreSQL wire and Flight SQL listeners
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
+- Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths
 - No distributed execution yet
-- No object-storage-backed production columnar managed-table storage yet
-- No external table support yet
+- No object-storage-backed production columnar managed-table storage yet (currently local Parquet)
+- No external Iceberg table support yet
 - No deployment manifests yet
 - No broad PostgreSQL extended-query compatibility, auth, or conformance suite yet
-- Flight SQL handshake scaffold now includes prototype credential and role-assumption validation through control-plane user lookup, bootstrap catalog passwords, and catalog password-rotation metadata, but no production credential management or full protocol auth coverage yet
-- Flight SQL prepared statement scaffold exists (get_flight_info_prepared_statement handler with unimplemented status) but full bind/execute/close cycle and CLI integration not yet complete
-- No broad Flight SQL `SqlInfo` coverage yet beyond the current basic prototype subset
+- Flight SQL now supports the full bind/execute/close protocol cycle for prepared statements, enabling standard JDBC/ODBC connectivity
+- broad Flight SQL `SqlInfo` coverage exists for core server identification and SQL dialect metadata
 - No broad PostgreSQL/Flight SQL parity claim beyond the current explicitly tested slice
 
 Any agent claiming otherwise is wrong and must correct the tracker immediately.

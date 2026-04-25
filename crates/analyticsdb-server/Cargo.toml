@@ -6,8 +6,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+analyticsdb-control = { path = "../analyticsdb-control" }
 analyticsdb-engine = { path = "../analyticsdb-engine" }
 analyticsdb-protocol = { path = "../analyticsdb-protocol" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

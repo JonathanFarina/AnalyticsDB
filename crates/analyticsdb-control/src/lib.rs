@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use analyticsdb_core::SessionContext;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use tokio::fs;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -13,6 +16,7 @@ pub enum NodeRole {
     Control,
     Compute,
     Storage,
+    Gateway,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +31,8 @@ pub struct ClusterNode {
     pub role: NodeRole,
     pub endpoint: String,
     pub status: NodeStatus,
+    #[serde(default)]
+    pub last_heartbeat_at_epoch_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,12 +69,15 @@ pub struct CatalogColumn {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+    #[serde(default)]
+    pub default_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CatalogTableConstraintKind {
     PrimaryKey,
     ForeignKey,
+    Unique,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,13 +85,9 @@ pub struct CatalogTableConstraint {
     pub name: String,
     pub kind: CatalogTableConstraintKind,
     pub columns: Vec<String>,
-    #[serde(default)]
     pub referenced_database: Option<String>,
-    #[serde(default)]
     pub referenced_schema: Option<String>,
-    #[serde(default)]
     pub referenced_table: Option<String>,
-    #[serde(default)]
     pub referenced_columns: Vec<String>,
 }
 
@@ -108,6 +113,7 @@ pub struct TableColumnDefinition {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+    pub default_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +129,10 @@ pub enum TableConstraintDefinition {
         referenced_schema: Option<String>,
         referenced_table: String,
         referenced_columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
     },
 }
 
@@ -149,7 +159,17 @@ struct CatalogState {
     relations: BTreeMap<String, CatalogRelation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub enum AlterTableOperation {
+    AddColumn {
+        column: TableColumnDefinition,
+    },
+    RenameTable {
+        new_name: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub enum MetadataStatement {
     CreateDatabase {
         name: String,
@@ -191,10 +211,40 @@ pub enum MetadataStatement {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<String>>,
     },
+    Delete {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        selection_sql: Option<String>,
+    },
+    Truncate {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+    },
+    Update {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        assignments: Vec<(String, String)>,
+        selection_sql: Option<String>,
+    },
+    AlterTable {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        operation: AlterTableOperation,
+    },
+    AlterSchema {
+        database: Option<String>,
+        name: String,
+        new_name: String,
+    },
     ShowDatabases,
     ShowSchemas {
         database: Option<String>,
     },
+    ShowNodes,
     ShowTables {
         database: Option<String>,
         schema: Option<String>,
@@ -204,11 +254,6 @@ pub enum MetadataStatement {
         schema: Option<String>,
     },
     ShowColumns {
-        database: Option<String>,
-        schema: Option<String>,
-        name: String,
-    },
-    DescribeRelation {
         database: Option<String>,
         schema: Option<String>,
         name: String,
@@ -240,6 +285,30 @@ pub enum MetadataStatement {
     InformationSchemaReferentialConstraints {
         sql: String,
     },
+    DropTable {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropView {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
+    DropSchema {
+        database: Option<String>,
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     AlterUserPassword {
         name: String,
         password: String,
@@ -249,11 +318,14 @@ pub enum MetadataStatement {
     Rollback,
 }
 
+pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.json";
+
 #[derive(Debug)]
 pub struct ControlPlane {
     coordinator_node_id: String,
     catalog_path: Option<PathBuf>,
     state: RwLock<CatalogState>,
+    next_round_robin_index: AtomicUsize,
 }
 
 impl ControlPlane {
@@ -262,22 +334,17 @@ impl ControlPlane {
     }
 
     pub async fn from_catalog_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let state = if path.exists() {
-            let raw = fs::read_to_string(&path).await?;
-            if raw.trim().is_empty() {
-                bootstrap_state()
-            } else {
-                serde_json::from_str::<CatalogState>(&raw)?
-            }
+        let path = path.as_ref();
+        if path.exists() {
+            let raw = fs::read_to_string(path).await?;
+            let state: CatalogState = serde_json::from_str(&raw)?;
+            Ok(Self::from_state(Some(path.to_path_buf()), state))
         } else {
-            bootstrap_state()
-        };
+            let control_plane = Self::from_state(Some(path.to_path_buf()), bootstrap_state());
+            control_plane.persist().await?;
 
-        let control_plane = Self::from_state(Some(path), state);
-        control_plane.persist().await?;
-
-        Ok(control_plane)
+            Ok(control_plane)
+        }
     }
 
     fn from_state(catalog_path: Option<PathBuf>, state: CatalogState) -> Self {
@@ -287,15 +354,31 @@ impl ControlPlane {
             coordinator_node_id,
             catalog_path,
             state: RwLock::new(state),
+            next_round_robin_index: AtomicUsize::new(0),
         }
     }
 
     pub async fn admit_query(&self, session: &SessionContext) -> Result<QueryAdmission> {
         self.validate_session(session).await?;
 
+        let state = self.state.read().await;
+        // Round-robin routing across 'Ready' nodes
+        let ready_nodes: Vec<_> = state
+            .nodes
+            .values()
+            .filter(|n| n.status == NodeStatus::Ready)
+            .collect();
+
+        let coordinator_node_id = if ready_nodes.is_empty() {
+            self.coordinator_node_id.clone()
+        } else {
+            let index = self.next_round_robin_index.fetch_add(1, Ordering::SeqCst) % ready_nodes.len();
+            ready_nodes[index].id.clone()
+        };
+
         Ok(QueryAdmission {
             query_id: format!("q-{}", Uuid::now_v7()),
-            coordinator_node_id: self.coordinator_node_id.clone(),
+            coordinator_node_id,
         })
     }
 
@@ -305,113 +388,52 @@ impl ControlPlane {
     }
 
     fn _validate_session(&self, state: &CatalogState, session: &SessionContext) -> Result<()> {
-        let _ = self._catalog_user(state, &session.user)?;
-        self._authorize_role_assumption(state, &session.user, &session.role)?;
+        let user = state
+            .users
+            .get(&session.user)
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", session.user))?;
 
-        let database = state
-            .databases
-            .get(&session.database)
-            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", session.database))?;
+        if session.role != session.user {
+            let role = state
+                .users
+                .get(&session.role)
+                .ok_or_else(|| anyhow::anyhow!("Unknown role '{}'", session.role))?;
 
-        if !database.schemas.contains(&session.schema) {
-            bail!("Unknown schema '{}.{}'", session.database, session.schema);
-        }
-
-        Ok(())
-    }
-
-    pub async fn validate_credentials(
-        &self,
-        user: &str,
-        password: Option<&str>,
-    ) -> Result<CatalogUser> {
-        let state = self.state.read().await;
-        let catalog_user = self._catalog_user(&state, user)?;
-
-        if let Some(expected_password) = catalog_user.password.as_deref() {
-            let provided_password = password
-                .ok_or_else(|| anyhow::anyhow!("Missing credentials for user '{}'", user))?;
-            if provided_password != expected_password {
-                bail!("Invalid credentials for user '{}'", user);
+            if !user.is_admin && role.name != user.name {
+                bail!(
+                    "User '{}' is not authorized to assume role '{}'",
+                    session.user,
+                    session.role
+                );
             }
         }
 
-        Ok(catalog_user.clone())
-    }
-
-    pub async fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
-        let state = self.state.read().await;
-        self._catalog_user(&state, user).cloned()
-    }
-
-    fn _catalog_user<'a>(&self, state: &'a CatalogState, user: &str) -> Result<&'a CatalogUser> {
-        state
-            .users
-            .get(user)
-            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))
-    }
-
-    pub async fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
-        let state = self.state.read().await;
-        self._authorize_role_assumption(&state, user, role)
-    }
-
-    fn _authorize_role_assumption(
-        &self,
-        state: &CatalogState,
-        user: &str,
-        role: &str,
-    ) -> Result<()> {
-        let user_entry = self._catalog_user(state, user)?;
-        if !state.users.contains_key(role) {
-            bail!("Unknown role '{}'", role);
+        if !state.databases.contains_key(&session.database) {
+            bail!("Unknown database '{}'", session.database);
         }
 
-        if role != user && !user_entry.is_admin {
+        let database = state.databases.get(&session.database).unwrap();
+        if !database.schemas.contains(&session.schema) {
             bail!(
-                "User '{}' is not allowed to assume role '{}' in the current prototype",
-                user,
-                role
+                "Unknown schema '{}.{}'",
+                session.database,
+                session.schema
             );
         }
 
         Ok(())
     }
 
-    pub async fn rotate_user_password(
-        &self,
-        session: &SessionContext,
-        user: &str,
-        new_password: &str,
-    ) -> Result<String> {
-        if new_password.trim().is_empty() {
-            bail!("Password must not be empty in the current prototype");
+    pub async fn cluster_snapshot(&self) -> ClusterSnapshot {
+        let state = self.state.read().await;
+
+        ClusterSnapshot {
+            coordinator_node_id: self.coordinator_node_id.clone(),
+            nodes: state.nodes.values().cloned().collect(),
+            databases: state.databases.values().cloned().collect(),
+            users: state.users.values().cloned().collect(),
+            relations: state.relations.values().cloned().collect(),
         }
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            let acting_user = self._catalog_user(&state, &session.user)?;
-            if !acting_user.is_admin {
-                bail!(
-                    "User '{}' is not allowed to rotate credentials in the current prototype",
-                    session.user
-                );
-            }
-
-            let catalog_user = state
-                .users
-                .get_mut(user)
-                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
-
-            catalog_user.password = Some(new_password.to_string());
-            catalog_user.password_version = catalog_user.password_version.saturating_add(1);
-            catalog_user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
-        }
-
-        self.persist().await?;
-        Ok(format!("Credentials rotated for user '{}'.", user))
     }
 
     pub async fn execute_metadata_statement(
@@ -435,15 +457,27 @@ impl ControlPlane {
             | MetadataStatement::CreateTableAs { .. }
             | MetadataStatement::CreateTable { .. }
             | MetadataStatement::CreateExternalTable { .. }
-            | MetadataStatement::InsertInto { .. } => {
+            | MetadataStatement::InsertInto { .. }
+            | MetadataStatement::Update { .. }
+            | MetadataStatement::Delete { .. }
+            | MetadataStatement::Truncate { .. }
+            | MetadataStatement::AlterTable { .. }
+            | MetadataStatement::AlterSchema { .. }
+            | MetadataStatement::DropTable { .. }
+            | MetadataStatement::DropView { .. }
+            | MetadataStatement::DropDatabase { .. }
+            | MetadataStatement::DropSchema { .. } => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
-            MetadataStatement::ShowDatabases
-            | MetadataStatement::ShowSchemas { .. }
+            MetadataStatement::ShowDatabases => {
+                self.validate_session(session).await?;
+                Ok("Command completed.".to_string())
+            }
+            MetadataStatement::ShowSchemas { .. }
+            | MetadataStatement::ShowNodes
             | MetadataStatement::ShowTables { .. }
             | MetadataStatement::ShowViews { .. }
             | MetadataStatement::ShowColumns { .. }
-            | MetadataStatement::DescribeRelation { .. }
             | MetadataStatement::InformationSchemaSchemata { .. }
             | MetadataStatement::InformationSchemaTables { .. }
             | MetadataStatement::InformationSchemaColumns { .. }
@@ -453,9 +487,119 @@ impl ControlPlane {
             | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
             | MetadataStatement::InformationSchemaReferentialConstraints { .. } => {
-                bail!("Listing statements should be handled through list metadata helpers")
+                self.validate_session(session).await?;
+                Ok("Command completed.".to_string())
             }
         }
+    }
+
+    pub async fn register_node(&self, mut node: ClusterNode) -> Result<()> {
+        node.last_heartbeat_at_epoch_ms = current_epoch_millis();
+        {
+            let mut state = self.state.write().await;
+            state.nodes.insert(node.id.clone(), node);
+        }
+        self.persist().await?;
+        Ok(())
+    }
+
+    pub async fn heartbeat(&self, node_id: &str) -> Result<()> {
+        {
+            let mut state = self.state.write().await;
+            let node = state
+                .nodes
+                .get_mut(node_id)
+                .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", node_id))?;
+            node.last_heartbeat_at_epoch_ms = current_epoch_millis();
+            node.status = NodeStatus::Ready;
+        }
+        // Heartbeats don't necessarily need to be persisted every time for the prototype
+        // but we'll do it for now to keep it simple and consistent.
+        self.persist().await?;
+        Ok(())
+    }
+
+    pub async fn prune_unhealthy_nodes(&self, threshold_ms: u128) -> Result<()> {
+        let now = current_epoch_millis();
+        let mut changed = false;
+        {
+            let mut state = self.state.write().await;
+            for node in state.nodes.values_mut() {
+                if node.status == NodeStatus::Ready && now - node.last_heartbeat_at_epoch_ms > threshold_ms {
+                    node.status = NodeStatus::Unavailable;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<ClusterNode>> {
+        let state = self.state.read().await;
+        Ok(state.nodes.values().cloned().collect())
+    }
+
+    async fn create_database(&self, session: &SessionContext, name: &str) -> Result<String> {
+        validate_identifier(name)?;
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can create databases");
+            }
+
+            if state.databases.contains_key(name) {
+                bail!("Database '{}' already exists", name);
+            }
+
+            state.databases.insert(
+                name.to_string(),
+                CatalogDatabase {
+                    name: name.to_string(),
+                    schemas: BTreeSet::from(["public".to_string()]),
+                },
+            );
+        }
+
+        self.persist().await?;
+        Ok(format!("Database '{}' created successfully.", name))
+    }
+
+    async fn create_schema(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema_name: &str,
+    ) -> Result<String> {
+        validate_identifier(schema_name)?;
+        let database_name = database.unwrap_or(&session.database);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let database = state
+                .databases
+                .get_mut(database_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
+
+            if database.schemas.contains(schema_name) {
+                bail!("Schema '{}.{}' already exists", database_name, schema_name);
+            }
+
+            database.schemas.insert(schema_name.to_string());
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Schema '{}.{}' created successfully.",
+            database_name, schema_name
+        ))
     }
 
     pub async fn list_databases(&self, session: &SessionContext) -> Result<Vec<String>> {
@@ -495,25 +639,71 @@ impl ControlPlane {
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
-        let database = state
-            .databases
-            .get(database_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
-
-        if !database.schemas.contains(schema_name) {
-            bail!("Unknown schema '{}.{}'", database_name, schema_name);
-        }
-
         Ok(state
             .relations
             .values()
-            .filter(|relation| {
-                relation.kind == kind
-                    && relation.database == database_name
-                    && relation.schema == schema_name
-            })
+            .filter(|rel| rel.kind == kind && rel.database == database_name && rel.schema == schema_name)
             .cloned()
             .collect())
+    }
+
+    pub async fn find_relation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<CatalogRelation> {
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
+
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        let key = relation_key(database_name, schema_name, name);
+        state
+            .relations
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Relation '{}' not found", key))
+    }
+
+    pub async fn relation_columns(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<Vec<CatalogColumn>> {
+        let relation = self.find_relation(session, database, schema, name).await?;
+        Ok(relation.columns)
+    }
+
+    pub async fn table_relation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<CatalogRelation> {
+        let relation = self.find_relation(session, database, schema, name).await?;
+        if relation.kind != CatalogRelationKind::Table {
+            bail!("Relation '{}' is not a table", name);
+        }
+        Ok(relation)
+    }
+
+    pub async fn list_tables_for_session(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<CatalogRelation>> {
+        self.list_relations(
+            session,
+            Some(&session.database),
+            Some(&session.schema),
+            CatalogRelationKind::Table,
+        )
+        .await
     }
 
     pub async fn list_relations_for_database(
@@ -548,124 +738,11 @@ impl ControlPlane {
     ) -> Result<Vec<CatalogRelation>> {
         self.list_relations(
             session,
-            Some(session.database.as_str()),
-            Some(session.schema.as_str()),
+            Some(&session.database),
+            Some(&session.schema),
             CatalogRelationKind::View,
         )
         .await
-    }
-
-    pub async fn list_tables_for_session(
-        &self,
-        session: &SessionContext,
-    ) -> Result<Vec<CatalogRelation>> {
-        self.list_relations(
-            session,
-            Some(session.database.as_str()),
-            Some(session.schema.as_str()),
-            CatalogRelationKind::Table,
-        )
-        .await
-    }
-
-    pub async fn relation_columns(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Result<Vec<CatalogColumn>> {
-        let relation = self.find_relation(session, database, schema, name).await?;
-        Ok(relation.columns)
-    }
-
-    pub async fn table_relation(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Result<CatalogRelation> {
-        let relation = self.find_relation(session, database, schema, name).await?;
-
-        if relation.kind != CatalogRelationKind::Table {
-            bail!(
-                "Relation '{}.{}.{}' is not a managed table",
-                relation.database,
-                relation.schema,
-                relation.name
-            );
-        }
-
-        Ok(relation)
-    }
-
-    pub async fn cluster_snapshot(&self) -> ClusterSnapshot {
-        let state = self.state.read().await;
-
-        ClusterSnapshot {
-            coordinator_node_id: self.coordinator_node_id.clone(),
-            nodes: state.nodes.values().cloned().collect(),
-            databases: state.databases.values().cloned().collect(),
-            users: state.users.values().cloned().collect(),
-            relations: state.relations.values().cloned().collect(),
-        }
-    }
-
-    async fn create_database(&self, session: &SessionContext, name: &str) -> Result<String> {
-        validate_identifier(name)?;
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            if state.databases.contains_key(name) {
-                bail!("Database '{}' already exists", name);
-            }
-
-            state.databases.insert(
-                name.to_string(),
-                CatalogDatabase {
-                    name: name.to_string(),
-                    schemas: ["public".to_string()].into_iter().collect(),
-                },
-            );
-        }
-
-        self.persist().await?;
-        Ok(format!("Database '{name}' created successfully."))
-    }
-
-    async fn create_schema(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema_name: &str,
-    ) -> Result<String> {
-        validate_identifier(schema_name)?;
-        let database_name = database.unwrap_or(&session.database);
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            let database = state
-                .databases
-                .get_mut(database_name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
-
-            if database.schemas.contains(schema_name) {
-                bail!("Schema '{}.{}' already exists", database_name, schema_name);
-            }
-
-            database.schemas.insert(schema_name.to_string());
-        }
-
-        self.persist().await?;
-        Ok(format!(
-            "Schema '{}.{}' created successfully.",
-            database_name, schema_name
-        ))
     }
 
     pub async fn register_view(
@@ -743,9 +820,11 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
         }
 
-        let catalog_path = self.catalog_path.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Managed tables require --catalog-path in the current prototype")
-        })?;
+        let catalog_path_buf = self
+            .catalog_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CATALOG_PATH));
+        let catalog_path = catalog_path_buf.as_path();
 
         let base_name = catalog_path
             .file_stem()
@@ -755,7 +834,7 @@ impl ControlPlane {
         let data_dir = parent_dir.join(format!("{base_name}.managed"));
 
         Ok(data_dir.join(format!(
-            "{database_name}__{schema_name}__{table_name}.table.json"
+            "{database_name}__{schema_name}__{table_name}.table.parquet"
         )))
     }
 
@@ -770,7 +849,6 @@ impl ControlPlane {
         constraints: Vec<CatalogTableConstraint>,
     ) -> Result<String> {
         validate_identifier(table_name)?;
-
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
@@ -805,7 +883,7 @@ impl ControlPlane {
                     name: table_name.to_string(),
                     kind: CatalogRelationKind::Table,
                     definition_sql: None,
-                    storage_path: Some(storage_path.to_string_lossy().into_owned()),
+                    storage_path: Some(storage_path.to_string_lossy().to_string()),
                     external_format: None,
                     columns,
                     constraints,
@@ -820,6 +898,183 @@ impl ControlPlane {
         ))
     }
 
+    pub async fn add_column(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table_name: &str,
+        column: CatalogColumn,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let relation_key = relation_key(database_name, schema_name, table_name);
+            let relation = state
+                .relations
+                .get_mut(&relation_key)
+                .ok_or_else(|| anyhow::anyhow!("Table '{}.{}.{}' not found", database_name, schema_name, table_name))?;
+
+            if relation.kind != CatalogRelationKind::Table {
+                bail!("Relation '{}.{}.{}' is not a table", database_name, schema_name, table_name);
+            }
+
+            if relation.columns.iter().any(|c| c.name == column.name) {
+                bail!("Column '{}' already exists in table '{}.{}.{}'", column.name, database_name, schema_name, table_name);
+            }
+
+            relation.columns.push(column);
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Column added successfully to '{}.{}.{}'.",
+            database_name, schema_name, table_name
+        ))
+    }
+
+    pub async fn rename_relation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_identifier(new_name)?;
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let old_key = relation_key(database_name, schema_name, name);
+            let new_key = relation_key(database_name, schema_name, new_name);
+
+            if !state.relations.contains_key(&old_key) {
+                bail!("Relation '{}.{}.{}' not found", database_name, schema_name, name);
+            }
+
+            if state.relations.contains_key(&new_key) {
+                bail!("Relation '{}.{}.{}' already exists", database_name, schema_name, new_name);
+            }
+
+            let mut relation = state.relations.remove(&old_key).unwrap();
+            relation.name = new_name.to_string();
+
+            // If it's a managed table, update the storage path as well to match the new name?
+            // Actually, managed tables use a directory name derived from the table name often.
+            // Let's see how register_managed_table does it.
+            // It seems it takes a storage_path as argument.
+            // If we rename physically in the engine, we should update the storage_path in metadata.
+
+            state.relations.insert(new_key, relation);
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Relation '{}.{}.{}' renamed to '{}' successfully.",
+            database_name, schema_name, name, new_name
+        ))
+    }
+
+    pub async fn rename_schema(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_identifier(new_name)?;
+        let database_name = database.unwrap_or(&session.database);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let db = state
+                .databases
+                .get_mut(database_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
+
+            if !db.schemas.contains(name) {
+                bail!("Schema '{}.{}' not found", database_name, name);
+            }
+
+            if db.schemas.contains(new_name) {
+                bail!("Schema '{}.{}' already exists", database_name, new_name);
+            }
+
+            // Update database schemas set
+            db.schemas.remove(name);
+            db.schemas.insert(new_name.to_string());
+
+            // Update all relations in this schema
+            let old_prefix = format!("{}.{}.", database_name, name);
+            let new_prefix = format!("{}.{}.", database_name, new_name);
+
+            let keys_to_update: Vec<String> = state
+                .relations
+                .keys()
+                .filter(|k| k.starts_with(&old_prefix))
+                .cloned()
+                .collect();
+
+            for old_key in keys_to_update {
+                let mut relation = state.relations.remove(&old_key).unwrap();
+                relation.schema = new_name.to_string();
+                let new_key = format!("{}{}", new_prefix, relation.name);
+                
+                // If it's a managed table, we might need to update the storage path too.
+                // But let's handle that in the engine for now or keep it simple.
+                
+                state.relations.insert(new_key, relation);
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Schema '{}.{}' renamed to '{}' successfully.",
+            database_name, name, new_name
+        ))
+    }
+
+    pub async fn update_relation_storage_path(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        new_storage_path: &str,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let key = relation_key(database_name, schema_name, name);
+            let relation = state
+                .relations
+                .get_mut(&key)
+                .ok_or_else(|| anyhow::anyhow!("Relation '{}.{}.{}' not found", database_name, schema_name, name))?;
+
+            relation.storage_path = Some(new_storage_path.to_string());
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Storage path for '{}.{}.{}' updated successfully.",
+            database_name, schema_name, name
+        ))
+    }
+
     pub async fn register_external_table(
         &self,
         session: &SessionContext,
@@ -830,7 +1085,6 @@ impl ControlPlane {
         format: ExternalStorageFormat,
     ) -> Result<String> {
         validate_identifier(table_name)?;
-
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
 
@@ -867,7 +1121,7 @@ impl ControlPlane {
                     definition_sql: None,
                     storage_path: Some(location.to_string()),
                     external_format: Some(format),
-                    columns: Vec::new(),
+                    columns: Vec::new(), // Schema will be resolved during registration
                     constraints: Vec::new(),
                 },
             );
@@ -878,6 +1132,145 @@ impl ControlPlane {
             "External table '{}.{}.{}' registered successfully.",
             database_name, schema_name, table_name
         ))
+    }
+
+    pub async fn drop_relation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        kind: CatalogRelationKind,
+        if_exists: bool,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let key = relation_key(database_name, schema_name, name);
+            if let Some(rel) = state.relations.get(&key) {
+                if rel.kind != kind {
+                    bail!("Relation '{}' is a {}, not a {:?}", key, if rel.kind == CatalogRelationKind::Table { "table" } else { "view" }, kind);
+                }
+                state.relations.remove(&key);
+            } else {
+                if if_exists {
+                    return Ok(format!(
+                        "{} '{}' does not exist, skipping.",
+                        if kind == CatalogRelationKind::Table { "Table" } else { "View" },
+                        key
+                    ));
+                } else {
+                    bail!("{} '{}' not found", if kind == CatalogRelationKind::Table { "Table" } else { "View" }, key);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "{} '{}.{}.{}' dropped successfully.",
+            if kind == CatalogRelationKind::Table { "Table" } else { "View" },
+            database_name,
+            schema_name,
+            name
+        ))
+    }
+
+    pub async fn drop_database(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can drop databases");
+            }
+
+            if name == "postgres" {
+                bail!("Cannot drop the default 'postgres' database");
+            }
+
+            if let Some(_db) = state.databases.remove(name) {
+                // Cascade: Remove all relations belonging to this database
+                state.relations.retain(|key, _| !key.starts_with(&format!("{name}.")));
+            } else {
+                if if_exists {
+                    return Ok(format!("Database '{}' does not exist, skipping.", name));
+                } else {
+                    bail!("Database '{}' not found", name);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("Database '{}' dropped successfully.", name))
+    }
+
+    pub async fn drop_schema(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        name: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+        let database_name = database.unwrap_or(&session.database);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if name == "public" || name == "pg_catalog" || name == "information_schema" {
+                bail!("Cannot drop system schema '{}'", name);
+            }
+
+            let (schema_exists, has_relations) = {
+                let db = state
+                    .databases
+                    .get(database_name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
+                
+                let exists = db.schemas.contains(name);
+                let has_rels = if exists {
+                    let schema_prefix = format!("{database_name}.{name}.");
+                    state.relations.keys().any(|k| k.starts_with(&schema_prefix))
+                } else {
+                    false
+                };
+                (exists, has_rels)
+            };
+
+            if schema_exists {
+                if has_relations && !cascade {
+                    bail!("Schema '{}.{}' is not empty and CASCADE was not specified", database_name, name);
+                }
+
+                // Remove schema and its relations
+                let db = state.databases.get_mut(database_name).unwrap();
+                db.schemas.remove(name);
+                let schema_prefix = format!("{database_name}.{name}.");
+                state.relations.retain(|key, _| !key.starts_with(&schema_prefix));
+            } else {
+                if if_exists {
+                    return Ok(format!("Schema '{}.{}' does not exist, skipping.", database_name, name));
+                } else {
+                    bail!("Schema '{}.{}' not found", database_name, name);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("Schema '{}.{}' dropped successfully.", database_name, name))
     }
 
     async fn persist(&self) -> Result<()> {
@@ -896,28 +1289,94 @@ impl ControlPlane {
         Ok(())
     }
 
-    async fn find_relation(
+    pub async fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
+        let state = self.state.read().await;
+        state
+            .users
+            .get(user)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))
+    }
+
+    pub async fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
+        let state = self.state.read().await;
+        let catalog_user = state
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+
+        if user == role {
+            return Ok(());
+        }
+
+        let catalog_role = state
+            .users
+            .get(role)
+            .ok_or_else(|| anyhow::anyhow!("Unknown role '{}'", role))?;
+
+        if !catalog_user.is_admin && catalog_user.name != catalog_role.name {
+            bail!(
+                "User '{}' is not authorized to assume role '{}'",
+                user,
+                role
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn validate_credentials(
+        &self,
+        user: &str,
+        password: Option<&str>,
+    ) -> Result<CatalogUser> {
+        let state = self.state.read().await;
+        let catalog_user = state
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
+
+        if let Some(expected) = &catalog_user.password {
+            let provided = password.ok_or_else(|| {
+                anyhow::anyhow!("Password required for user '{}'", user)
+            })?;
+            if provided != expected {
+                bail!("Invalid credentials for user '{}'", user);
+            }
+        }
+
+        Ok(catalog_user.clone())
+    }
+
+    async fn rotate_user_password(
         &self,
         session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Result<CatalogRelation> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-        let relation_key = relation_key(database_name, schema_name, name);
+        user_name: &str,
+        password: &str,
+    ) -> Result<String> {
+        if password.is_empty() {
+            bail!("Password must not be empty");
+        }
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
 
-        let state = self.state.read().await;
-        self._validate_session(&state, session)?;
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("User '{}' is not allowed to rotate credentials", session.user);
+            }
 
-        state.relations.get(&relation_key).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown relation '{}.{}.{}'",
-                database_name,
-                schema_name,
-                name
-            )
-        })
+            let user = state
+                .users
+                .get_mut(user_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user_name))?;
+
+            user.password = Some(password.to_string());
+            user.password_version += 1;
+            user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
+        }
+
+        self.persist().await?;
+        Ok(format!("Password for user '{}' rotated successfully.", user_name))
     }
 }
 
@@ -927,9 +1386,7 @@ fn bootstrap_state() -> CatalogState {
         "postgres".to_string(),
         CatalogDatabase {
             name: "postgres".to_string(),
-            schemas: ["public".to_string(), "information_schema".to_string()]
-                .into_iter()
-                .collect(),
+            schemas: BTreeSet::from(["public".to_string()]),
         },
     );
 
@@ -945,16 +1402,6 @@ fn bootstrap_state() -> CatalogState {
         },
     );
     users.insert(
-        "analyticsdb_admin".to_string(),
-        CatalogUser {
-            name: "analyticsdb_admin".to_string(),
-            is_admin: true,
-            password: Some("analyticsdb_admin".to_string()),
-            password_version: 1,
-            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
-        },
-    );
-    users.insert(
         "analytics_reader".to_string(),
         CatalogUser {
             name: "analytics_reader".to_string(),
@@ -964,32 +1411,25 @@ fn bootstrap_state() -> CatalogState {
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
         },
     );
+    users.insert(
+        "analyticsdb_admin".to_string(),
+        CatalogUser {
+            name: "analyticsdb_admin".to_string(),
+            is_admin: false,
+            password: Some("analyticsdb_admin".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+        },
+    );
 
-    let mut nodes = BTreeMap::new();
-    nodes.insert(
-        "control-1".to_string(),
-        ClusterNode {
-            id: "control-1".to_string(),
-            role: NodeRole::Control,
-            endpoint: "embedded://control-1".to_string(),
-            status: NodeStatus::Ready,
-        },
-    );
-    nodes.insert(
-        "compute-1".to_string(),
-        ClusterNode {
-            id: "compute-1".to_string(),
-            role: NodeRole::Compute,
-            endpoint: "embedded://compute-1".to_string(),
-            status: NodeStatus::Ready,
-        },
-    );
+    let nodes = BTreeMap::new();
+    let relations = BTreeMap::new();
 
     CatalogState {
         databases,
         users,
         nodes,
-        relations: BTreeMap::new(),
+        relations,
     }
 }
 
@@ -1049,336 +1489,424 @@ fn current_epoch_millis() -> u128 {
         .as_millis()
 }
 
-fn split_sql_top_level(input: &str, delimiter: char) -> Result<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut in_single_quote = false;
-    let mut chars = input.char_indices().peekable();
-
-    while let Some((index, character)) = chars.next() {
-        if character == '\'' {
-            if in_single_quote {
-                if matches!(chars.peek(), Some((_, '\''))) {
-                    let _ = chars.next();
-                } else {
-                    in_single_quote = false;
-                }
-            } else {
-                in_single_quote = true;
-            }
-            continue;
-        }
-
-        if in_single_quote {
-            continue;
-        }
-
-        match character {
-            '(' => depth += 1,
-            ')' => {
-                if depth == 0 {
-                    bail!("Unbalanced ')' in SQL fragment '{}'", input);
-                }
-                depth -= 1;
-            }
-            _ if character == delimiter && depth == 0 => {
-                parts.push(input[start..index].trim().to_string());
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    if in_single_quote || depth != 0 {
-        bail!("Unbalanced SQL fragment '{}'", input);
-    }
-
-    let tail = input[start..].trim();
-    if !tail.is_empty() {
-        parts.push(tail.to_string());
-    }
-
-    Ok(parts)
-}
-
-fn parse_table_columns(
-    raw: &str,
-) -> Result<(Vec<TableColumnDefinition>, Vec<TableConstraintDefinition>)> {
-    let mut columns = Vec::new();
+fn parse_column_def(
+    element: &sqlparser::ast::ColumnDef,
+) -> (TableColumnDefinition, Vec<TableConstraintDefinition>) {
+    let mut nullable = true;
+    let mut default_value = None;
     let mut constraints = Vec::new();
 
-    for element in split_sql_top_level(raw, ',')? {
-        if let Some(constraint) = parse_table_constraint_definition(&element)? {
-            constraints.push(constraint);
-            continue;
-        }
-        columns.push(parse_table_column_definition(&element)?);
-    }
-
-    Ok((columns, constraints))
-}
-
-fn parse_table_column_definition(column: &str) -> Result<TableColumnDefinition> {
-    let tokens = column.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() < 2 {
-        bail!(
-            "Unsupported column definition '{}' in the current prototype",
-            column
-        );
-    }
-
-    let nullable = !(tokens.len() >= 4
-        && tokens[tokens.len() - 2].eq_ignore_ascii_case("NOT")
-        && tokens[tokens.len() - 1].eq_ignore_ascii_case("NULL"));
-
-    let data_type_end = if nullable {
-        tokens.len()
-    } else {
-        tokens.len() - 2
-    };
-    let data_type = tokens[1..data_type_end].join(" ");
-
-    if data_type.is_empty() {
-        bail!(
-            "Unsupported column definition '{}' in the current prototype",
-            column
-        );
-    }
-
-    Ok(TableColumnDefinition {
-        name: tokens[0].to_string(),
-        data_type,
-        nullable,
-    })
-}
-
-fn parse_table_constraint_definition(raw: &str) -> Result<Option<TableConstraintDefinition>> {
-    let trimmed = raw.trim();
-    let upper = trimmed.to_ascii_uppercase();
-
-    let (constraint_name, definition) = if upper.starts_with("CONSTRAINT ") {
-        let rest = trimmed["CONSTRAINT ".len()..].trim();
-        let (name, remainder) = rest.split_once(' ').ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unsupported table constraint syntax '{}' in the current prototype",
-                raw
-            )
-        })?;
-        (Some(name.to_string()), remainder.trim())
-    } else {
-        (None, trimmed)
-    };
-
-    let definition_upper = definition.to_ascii_uppercase();
-    if definition_upper.starts_with("PRIMARY KEY") {
-        let open = definition.find('(').ok_or_else(|| {
-            anyhow::anyhow!("PRIMARY KEY constraint requires column list in '{}'.", raw)
-        })?;
-        let close = definition.rfind(')').ok_or_else(|| {
-            anyhow::anyhow!("PRIMARY KEY constraint requires closing ')' in '{}'.", raw)
-        })?;
-        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
-        if columns.is_empty() {
-            bail!(
-                "PRIMARY KEY constraint requires at least one column in '{}'.",
-                raw
-            );
-        }
-        return Ok(Some(TableConstraintDefinition::PrimaryKey {
-            name: constraint_name,
-            columns,
-        }));
-    }
-
-    if definition_upper.starts_with("FOREIGN KEY") {
-        let open = definition.find('(').ok_or_else(|| {
-            anyhow::anyhow!("FOREIGN KEY constraint requires column list in '{}'.", raw)
-        })?;
-        let close = definition.find(')').ok_or_else(|| {
-            anyhow::anyhow!("FOREIGN KEY constraint requires closing ')' in '{}'.", raw)
-        })?;
-        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
-        let after_columns = definition[close + 1..].trim();
-        let after_upper = after_columns.to_ascii_uppercase();
-        let references_prefix = "REFERENCES ";
-        if !after_upper.starts_with(references_prefix) {
-            bail!(
-                "FOREIGN KEY constraint requires REFERENCES clause in '{}'.",
-                raw
-            );
-        }
-        let ref_target_and_columns = after_columns[references_prefix.len()..].trim();
-        let ref_open = ref_target_and_columns.find('(').ok_or_else(|| {
-            anyhow::anyhow!(
-                "REFERENCES clause requires referenced column list in '{}'.",
-                raw
-            )
-        })?;
-        let ref_close = ref_target_and_columns.rfind(')').ok_or_else(|| {
-            anyhow::anyhow!("REFERENCES clause requires closing ')' in '{}'.", raw)
-        })?;
-        let ref_target = ref_target_and_columns[..ref_open].trim();
-        let referenced_columns =
-            split_sql_top_level(&ref_target_and_columns[ref_open + 1..ref_close], ',')?;
-        let (referenced_database, referenced_schema, referenced_table) =
-            parse_qualified_name(ref_target, None, None)?;
-
-        return Ok(Some(TableConstraintDefinition::ForeignKey {
-            name: constraint_name,
-            columns,
-            referenced_database,
-            referenced_schema,
-            referenced_table,
-            referenced_columns,
-        }));
-    }
-
-    Ok(None)
-}
-
-fn parse_insert_rows(raw: &str) -> Result<Vec<Vec<String>>> {
-    let mut rows = Vec::new();
-    let mut in_single_quote = false;
-    let mut depth = 0usize;
-    let mut row_start = None;
-    let chars = raw.char_indices().collect::<Vec<_>>();
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        let (offset, character) = chars[index];
-
-        if character == '\'' {
-            if in_single_quote {
-                if index + 1 < chars.len() && chars[index + 1].1 == '\'' {
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            } else {
-                in_single_quote = true;
+    for option_def in &element.options {
+        match &option_def.option {
+            sqlparser::ast::ColumnOption::NotNull => nullable = false,
+            sqlparser::ast::ColumnOption::Default(expr) => {
+                default_value = Some(expr.to_string());
             }
-            index += 1;
-            continue;
-        }
-
-        if in_single_quote {
-            index += 1;
-            continue;
-        }
-
-        match character {
-            '(' => {
-                if depth == 0 {
-                    row_start = Some(offset + character.len_utf8());
-                }
-                depth += 1;
-            }
-            ')' => {
-                if depth == 0 {
-                    bail!("Unbalanced ')' in VALUES clause '{}'", raw);
-                }
-
-                depth -= 1;
-                if depth == 0 {
-                    let start = row_start.ok_or_else(|| {
-                        anyhow::anyhow!("Malformed VALUES clause '{}': missing row start", raw)
-                    })?;
-                    rows.push(split_sql_top_level(&raw[start..offset], ',')?);
-                    row_start = None;
-                }
-            }
-            ',' if depth == 0 => {}
-            whitespace if whitespace.is_whitespace() && depth == 0 => {}
-            _ if depth == 0 => {
-                bail!(
-                    "Unsupported VALUES syntax '{}' in the current prototype",
-                    raw
-                )
+            sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                constraints.push(TableConstraintDefinition::PrimaryKey {
+                    name: None,
+                    columns: vec![element.name.to_string()],
+                });
             }
             _ => {}
         }
-
-        index += 1;
     }
 
-    if in_single_quote || depth != 0 {
-        bail!("Unbalanced VALUES clause '{}'", raw);
-    }
-
-    if rows.is_empty() {
-        bail!("VALUES clause must contain at least one row");
-    }
-
-    Ok(rows)
-}
-
-fn parse_insert_target(raw: &str) -> Result<(String, Option<Vec<String>>)> {
-    let trimmed = raw.trim();
-
-    if let Some(open_paren) = trimmed.find('(') {
-        if !trimmed.ends_with(')') {
-            bail!(
-                "Unsupported INSERT target '{}' in the current prototype",
-                trimmed
-            );
-        }
-
-        let name = trimmed[..open_paren].trim();
-        let columns_raw = &trimmed[open_paren + 1..trimmed.len() - 1];
-        let columns = split_sql_top_level(columns_raw, ',')?
-            .into_iter()
-            .map(|column| column.trim().to_string())
-            .collect::<Vec<_>>();
-
-        if columns.is_empty() || columns.iter().any(|column| column.is_empty()) {
-            bail!(
-                "Unsupported INSERT target '{}' in the current prototype",
-                trimmed
-            );
-        }
-
-        return Ok((name.to_string(), Some(columns)));
-    }
-
-    Ok((trimmed.to_string(), None))
-}
-
-fn parse_schema_scope(raw: &str) -> Result<(Option<String>, Option<String>)> {
-    let parts = raw.split('.').collect::<Vec<_>>();
-
-    match parts.as_slice() {
-        [schema] => Ok((None, Some((*schema).to_string()))),
-        [database, schema] => Ok((Some((*database).to_string()), Some((*schema).to_string()))),
-        _ => bail!("Unsupported schema scope '{}'", raw),
-    }
-}
-
-fn parse_sql_single_quoted_literal(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with('\'') || !trimmed.ends_with('\'') || trimmed.len() < 2 {
-        bail!("Expected single-quoted SQL string literal, got '{}'.", raw);
-    }
-
-    let mut result = String::new();
-    let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            if matches!(chars.peek(), Some('\'')) {
-                let _ = chars.next();
-                result.push('\'');
-            } else {
-                bail!("Unescaped quote in SQL string literal '{}'.", raw);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    Ok(result)
+    (
+        TableColumnDefinition {
+            name: element.name.to_string(),
+            data_type: element.data_type.to_string(),
+            nullable,
+            default_value,
+        },
+        constraints,
+    )
 }
 
 pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
+    let dialect = PostgreSqlDialect {};
+    let statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return parse_metadata_statement_fallback(sql),
+    };
+
+    if statements.len() != 1 {
+        return parse_metadata_statement_fallback(sql);
+    }
+
+    match &statements[0] {
+        sqlparser::ast::Statement::CreateDatabase { db_name, .. } => {
+            Some(MetadataStatement::CreateDatabase {
+                name: db_name.to_string(),
+            })
+        }
+        sqlparser::ast::Statement::CreateSchema {
+            schema_name,
+            if_not_exists: _,
+            ..
+        } => {
+            let (db, name) = match schema_name {
+                sqlparser::ast::SchemaName::Simple(n) => {
+                    let idents: Vec<String> = n.0.iter().map(|i| i.to_string()).collect();
+                    match idents.as_slice() {
+                        [name] => (None, name.clone()),
+                        [db, name] => (Some(db.clone()), name.clone()),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            Some(MetadataStatement::CreateSchema {
+                database: db,
+                name,
+            })
+        }
+        sqlparser::ast::Statement::CreateTable(create_table) => {
+            let name = &create_table.name;
+            let idents: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, table_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            if create_table.external {
+                return Some(MetadataStatement::CreateExternalTable {
+                    database,
+                    schema,
+                    name: table_name,
+                    format: ExternalStorageFormat::Parquet,
+                    location: create_table.location.clone().unwrap_or_default(),
+                });
+            }
+
+            if let Some(query) = &create_table.query {
+                return Some(MetadataStatement::CreateTableAs {
+                    database,
+                    schema,
+                    name: table_name,
+                    query_sql: query.to_string(),
+                });
+            }
+
+            let mut columns = Vec::new();
+            let mut constraints = Vec::new();
+
+            for element in &create_table.columns {
+                let (col_def, col_constraints) = parse_column_def(element);
+                columns.push(col_def);
+                constraints.extend(col_constraints);
+            }
+
+            for constraint in &create_table.constraints {
+                match constraint {
+                    sqlparser::ast::TableConstraint::PrimaryKey(p) => {
+                        constraints.push(TableConstraintDefinition::PrimaryKey {
+                            name: p.name.as_ref().map(|i| i.to_string()),
+                            columns: p.columns.iter().map(|c| c.to_string()).collect(),
+                        });
+                    }
+                    sqlparser::ast::TableConstraint::ForeignKey(f) => {
+                        let ft_idents: Vec<String> =
+                            f.foreign_table.0.iter().map(|i| i.to_string()).collect();
+                        let (f_db, f_sch, f_name) = match ft_idents.as_slice() {
+                            [n] => (None, None, n.clone()),
+                            [s, n] => (None, Some(s.clone()), n.clone()),
+                            [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                            _ => return None,
+                        };
+
+                        constraints.push(TableConstraintDefinition::ForeignKey {
+                            name: f.name.as_ref().map(|i| i.to_string()),
+                            columns: f.columns.iter().map(|i| i.to_string()).collect(),
+                            referenced_database: f_db,
+                            referenced_schema: f_sch,
+                            referenced_table: f_name,
+                            referenced_columns: f
+                                .referred_columns
+                                .iter()
+                                .map(|i| i.to_string())
+                                .collect(),
+                        });
+                    }
+                    sqlparser::ast::TableConstraint::Unique(u) => {
+                         constraints.push(TableConstraintDefinition::Unique {
+                            name: u.name.as_ref().map(|i| i.to_string()),
+                            columns: u.columns.iter().map(|c| c.to_string()).collect(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(MetadataStatement::CreateTable {
+                database,
+                schema,
+                name: table_name,
+                columns,
+                constraints,
+            })
+        }
+        sqlparser::ast::Statement::Insert(insert) => {
+            let table_name_obj = match &insert.table {
+                sqlparser::ast::TableObject::TableName(n) => n,
+                _ => return None,
+            };
+            let idents: Vec<String> = table_name_obj.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            let columns = if insert.columns.is_empty() {
+                None
+            } else {
+                Some(insert.columns.iter().map(|i| i.to_string()).collect())
+            };
+
+            let rows = match insert.source.as_deref() {
+                Some(query) => match &*query.body {
+                    sqlparser::ast::SetExpr::Values(values) => {
+                        let mut result_rows = Vec::new();
+                        for row in &values.rows {
+                            let mut result_row = Vec::new();
+                            for expr in row {
+                                result_row.push(expr.to_string());
+                            }
+                            result_rows.push(result_row);
+                        }
+                        result_rows
+                    }
+                    _ => return None,
+                },
+                None => return None,
+            };
+
+            Some(MetadataStatement::InsertInto {
+                database,
+                schema,
+                name,
+                columns,
+                rows,
+            })
+        }
+        sqlparser::ast::Statement::Delete(delete) => {
+            let table_name_obj = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(v) => {
+                    match &v[0].relation {
+                        sqlparser::ast::TableFactor::Table { name, .. } => name,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            let idents: Vec<String> = table_name_obj.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            Some(MetadataStatement::Delete {
+                database,
+                schema,
+                name,
+                selection_sql: delete.selection.as_ref().map(|e| e.to_string()),
+            })
+        }
+        sqlparser::ast::Statement::Truncate(truncate) => {
+            let name = &truncate.table_names[0].name;
+            let idents: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, table_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            Some(MetadataStatement::Truncate {
+                database,
+                schema,
+                name: table_name,
+            })
+        }
+        sqlparser::ast::Statement::Update(update) => {
+            let idents: Vec<String> = match &update.table.relation {
+                sqlparser::ast::TableFactor::Table { name, .. } => {
+                    name.0.iter().map(|i| i.to_string()).collect()
+                }
+                _ => return None,
+            };
+            let (database, schema, name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            let mut result_assignments = Vec::new();
+            for assignment in &update.assignments {
+                let col = match &assignment.target {
+                    sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                        name.0.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
+                    }
+                    _ => return None, // Unsupported assignment target (e.g. Tuple)
+                };
+                result_assignments.push((col, assignment.value.to_string()));
+            }
+
+            Some(MetadataStatement::Update {
+                database,
+                schema,
+                name,
+                assignments: result_assignments,
+                selection_sql: update.selection.as_ref().map(|e| e.to_string()),
+            })
+        }
+        sqlparser::ast::Statement::AlterTable(alter) => {
+            let idents: Vec<String> = alter.name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, table_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            if alter.operations.is_empty() {
+                return None;
+            }
+
+            match &alter.operations[0] {
+                sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                    let (col_def, _) = parse_column_def(column_def);
+                    Some(MetadataStatement::AlterTable {
+                        database,
+                        schema,
+                        name: table_name,
+                        operation: AlterTableOperation::AddColumn { column: col_def },
+                    })
+                }
+                sqlparser::ast::AlterTableOperation::RenameTable { table_name: name } => {
+                    let name_str = name.to_string();
+                    let new_name = if name_str.to_ascii_uppercase().starts_with("TO ") {
+                        name_str["TO ".len()..].trim().to_string()
+                    } else {
+                        name_str
+                    };
+                    Some(MetadataStatement::AlterTable {
+                        database,
+                        schema,
+                        name: table_name,
+                        operation: AlterTableOperation::RenameTable {
+                            new_name,
+                        },
+                    })
+                }
+                _ => None,
+            }
+        }
+        sqlparser::ast::Statement::AlterSchema(alter) => {
+            let idents: Vec<String> = alter.name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema_name) = match idents.as_slice() {
+                [n] => (None, n.clone()),
+                [d, n] => (Some(d.clone()), n.clone()),
+                _ => return None,
+            };
+
+            if alter.operations.is_empty() {
+                return None;
+            }
+
+            match &alter.operations[0] {
+                sqlparser::ast::AlterSchemaOperation::Rename { name: new_name } => {
+                    Some(MetadataStatement::AlterSchema {
+                        database,
+                        name: schema_name,
+                        new_name: new_name.to_string(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        sqlparser::ast::Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            cascade,
+            ..
+        } => {
+            let name = &names[0];
+            let idents: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
+            
+            match object_type {
+                sqlparser::ast::ObjectType::Table => {
+                    let (database, schema, obj_name) = match idents.as_slice() {
+                        [n] => (None, None, n.clone()),
+                        [s, n] => (None, Some(s.clone()), n.clone()),
+                        [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                        _ => return None,
+                    };
+                    Some(MetadataStatement::DropTable {
+                        database,
+                        schema,
+                        name: obj_name,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    })
+                }
+                sqlparser::ast::ObjectType::View => {
+                    let (database, schema, obj_name) = match idents.as_slice() {
+                        [n] => (None, None, n.clone()),
+                        [s, n] => (None, Some(s.clone()), n.clone()),
+                        [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                        _ => return None,
+                    };
+                    Some(MetadataStatement::DropView {
+                        database,
+                        schema,
+                        name: obj_name,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    })
+                }
+                sqlparser::ast::ObjectType::Database => {
+                    let (database, _schema, obj_name) = match idents.as_slice() {
+                        [n] => (None::<String>, None::<String>, n.clone()),
+                        [d, n] => (Some(d.clone()), None::<String>, n.clone()),
+                        _ => return None,
+                    };
+                    // For DROP DATABASE, the name is the identifier itself
+                    let db_name = database.unwrap_or(obj_name);
+                    Some(MetadataStatement::DropDatabase {
+                        name: db_name,
+                        if_exists: *if_exists,
+                    })
+                }
+                sqlparser::ast::ObjectType::Schema => {
+                    let (database, schema_name) = match idents.as_slice() {
+                        [n] => (None, n.clone()),
+                        [d, n] => (Some(d.clone()), n.clone()),
+                        _ => return None,
+                    };
+                    Some(MetadataStatement::DropSchema {
+                        database,
+                        name: schema_name,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => parse_metadata_statement_fallback(sql),
+    }
+}
+
+fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -1606,6 +2134,13 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
 
     if tokens.len() == 2
         && tokens[0].eq_ignore_ascii_case("SHOW")
+        && tokens[1].eq_ignore_ascii_case("NODES")
+    {
+        return Some(MetadataStatement::ShowNodes);
+    }
+
+    if tokens.len() == 2
+        && tokens[0].eq_ignore_ascii_case("SHOW")
         && tokens[1].eq_ignore_ascii_case("SCHEMAS")
     {
         return Some(MetadataStatement::ShowSchemas { database: None });
@@ -1639,7 +2174,6 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         let Ok((database, schema)) = parse_schema_scope(tokens[3]) else {
             return None;
         };
-
         return Some(MetadataStatement::ShowTables { database, schema });
     }
 
@@ -1661,7 +2195,6 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         let Ok((database, schema)) = parse_schema_scope(tokens[3]) else {
             return None;
         };
-
         return Some(MetadataStatement::ShowViews { database, schema });
     }
 
@@ -1673,7 +2206,6 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         let Ok((database, schema, name)) = parse_qualified_name(tokens[3], None, None) else {
             return None;
         };
-
         return Some(MetadataStatement::ShowColumns {
             database,
             schema,
@@ -1685,8 +2217,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         let Ok((database, schema, name)) = parse_qualified_name(tokens[1], None, None) else {
             return None;
         };
-
-        return Some(MetadataStatement::DescribeRelation {
+        return Some(MetadataStatement::ShowColumns {
             database,
             schema,
             name,
@@ -1696,13 +2227,12 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
     if upper.starts_with("ALTER USER ") {
         let remainder = trimmed["ALTER USER ".len()..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
-        let password_index = upper_remainder.find(" PASSWORD ")?;
-        let user_name = remainder[..password_index].trim();
-        if user_name.is_empty() {
-            return None;
-        }
-        let raw_password = remainder[password_index + " PASSWORD ".len()..].trim();
-        let Ok(password) = parse_sql_single_quoted_literal(raw_password) else {
+        let pass_idx = upper_remainder.find(" PASSWORD ")?;
+
+        let user_name = remainder[..pass_idx].trim();
+        let pass_val = remainder[pass_idx + " PASSWORD ".len()..].trim();
+
+        let Ok(password) = parse_sql_single_quoted_literal(pass_val) else {
             return None;
         };
 
@@ -1715,305 +2245,279 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{fs, path::PathBuf};
+fn parse_table_columns(
+    raw: &str,
+) -> Result<(Vec<TableColumnDefinition>, Vec<TableConstraintDefinition>)> {
+    let mut columns = Vec::new();
+    let mut constraints = Vec::new();
 
-    use analyticsdb_core::{Protocol, SessionContext};
-    use uuid::Uuid;
+    for element in split_sql_top_level(raw, ',')? {
+        if let Some(constraint) = parse_table_constraint_definition(&element)? {
+            constraints.push(constraint);
+            continue;
+        }
+        columns.push(parse_table_column_definition(&element)?);
+    }
 
-    use super::{
-        parse_metadata_statement, CatalogRelationKind, ControlPlane, MetadataStatement, NodeRole,
-        QueryAdmission, TableColumnDefinition, TableConstraintDefinition,
+    Ok((columns, constraints))
+}
+
+fn parse_table_column_definition(column: &str) -> Result<TableColumnDefinition> {
+    let tokens = column.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        bail!(
+            "Unsupported column definition '{}' in the current prototype",
+            column
+        );
+    }
+
+    let nullable = !(tokens.len() >= 4
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("NOT")
+        && tokens[tokens.len() - 1].eq_ignore_ascii_case("NULL"));
+
+    let data_type_end = if nullable {
+        tokens.len()
+    } else {
+        tokens.len() - 2
+    };
+    let data_type = tokens[1..data_type_end].join(" ");
+
+    if data_type.is_empty() {
+        bail!(
+            "Unsupported column definition '{}' in the current prototype",
+            column
+        );
+    }
+
+    Ok(TableColumnDefinition {
+        name: tokens[0].to_string(),
+        data_type,
+        nullable,
+        default_value: None,
+    })
+}
+
+fn parse_table_constraint_definition(raw: &str) -> Result<Option<TableConstraintDefinition>> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+
+    let (constraint_name, definition) = if upper.starts_with("CONSTRAINT ") {
+        let rest = trimmed["CONSTRAINT ".len()..].trim();
+        let (name, remainder) = rest.split_once(' ').ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported table constraint syntax '{}' in the current prototype",
+                raw
+            )
+        })?;
+        (Some(name.to_string()), remainder.trim())
+    } else {
+        (None, trimmed)
     };
 
-    fn default_session() -> SessionContext {
-        SessionContext {
-            protocol: Protocol::Embedded,
-            ..SessionContext::default()
+    let definition_upper = definition.to_ascii_uppercase();
+    if definition_upper.starts_with("PRIMARY KEY") {
+        let open = definition.find('(').ok_or_else(|| {
+            anyhow::anyhow!("PRIMARY KEY constraint requires column list in '{}'.", raw)
+        })?;
+        let close = definition.rfind(')').ok_or_else(|| {
+            anyhow::anyhow!("PRIMARY KEY constraint requires closing ')' in '{}'.", raw)
+        })?;
+        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
+        if columns.is_empty() {
+            bail!(
+                "PRIMARY KEY constraint requires at least one column in '{}'.",
+                raw
+            );
+        }
+        return Ok(Some(TableConstraintDefinition::PrimaryKey {
+            name: constraint_name,
+            columns,
+        }));
+    }
+
+    if definition_upper.starts_with("FOREIGN KEY") {
+        let open = definition.find('(').ok_or_else(|| {
+            anyhow::anyhow!("FOREIGN KEY constraint requires column list in '{}'.", raw)
+        })?;
+        let close = definition.rfind(')').ok_or_else(|| {
+            anyhow::anyhow!("FOREIGN KEY constraint requires closing ')' in '{}'.", raw)
+        })?;
+        let columns = split_sql_top_level(&definition[open + 1..close], ',')?;
+        if columns.is_empty() {
+            bail!(
+                "FOREIGN KEY constraint requires at least one column in '{}'.",
+                raw
+            );
+        }
+
+        let after_columns = definition[close + 1..].trim();
+        let upper_after = after_columns.to_ascii_uppercase();
+        if !upper_after.starts_with("REFERENCES ") {
+            bail!(
+                "FOREIGN KEY constraint requires REFERENCES clause in '{}'.",
+                raw
+            );
+        }
+
+        let ref_remainder = after_columns["REFERENCES ".len()..].trim();
+        let open_ref = ref_remainder.find('(').ok_or_else(|| {
+            anyhow::anyhow!(
+                "FOREIGN KEY REFERENCES requires column list in '{}'.",
+                raw
+            )
+        })?;
+        let close_ref = ref_remainder.rfind(')').ok_or_else(|| {
+            anyhow::anyhow!(
+                "FOREIGN KEY REFERENCES requires closing ')' in '{}'.",
+                raw
+            )
+        })?;
+
+        let raw_table = ref_remainder[..open_ref].trim();
+        let (referenced_database, referenced_schema, referenced_table) =
+            parse_qualified_name(raw_table, None, None)?;
+        let referenced_columns = split_sql_top_level(&ref_remainder[open_ref + 1..close_ref], ',')?;
+
+        return Ok(Some(TableConstraintDefinition::ForeignKey {
+            name: constraint_name,
+            columns,
+            referenced_database,
+            referenced_schema,
+            referenced_table,
+            referenced_columns,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn parse_insert_target(raw: &str) -> Result<(String, Option<Vec<String>>)> {
+    let trimmed = raw.trim();
+    if let Some(open) = trimmed.find('(') {
+        if !trimmed.ends_with(')') {
+            bail!(
+                "Unsupported INSERT target '{}' in the current prototype",
+                trimmed
+            );
+        }
+        let name = trimmed[..open].trim();
+        let columns = split_sql_top_level(&trimmed[open + 1..trimmed.len() - 1], ',')?
+            .iter()
+            .map(|column| column.trim().to_string())
+            .collect::<Vec<_>>();
+
+        if columns.is_empty() || columns.iter().any(|column| column.is_empty()) {
+            bail!(
+                "Unsupported INSERT target '{}' in the current prototype",
+                trimmed
+            );
+        }
+
+        return Ok((name.to_string(), Some(columns)));
+    }
+
+    Ok((trimmed.to_string(), None))
+}
+
+fn parse_insert_rows(raw: &str) -> Result<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    for row_fragment in split_sql_top_level(raw, ',')? {
+        let trimmed = row_fragment.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            bail!(
+                "Unsupported INSERT row fragment '{}' in the current prototype",
+                trimmed
+            );
+        }
+        let values = split_sql_top_level(&trimmed[1..trimmed.len() - 1], ',')?;
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
+fn parse_schema_scope(raw: &str) -> Result<(Option<String>, Option<String>)> {
+    let parts = raw.split('.').collect::<Vec<_>>();
+
+    match parts.as_slice() {
+        [schema] => Ok((None, Some((*schema).to_string()))),
+        [database, schema] => Ok((Some((*database).to_string()), Some((*schema).to_string()))),
+        _ => bail!("Unsupported schema scope '{}'", raw),
+    }
+}
+
+fn parse_sql_single_quoted_literal(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('\'') || !trimmed.ends_with('\'') || trimmed.len() < 2 {
+        bail!("Expected single-quoted SQL string literal, got '{}'.", raw);
+    }
+
+    let mut result = String::new();
+    let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if matches!(chars.peek(), Some('\'')) {
+                let _ = chars.next();
+                result.push('\'');
+            } else {
+                bail!("Unescaped quote in SQL string literal '{}'.", raw);
+            }
+        } else {
+            result.push(ch);
         }
     }
 
-    fn temp_catalog_path(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("analyticsdb-{name}-{}.json", Uuid::now_v7()));
-        path
+    Ok(result)
+}
+
+fn split_sql_top_level(input: &str, delimiter: char) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_single_quote = false;
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((index, character)) = chars.next() {
+        if character == '\'' {
+            if in_single_quote {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    let _ = chars.next();
+                } else {
+                    in_single_quote = false;
+                }
+            } else {
+                in_single_quote = true;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            continue;
+        }
+
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    bail!("Unbalanced ')' in SQL fragment '{}'", input);
+                }
+                depth -= 1;
+            }
+            _ if character == delimiter && depth == 0 => {
+                parts.push(input[start..index].trim().to_string());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
     }
 
-    #[tokio::test]
-    async fn admits_bootstrap_session_and_generates_query_id() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let admission = control_plane
-            .admit_query(&default_session())
-            .await
-            .expect("bootstrap session should be admitted");
-
-        assert!(matches!(
-            admission,
-            QueryAdmission {
-                coordinator_node_id,
-                ..
-            } if coordinator_node_id == "control-1"
-        ));
-        assert!(admission.query_id.starts_with("q-"));
+    if in_single_quote || depth != 0 {
+        bail!("Unbalanced SQL fragment '{}'", input);
     }
 
-    #[tokio::test]
-    async fn rejects_unknown_database() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut session = default_session();
-        session.database = "missing".to_string();
-
-        let error = control_plane
-            .validate_session(&session)
-            .await
-            .expect_err("unknown database should fail");
-
-        assert!(error.to_string().contains("Unknown database"));
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
     }
 
-    #[tokio::test]
-    async fn rejects_unknown_role_in_session_validation() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut session = default_session();
-        session.role = "missing_role".to_string();
-
-        let error = control_plane
-            .validate_session(&session)
-            .await
-            .expect_err("unknown role should fail validation");
-
-        assert!(error.to_string().contains("Unknown role"));
-    }
-
-    #[tokio::test]
-    async fn rejects_non_admin_role_assumption() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut session = default_session();
-        session.user = "analytics_reader".to_string();
-        session.role = "postgres".to_string();
-
-        let error = control_plane
-            .validate_session(&session)
-            .await
-            .expect_err("non-admin user should not assume postgres role");
-
-        assert!(error.to_string().contains("is not allowed to assume role"));
-    }
-
-    #[tokio::test]
-    async fn allows_admin_role_assumption() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut session = default_session();
-        session.user = "analyticsdb_admin".to_string();
-        session.role = "postgres".to_string();
-
-        control_plane
-            .validate_session(&session)
-            .await
-            .expect("admin role assumption should be allowed");
-    }
-
-    #[tokio::test]
-    async fn validates_credentials_with_unknown_user() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let error = control_plane
-            .validate_credentials("missing", Some("secret"))
-            .await
-            .expect_err("unknown user must fail credentials validation");
-
-        assert!(error.to_string().contains("Unknown user"));
-    }
-
-    #[tokio::test]
-    async fn validates_credentials_with_expected_bootstrap_password() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let user = control_plane
-            .validate_credentials("postgres", Some("postgres"))
-            .await
-            .expect("postgres bootstrap password should be accepted");
-
-        assert_eq!(user.name, "postgres");
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_bootstrap_password() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let error = control_plane
-            .validate_credentials("postgres", Some("wrong-password"))
-            .await
-            .expect_err("wrong password should be rejected");
-
-        assert!(error.to_string().contains("Invalid credentials"));
-    }
-
-    #[tokio::test]
-    async fn rejects_missing_password_for_passworded_bootstrap_user() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let error = control_plane
-            .validate_credentials("postgres", None)
-            .await
-            .expect_err("missing password should be rejected");
-
-        assert!(error.to_string().contains("Missing credentials"));
-    }
-
-    #[tokio::test]
-    async fn rotates_password_and_invalidates_previous_credentials() {
-        let path = temp_catalog_path("password-rotation");
-        let control_plane = ControlPlane::from_catalog_path(&path)
-            .await
-            .expect("catalog should load");
-
-        let before = control_plane
-            .catalog_user("analytics_reader")
-            .await
-            .expect("reader user should exist before rotation");
-        assert_eq!(before.password_version, 1);
-
-        let message = control_plane
-            .rotate_user_password(&default_session(), "analytics_reader", "reader-next")
-            .await
-            .expect("password rotation should succeed");
-        assert!(message.contains("Credentials rotated"));
-
-        let stale = control_plane
-            .validate_credentials("analytics_reader", Some("analytics_reader"))
-            .await
-            .expect_err("old password should be rejected after rotation");
-        assert!(stale.to_string().contains("Invalid credentials"));
-
-        let updated = control_plane
-            .validate_credentials("analytics_reader", Some("reader-next"))
-            .await
-            .expect("new password should be accepted");
-        assert_eq!(updated.password_version, 2);
-        assert!(updated.password_rotated_at_epoch_ms.is_some());
-    }
-
-    #[tokio::test]
-    async fn rejects_password_rotation_for_non_admin_user() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut session = default_session();
-        session.user = "analytics_reader".to_string();
-        session.role = "analytics_reader".to_string();
-
-        let error = control_plane
-            .rotate_user_password(&session, "postgres", "next")
-            .await
-            .expect_err("non-admin should not rotate passwords");
-        assert!(error
-            .to_string()
-            .contains("not allowed to rotate credentials"));
-    }
-
-    #[tokio::test]
-    async fn metadata_statement_alter_user_password_rotates_credentials() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let message = control_plane
-            .execute_metadata_statement(
-                &default_session(),
-                &MetadataStatement::AlterUserPassword {
-                    name: "analytics_reader".to_string(),
-                    password: "reader-sql-rotated".to_string(),
-                },
-            )
-            .await
-            .expect("admin ALTER USER PASSWORD should succeed");
-        assert!(message.contains("Credentials rotated"));
-
-        let stale = control_plane
-            .validate_credentials("analytics_reader", Some("analytics_reader"))
-            .await
-            .expect_err("old password should be invalidated");
-        assert!(stale.to_string().contains("Invalid credentials"));
-
-        control_plane
-            .validate_credentials("analytics_reader", Some("reader-sql-rotated"))
-            .await
-            .expect("new rotated password should be accepted");
-    }
-
-    #[tokio::test]
-    async fn metadata_statement_alter_user_password_rejects_non_admin_actor() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let mut reader_session = default_session();
-        reader_session.user = "analytics_reader".to_string();
-        reader_session.role = "analytics_reader".to_string();
-
-        let error = control_plane
-            .execute_metadata_statement(
-                &reader_session,
-                &MetadataStatement::AlterUserPassword {
-                    name: "postgres".to_string(),
-                    password: "pwned".to_string(),
-                },
-            )
-            .await
-            .expect_err("non-admin ALTER USER PASSWORD should fail");
-        assert!(error
-            .to_string()
-            .contains("not allowed to rotate credentials"));
-    }
-
-    #[tokio::test]
-    async fn exposes_bootstrap_cluster_snapshot() {
-        let control_plane = ControlPlane::new_bootstrap();
-        let snapshot = control_plane.cluster_snapshot().await;
-
-        assert_eq!(snapshot.coordinator_node_id, "control-1");
-        assert!(snapshot
-            .nodes
-            .iter()
-            .any(|node| node.role == NodeRole::Control && node.id == "control-1"));
-        assert!(snapshot
-            .databases
-            .iter()
-            .any(|database| database.name == "postgres"));
-        assert!(snapshot.relations.is_empty());
-    }
-
-    #[tokio::test]
-    async fn persists_created_database_and_schema() {
-        let path = temp_catalog_path("catalog");
-        let control_plane = ControlPlane::from_catalog_path(&path)
-            .await
-            .expect("catalog should load");
-
-        control_plane
-            .execute_metadata_statement(
-                &default_session(),
-                &MetadataStatement::CreateDatabase {
-                    name: "analytics".to_string(),
-                },
-            )
-            .await
-            .expect("database creation should succeed");
-
-        control_plane
-            .execute_metadata_statement(
-                &default_session(),
-                &MetadataStatement::CreateSchema {
-                    database: Some("analytics".to_string()),
-                    name: "reporting".to_string(),
-                },
-            )
-            .await
-            .expect("schema creation should succeed");
-
-        let reloaded = ControlPlane::from_catalog_path(&path)
-            .await
-            .expect("catalog should reload");
-        let databases = reloaded
-            .list_databases(&default_session())
-            .await
-            .expect("databases should list");
-        let schemas = reloaded
-            .list_schemas(&default_session(), Some("analytics"))
-            .await
-            .expect("schemas should list");
-
-        assert!(databases.iter().any(|database| database == "analytics"));
-        assert!(schemas.iter().any(|schema| schema == "reporting"));
-    }
+    Ok(parts)
 }

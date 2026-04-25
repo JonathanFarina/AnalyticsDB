@@ -98,6 +98,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::Streaming;
+use tracing::{debug, info, trace, warn};
 
 const FLIGHT_USER_HEADER: &str = "x-analyticsdb-user";
 const FLIGHT_ROLE_HEADER: &str = "x-analyticsdb-role";
@@ -248,11 +249,11 @@ pub async fn serve_postgres_wire(
 
     loop {
         let (socket, addr) = listener.accept().await?;
-        eprintln!("[TRACE] postgres: accepting connection from {:?}", addr);
+        trace!("postgres: accepting connection from {:?}", addr);
         let factory_ref = Arc::clone(&factory);
         tokio::spawn(async move {
             let _ = process_socket(socket, None, factory_ref).await;
-            eprintln!("[TRACE] postgres: connection closed for {:?}", addr);
+            trace!("postgres: connection closed for {:?}", addr);
         });
     }
 }
@@ -260,6 +261,7 @@ pub async fn serve_postgres_wire(
 pub async fn serve_flight_sql(
     listener: TcpListener,
     engine: Arc<PrototypeEngine>,
+    tls_config: Option<(Vec<u8>, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
     let service = AnalyticsFlightSqlService {
@@ -267,8 +269,20 @@ pub async fn serve_flight_sql(
         auth_hook: Arc::new(PrototypeAllowAllAuthHook { control_plane }),
     };
 
-    Server::builder()
-        .add_service(FlightServiceServer::new(service))
+    let mut builder = Server::builder();
+
+    let router = if let Some((cert, key)) = tls_config {
+        info!("Flight SQL: Starting with TLS enabled");
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        builder
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
+            .add_service(FlightServiceServer::new(service))
+    } else {
+        warn!("Flight SQL: Starting in PLAINTEXT mode (insecure)");
+        builder.add_service(FlightServiceServer::new(service))
+    };
+
+    router
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
 
@@ -488,7 +502,7 @@ impl SimpleQueryHandler for AnalyticsPostgresHandler {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        eprintln!("[SQL] postgres_simple_query: {}", query);
+        debug!("postgres_simple_query: {}", query);
         if let Some(response) =
             apply_postgres_session_statement(client, parse_postgres_set_statement(query)?)?
         {
@@ -528,7 +542,7 @@ impl QueryParser for AnalyticsQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        eprintln!("[SQL] postgres_parse: {}", sql);
+        debug!("postgres_parse: {}", sql);
         let parameter_count = referenced_parameter_count(sql);
         let parameter_types = resolved_parameter_types(parameter_count, types);
         let result_schema = if let Some(schema) =
@@ -893,6 +907,7 @@ fn parse_postgres_show_statement(sql: &str) -> PgWireResult<PostgresShowStatemen
 
     let raw_upper = raw_name.to_ascii_uppercase();
     if raw_upper == "DATABASES"
+        || raw_upper == "NODES"
         || raw_upper == "SCHEMAS"
         || raw_upper.starts_with("SCHEMAS FROM ")
         || raw_upper == "TABLES"
@@ -1618,6 +1633,7 @@ fn sql_returns_rows(sql: &str) -> bool {
     upper.starts_with("SELECT")
         || upper.starts_with("SHOW")
         || upper.starts_with("DESCRIBE")
+        || upper.starts_with("EXPLAIN")
         || upper.starts_with("WITH")
 }
 
@@ -1688,6 +1704,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         Status,
     > {
         let metadata = request.metadata().clone();
+        trace!("flight-sql: handshake request from {:?}", request.remote_addr());
         let mut stream = request.into_inner();
         let handshake_request =
             stream
@@ -1769,7 +1786,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        eprintln!("[SQL] flight_sql_query: {}", query.query);
+        debug!("flight_sql_query: {}", query.query);
         let session = flight_session_from_metadata(request.metadata());
         let execution = self
             .execute_batches(QueryRequest {
@@ -1834,6 +1851,22 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .execute_batches(QueryRequest {
                 sql: command.query,
                 session,
+            })
+            .await?;
+
+        Ok(rows_affected_from_message(&execution.message) as i64)
+    }
+
+    async fn do_put_prepared_statement_update(
+        &self,
+        query: arrow_flight::sql::CommandPreparedStatementUpdate,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        let payload = decode_statement_ticket(query.prepared_statement_handle)?;
+        let execution = self
+            .execute_batches(QueryRequest {
+                sql: payload.sql,
+                session: payload.session,
             })
             .await?;
 
@@ -2099,14 +2132,81 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 
+    async fn do_action_create_prepared_statement(
+        &self,
+        query: arrow_flight::sql::ActionCreatePreparedStatementRequest,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<arrow_flight::sql::ActionCreatePreparedStatementResult, Status> {
+        let session = flight_session_from_metadata(request.metadata());
+        debug!("flight_sql_create_prepared_statement: {}", query.query);
+
+        let dataset_schema = match self
+            .engine
+            .plan_query_schema(&QueryRequest {
+                sql: query.query.clone(),
+                session: session.clone(),
+            })
+            .await
+        {
+            Ok(Some(schema)) => {
+                use datafusion::arrow::ipc::writer::StreamWriter;
+                let mut buffer = Vec::new();
+                let mut writer = StreamWriter::try_new(&mut buffer, &schema).map_err(status_from_error)?;
+                writer.finish().map_err(status_from_error)?;
+                bytes::Bytes::from(buffer)
+            }
+            _ => bytes::Bytes::new(),
+        };
+
+        // For this prototype, we treat "prepared statements" as just the SQL string 
+        // and session context wrapped in a handle.
+        let payload = StatementTicketPayload {
+            sql: query.query,
+            session,
+        };
+        let handle = serde_json::to_vec(&payload).map_err(status_from_error)?;
+
+        Ok(arrow_flight::sql::ActionCreatePreparedStatementResult {
+            prepared_statement_handle: handle.into(),
+            dataset_schema,
+            parameter_schema: bytes::Bytes::new(),
+        })
+    }
+
+    async fn do_action_close_prepared_statement(
+        &self,
+        _query: arrow_flight::sql::ActionClosePreparedStatementRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        // No-op for prototype as we are stateless
+        Ok(())
+    }
+
     async fn get_flight_info_prepared_statement(
         &self,
-        _query: CommandPreparedStatementQuery,
-        _request: Request<FlightDescriptor>,
+        query: CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented(
-            "prepared statements are in scaffold status - full implementation coming",
-        ))
+        let payload = decode_statement_ticket(query.prepared_statement_handle)?;
+        debug!("flight_sql_prepared_statement: {}", payload.sql);
+        let execution = self
+            .execute_batches(QueryRequest {
+                sql: payload.sql.clone(),
+                session: payload.session.clone(),
+            })
+            .await?;
+
+        let descriptor = request.into_inner();
+        let ticket = statement_ticket(payload.sql, payload.session)?;
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(descriptor)
+            .try_with_schema(execution.schema.as_ref())
+            .map_err(status_from_error)?;
+
+        Ok(Response::new(info))
     }
 }
 
@@ -2242,10 +2342,12 @@ fn status_from_error(error: impl std::fmt::Display) -> Status {
 
 fn flight_sql_info_data() -> Result<SqlInfoData, Status> {
     let mut builder = SqlInfoDataBuilder::new();
-    // Keep SqlInfo intentionally narrow for the current prototype slice.
+    // Expand SqlInfo coverage to satisfy generic Flight SQL clients (DBeaver, JDBC, etc.)
     builder.append(SqlInfo::FlightSqlServerName, "AnalyticsDB Prototype");
     builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0-prototype");
-    builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
+    builder.append(SqlInfo::FlightSqlServerArrowVersion, "15.0.0");
+    builder.append(SqlInfo::FlightSqlServerReadOnly, false);
+    builder.append(SqlInfo::SqlIdentifierQuoteChar, "\"");
 
     builder.build().map_err(status_from_error)
 }
