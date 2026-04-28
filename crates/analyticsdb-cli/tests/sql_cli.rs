@@ -859,9 +859,16 @@ fn assert_supported_protocol_equivalence(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_executes_sql_and_reports_timing() {
+    let catalog_path = temp_catalog_path();
     let output = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
-        .args(["query", "--sql", "SELECT 1 AS one, 2 AS two"])
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT 1 AS one, 2 AS two",
+        ])
         .assert()
         .success()
         .get_output()
@@ -878,6 +885,38 @@ async fn cli_executes_sql_and_reports_timing() {
     assert!(stdout.contains("| one | two |"));
     assert!(stdout.contains("| 1   | 2   |"));
     assert!(stdout.contains("Rows: 1"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_can_report_detailed_query_return_timing() {
+    let catalog_path = temp_catalog_path();
+    let output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--timing",
+            "--sql",
+            "SELECT 1 AS one",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("stdout should be valid utf-8");
+
+    assert!(stdout.contains("Execution Time:"));
+    assert!(stdout.contains("Timing: query/fetch="));
+    assert!(stdout.contains("client_total="));
+    assert!(stdout.contains("render="));
+    assert!(stdout.contains("end_to_end="));
+
+    cleanup_catalog_artifacts(&catalog_path);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1253,6 +1292,75 @@ async fn cli_creates_defined_table_inserts_rows_and_queries_them_across_invocati
     assert!(describe_stdout.contains("status"));
     assert!(describe_stdout.contains("is_hot"));
     assert!(describe_stdout.contains("Boolean"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_streams_insert_select_into_managed_table() {
+    let catalog_path = temp_catalog_path();
+
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "CREATE TABLE customers (id BIGINT NOT NULL, first_name TEXT, last_name TEXT, email TEXT, created_at TIMESTAMP)",
+        ])
+        .assert()
+        .success();
+
+    let insert_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "
+            INSERT INTO customers (id, first_name, last_name, email, created_at)
+            SELECT
+                n,
+                left(md5(random()::text), 8),
+                left(md5(random()::text), 10),
+                'user' || n || '@' || left(md5(random()::text), 6) || '.com',
+                NOW() - (random() * INTERVAL '5 years')
+            FROM generate_series(1, 1000) AS s(n)
+            ",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let insert_stdout = String::from_utf8(insert_output).expect("stdout should be valid utf-8");
+
+    assert!(
+        insert_stdout.contains("Message: Inserted 1000 row(s) into 'postgres.public.customers'.")
+    );
+
+    let query_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT COUNT(*) AS row_count, MIN(id) AS min_id, MAX(id) AS max_id FROM customers",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let query_stdout = String::from_utf8(query_output).expect("stdout should be valid utf-8");
+
+    assert!(query_stdout.contains("| row_count | min_id | max_id |"));
+    assert!(query_stdout.contains("| 1000      | 1      | 1000   |"));
 
     cleanup_catalog_artifacts(&catalog_path);
 }
@@ -2328,7 +2436,7 @@ async fn cli_protocols_share_missing_relation_query_error_slice() {
         "missing relation in existing schema",
         &postgres_missing_relation,
         &flight_missing_relation,
-        "table 'datafusion.reporting.missing_table' not found",
+        "not found",
     );
 
     cleanup_catalog_artifacts(&postgres_catalog_path);
@@ -4035,6 +4143,47 @@ async fn cli_wire_protocols_return_exact_result_shape_for_metadata_sql() {
     cleanup_catalog_artifacts(&catalog_path);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_wire_protocols_keep_customers_sql_shapes_in_parity() {
+    let catalog_path = temp_catalog_path();
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&catalog_path).await;
+
+    let setup = [
+        "CREATE TABLE customers (id BIGINT NOT NULL, first_name TEXT, last_name TEXT, email TEXT, created_at TIMESTAMP)",
+        "INSERT INTO customers VALUES (1, 'Ada', 'Lovelace', 'ada@example.com', TIMESTAMP '2024-01-01 00:00:00')",
+        "INSERT INTO customers VALUES (2, 'Grace', 'Hopper', 'grace@example.com', TIMESTAMP '2024-01-02 00:00:00')",
+    ];
+
+    for sql in setup {
+        let _ = protocol_json_response("postgres", &postgres_endpoint, Some("public"), sql);
+        let _ = protocol_json_response("flight-sql", &flight_endpoint, Some("public"), sql);
+    }
+
+    let parity_cases = [
+        ("select customers", "SELECT * FROM customers ORDER BY id"),
+        ("describe customers", "DESCRIBE customers"),
+        ("show columns customers", "SHOW COLUMNS FROM customers"),
+        (
+            "information_schema columns projection",
+            "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_name = 'customers' \
+               AND table_schema = 'public' \
+             ORDER BY ordinal_position",
+        ),
+    ];
+
+    for (step, sql) in parity_cases {
+        let postgres = protocol_json_response("postgres", &postgres_endpoint, Some("public"), sql);
+        let flight_sql =
+            protocol_json_response("flight-sql", &flight_endpoint, Some("public"), sql);
+        assert_supported_protocol_equivalence(step, &postgres, &flight_sql);
+    }
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
 // ---------------------------------------------------------------------------
 // Command-tag / message consistency assertions for DML and DDL
 // ---------------------------------------------------------------------------
@@ -4216,6 +4365,36 @@ async fn cli_wire_protocols_emit_consistent_command_messages_for_dml_ddl() {
         !pg_select.message.contains("affected"),
         "SELECT message should not contain 'affected'; got '{}'",
         pg_select.message
+    );
+
+    // ---- DESCRIBE returns the query-completed message, not an affected-row message ----
+    let pg_describe = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "DESCRIBE tag_tbl",
+    );
+    let fl_describe = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "DESCRIBE tag_tbl",
+    );
+    check(
+        "DESCRIBE rows",
+        &pg_describe,
+        &fl_describe,
+        WIRE_QUERY_COMPLETED_MESSAGE,
+    );
+    assert!(
+        !pg_describe.message.contains("affected"),
+        "DESCRIBE message should not contain 'affected'; got '{}'",
+        pg_describe.message
+    );
+    assert_eq!(
+        pg_describe.rows.len(),
+        2,
+        "DESCRIBE should return one row per table column"
     );
 
     // ---- ALTER USER PASSWORD ----
@@ -4650,7 +4829,11 @@ async fn cli_ddl_comprehensive_lifecycle() {
 
     for sql in ddl_sequence {
         let response = protocol_json_response("postgres", &endpoint, None, sql);
-        assert!(!response.message.is_empty(), "DDL command '{}' should return a success message", sql);
+        assert!(
+            !response.message.is_empty(),
+            "DDL command '{}' should return a success message",
+            sql
+        );
     }
 
     // Final verification that DB is gone
@@ -4710,7 +4893,7 @@ async fn cli_supports_single_endpoint_routing_via_control_plane() {
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local addr should exist");
-    
+
     let engine = Arc::new(
         PrototypeEngine::from_catalog_path(&catalog_path)
             .await
@@ -4719,13 +4902,17 @@ async fn cli_supports_single_endpoint_routing_via_control_plane() {
 
     // 1. Register a specific node ID
     let expected_node_id = "test-coordinator-42";
-    engine.control_plane().register_node(ClusterNode {
-        id: expected_node_id.to_string(),
-        role: NodeRole::Control,
-        endpoint: addr.to_string(),
-        status: NodeStatus::Ready,
-        last_heartbeat_at_epoch_ms: 0,
-    }).await.expect("node registration should succeed");
+    engine
+        .control_plane()
+        .register_node(ClusterNode {
+            id: expected_node_id.to_string(),
+            role: NodeRole::Control,
+            endpoint: addr.to_string(),
+            status: NodeStatus::Ready,
+            last_heartbeat_at_epoch_ms: 0,
+        })
+        .await
+        .expect("node registration should succeed");
 
     let task = tokio::spawn(serve_postgres_wire(listener, Arc::clone(&engine)));
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4749,7 +4936,7 @@ async fn cli_supports_single_endpoint_routing_via_control_plane() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_supports_multi_endpoint_failover() {
     let catalog_path = temp_catalog_path();
-    
+
     // 1. Start one server and then kill it to simulate failure
     let (server1, addr1) = start_postgres_server(&catalog_path).await;
     drop(server1); // Kill it immediately

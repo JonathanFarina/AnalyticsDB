@@ -74,8 +74,8 @@ A feature is `Complete` only when all of the following are true:
 | Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
 | Encryption at rest | Prototype | key management design and hooks | end-to-end encrypted storage path with rotation story |
-| CLI | Partial | command shell scaffold | protocol selection, history, line editing, and timing UX complete |
-| CLI speed measurement | Partial | timing output scaffold | accurate and documented timing behavior |
+| CLI | Partial | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, and initial meta commands (`\q`, `\?`, `\conninfo`) | broader psql-style meta-command coverage and polished timing UX complete |
+| CLI speed measurement | Partial | timing output scaffold with detailed query/fetch, client total, render, and end-to-end timings behind `--timing` / `\timing` | accurate and documented timing behavior |
 | Web console query editor | Prototype | page scaffold | query execution, messages, results, and timing complete |
 | Web console explorer | Prototype | metadata browsing scaffold | stable navigation across databases, schemas, tables, and views |
 | Web console admin: databases | Prototype | UI scaffold | create/manage flows with authz and audit coverage |
@@ -98,6 +98,7 @@ A feature is `Complete` only when all of the following are true:
 - Prototype protocol crate now includes tested PostgreSQL wire prototype session-setting compatibility for common `SET` / `RESET` / `SHOW` forms, including preserved `search_path` routing semantics, JDBC/libpq-style `extra_float_digits`, `SHOW ALL`, prototype `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`, and stored generic client parameters in both simple and extended query paths
 - Prototype protocol crate now includes tested PostgreSQL startup `ParameterStatus` coverage for common client-expected keys (`server_version`, `client_encoding`, `DateStyle`, `TimeZone`, `standard_conforming_strings`, `search_path`, `application_name`, and `default_transaction_isolation`)
 - Prototype engine now includes real DataFusion UDF implementations for PostgreSQL introspection functions (`version()`, `current_database()`, `current_schema()`, `current_user()`, `session_user()`, `current_setting('<name>')`), replacing the previous protocol-level shims
+- Prototype engine now includes a PostgreSQL-compatibility rewrite plus UDF support for numeric interval scaling such as `random() * INTERVAL '5 years'`
 - Prototype engine now handles transaction statements (`BEGIN`, `COMMIT`, `ROLLBACK`) as successful no-ops to support standard PostgreSQL client lifecycles
 - Prototype engine now provides an integrated `pg_catalog` schema through custom DataFusion `TableProvider`s, enabling complex metadata queries, joins, and filters for `pg_tables`, `pg_views`, `pg_namespace`, `pg_database`, and `pg_roles`
 - Prototype protocol crate now includes tested PostgreSQL extended-query literal rendering that preserves parameter markers inside SQL string literals while still binding typed placeholders
@@ -105,6 +106,7 @@ A feature is `Complete` only when all of the following are true:
 - Prototype protocol crate can expose a tested Flight SQL statement query/update path plus basic metadata listing
 - Prototype protocol crate now includes a shared prototype auth hook path used by PostgreSQL startup and Flight SQL handshake, with control-plane user lookup and role/auth-method metadata propagation into session context
 - Prototype server now supports **TLS/SSL encryption** for Flight SQL and **Prepared Statements** with schema planning, enabling standard JDBC/ODBC connectivity
+- Flight SQL statement and prepared-statement query tickets now carry the planned row schema from `GetFlightInfo`/prepare, and `DoGet` streams row batches from the shared engine row-stream path instead of re-planning and materializing the full result before encoding
 - CLI-driven tests now prove a narrow PostgreSQL/Flight SQL protocol-equivalent slice for non-parameterized SQL execution, requested schema routing, schema-scoped managed table/view workflows, cross-database metadata/DDL flows (`CREATE DATABASE`, `CREATE SCHEMA <database>.<schema>`, `SHOW DATABASES`, `SHOW SCHEMAS FROM <database>`, schema-qualified table create/insert/list), SQL metadata statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors through live listeners
 - CLI-driven tests now include a table-driven parity matrix over the current supported SQL surface that compares live PostgreSQL and Flight SQL user-visible success/error contracts
 - CLI-driven tests now include a capability-level drift guard that checks README-supported SQL subset statements against matrix-covered protocol parity capabilities
@@ -113,6 +115,7 @@ A feature is `Complete` only when all of the following are true:
 - CLI-driven tests now include password rotation behavior that invalidates old credentials and accepts rotated credentials across live PostgreSQL and Flight SQL listeners
 - CLI-driven tests now include strict `ALTER USER ... PASSWORD ...` error-contract parity checks for unknown users, empty passwords, malformed literals, and non-admin authorization failures across PostgreSQL and Flight SQL listeners
 - CLI-driven tests now include result-shape assertions (exact column names) for all metadata SQL statements (`SHOW DATABASES`, `SHOW SCHEMAS`, `SHOW TABLES`, `SHOW VIEWS`, `SHOW COLUMNS FROM`, `DESCRIBE`, `SELECT` scalar) through both PostgreSQL and Flight SQL wire protocols
+- CLI-driven tests now include a customer-table parity regression that compares PostgreSQL and Flight SQL behavior for `SELECT`, `DESCRIBE`, `SHOW COLUMNS`, and projected `information_schema.columns` queries using the shared statement outcome contract
 - CLI-driven tests now include command-tag / message consistency assertions confirming that DDL (`CREATE DATABASE`, `CREATE SCHEMA`, `CREATE TABLE`, `CREATE VIEW`, `ALTER USER PASSWORD`) produces "Command completed. 0 row(s) affected." and DML INSERT produces "Command completed. N row(s) affected." identically across both wire protocols
 - CLI-driven tests now include session-parameter reflection assertions verifying that database, schema, user, role, and auth_method in the response session context match the startup parameters sent through both PostgreSQL wire startup and Flight SQL header handshake
 - CLI-driven tests now include an initial pg_catalog compatibility slice validating `pg_catalog.pg_tables`, `pg_catalog.pg_views`, `pg_catalog.pg_namespace`, `pg_catalog.pg_database`, and `pg_catalog.pg_roles` through both live protocol listeners, including tested projection/filter/order forms with equality + `IN` filters and mixed-direction multi-column `ORDER BY ASC|DESC` for the current constrained prototype subset
@@ -121,9 +124,14 @@ A feature is `Complete` only when all of the following are true:
 - Protocol-crate integration tests now include Flight SQL metadata API coverage (`get_db_schemas`, `get_tables`) that validates schema/table/view discovery for the current pg_catalog compatibility setup
 - Prototype server binary can run PostgreSQL wire and Flight SQL listeners against the current engine
 - Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection, prototype `ALTER USER ... PASSWORD ...` rotation, and **SHOW NODES** node discovery
-- Control plane now supports **node registration and discovery**, with basic routing logic used to assign coordinators to admitted queries
+- Control plane supports **distributed coordination** with **leader election (coordinator)** and **heartbeat-based health tracking**
+- Cluster supports **dynamic scaling** with **automatic port assignment** for new nodes joining the coordinator
+- Managed cluster configuration holds common settings for ports, catalog paths, and security policies
+- CLI supports **automatic failover** and transparent reconnection across multiple cluster endpoints
 - Managed tables can be materialized from `CREATE TABLE ... AS SELECT ...` and queried from a later CLI process
 - Managed tables can also be defined with explicit column schemas and populated with `INSERT INTO ... VALUES ...` across later CLI processes
+- Managed tables now support a prototype `INSERT INTO ... SELECT ...` append path that writes through DataFusion's Parquet sink into local Parquet snapshots, with CLI-driven coverage for a bounded generated-series insert
+- Prototype engine caches DataFusion session contexts per logical session and invalidates the cache after catalog/table-mutating command outcomes; managed and external Parquet relation registration now uses direct DataFusion Parquet table registration with catalog schema metadata when available
 - Managed table inserts support column-list insertion for the current tested embedded prototype subset
 - Managed tables now support **UPDATE**, **DELETE**, **TRUNCATE**, **DROP**, and **RENAME** operations through SQL
 - Managed tables now support **ALTER TABLE ADD COLUMN** for schema evolution, including physical snapshot updates to maintain Parquet readability
@@ -134,6 +142,7 @@ A feature is `Complete` only when all of the following are true:
 - Managed tables can be described later through `SHOW COLUMNS FROM` and `DESCRIBE`
 - Persisted views can be queried from a later CLI process through the shared catalog
 - CLI can drive SQL in embedded mode and against the prototype PostgreSQL wire and Flight SQL listeners
+- CLI Flight SQL result handling consumes `DoGet` batches as a stream before rendering, avoiding an intermediate full `Vec<RecordBatch>` collection in the client path
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
 - Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths

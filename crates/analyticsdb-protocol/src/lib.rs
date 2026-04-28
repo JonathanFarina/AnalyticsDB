@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use analyticsdb_control::{CatalogRelationKind, ControlPlane};
-use analyticsdb_core::{Protocol, QueryRequest, SessionContext};
+use analyticsdb_core::{Protocol, QueryRequest, SessionContext, StatementOutcome};
 use analyticsdb_engine::{PrototypeEngine, QueryExecutionResult};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
@@ -25,9 +25,11 @@ use arrow_flight::sql::CommandStatementUpdate;
 use arrow_flight::sql::ProstMessageExt;
 use arrow_flight::sql::SqlInfo;
 use arrow_flight::sql::TicketStatementQuery;
+use arrow_flight::Action;
 use arrow_flight::FlightDescriptor;
 use arrow_flight::FlightEndpoint;
 use arrow_flight::FlightInfo;
+use arrow_flight::Result as FlightResult;
 use arrow_flight::Ticket;
 use async_trait::async_trait;
 use base64::Engine;
@@ -545,20 +547,28 @@ impl QueryParser for AnalyticsQueryParser {
         debug!("postgres_parse: {}", sql);
         let parameter_count = referenced_parameter_count(sql);
         let parameter_types = resolved_parameter_types(parameter_count, types);
-        let result_schema = if let Some(schema) =
+        let set_statement = parse_postgres_set_statement(sql)?;
+        let result_schema = if !matches!(set_statement, PostgresSetStatement::NotASetStatement) {
+            Vec::new()
+        } else if let Some(schema) =
             postgres_show_result_schema(parse_postgres_show_statement(sql)?)
         {
             schema
-        } else if sql_returns_rows(sql) {
+        } else {
             let described_sql = render_sql_with_default_parameters(sql, &parameter_types)?;
             let request = QueryRequest {
                 sql: described_sql,
                 session: postgres_session_from_client(client),
             };
-            let execution = execute_postgres_sql(Arc::clone(&self.engine), request).await?;
-            postgres_row_schema_from_arrow(&execution.schema, None)
-        } else {
-            Vec::new()
+            match self
+                .engine
+                .plan_query_schema(&request)
+                .await
+                .map_err(anyhow_error_to_pgwire)?
+            {
+                Some(schema) => postgres_row_schema_from_arrow(&schema, None),
+                None => Vec::new(),
+            }
         };
 
         Ok(AnalyticsPreparedStatement {
@@ -715,6 +725,7 @@ fn postgres_session_from_client<C: ClientInfo>(client: &C) -> SessionContext {
             .cloned()
             .unwrap_or_else(|| "postgres-wire-startup".to_string()),
         protocol: Protocol::PostgreSql,
+        transaction_status: analyticsdb_core::TransactionStatus::Idle,
     }
 }
 
@@ -1271,18 +1282,30 @@ async fn execute_postgres_sql(
 
 fn query_execution_to_pg_response(
     execution: QueryExecutionResult,
-    sql: &str,
+    _sql: &str,
     row_schema: Option<Arc<Vec<FieldInfo>>>,
 ) -> PgWireResult<PgResponse> {
-    if !sql_returns_rows(sql) || execution.schema.fields().is_empty() {
-        let rows = rows_affected_from_message(&execution.message);
+    if let StatementOutcome::Command { tag, rows_affected } = &execution.outcome {
         return Ok(PgResponse::Execution(
-            Tag::new(command_tag_for_sql(sql)).with_rows(rows),
+            Tag::new(tag).with_rows((*rows_affected).try_into().unwrap_or(usize::MAX)),
         ));
-    }
+    };
 
-    let row_schema = row_schema
-        .unwrap_or_else(|| Arc::new(postgres_row_schema_from_arrow(&execution.schema, None)));
+    let row_schema = row_schema.unwrap_or_else(|| {
+        if execution.schema.fields().is_empty() {
+            // For row-returning queries that ended up with no columns (rare),
+            // provide a dummy schema so pgwire doesn't fail.
+            Arc::new(vec![FieldInfo::new(
+                "result".to_string(),
+                None,
+                None,
+                pgwire::api::Type::TEXT,
+                pgwire::api::results::FieldFormat::Text,
+            )])
+        } else {
+            Arc::new(postgres_row_schema_from_arrow(&execution.schema, None))
+        }
+    });
     let rows = query_execution_to_pg_rows(execution, Arc::clone(&row_schema))?;
 
     Ok(PgResponse::Query(PgQueryResponse::new(row_schema, rows)))
@@ -1627,47 +1650,49 @@ fn unsupported_parameter_type_error(name: &str) -> PgWireError {
     ))))
 }
 
-fn sql_returns_rows(sql: &str) -> bool {
-    let upper = sql.trim_start().to_ascii_uppercase();
-
-    upper.starts_with("SELECT")
-        || upper.starts_with("SHOW")
-        || upper.starts_with("DESCRIBE")
-        || upper.starts_with("EXPLAIN")
-        || upper.starts_with("WITH")
-}
-
-fn command_tag_for_sql(sql: &str) -> &str {
-    let trimmed = sql.trim();
-    let upper = trimmed.to_ascii_uppercase();
-
-    if upper.starts_with("CREATE DATABASE") {
-        "CREATE DATABASE"
-    } else if upper.starts_with("CREATE SCHEMA") {
-        "CREATE SCHEMA"
-    } else if upper.starts_with("CREATE VIEW") {
-        "CREATE VIEW"
-    } else if upper.starts_with("CREATE TABLE") {
-        "CREATE TABLE"
-    } else if upper.starts_with("INSERT") {
-        "INSERT"
-    } else {
-        "OK"
-    }
-}
-
-fn rows_affected_from_message(message: &str) -> usize {
-    let mut digits = String::new();
-
-    for character in message.chars() {
-        if character.is_ascii_digit() {
-            digits.push(character);
-        } else if !digits.is_empty() {
-            break;
+fn statement_update_rows_affected(execution: &QueryExecutionResult) -> i64 {
+    match &execution.outcome {
+        StatementOutcome::Rows => 0,
+        StatementOutcome::Command { rows_affected, .. } => {
+            (*rows_affected).try_into().unwrap_or(i64::MAX)
         }
     }
+}
 
-    digits.parse::<usize>().unwrap_or(0)
+async fn plan_rows_schema(
+    engine: &PrototypeEngine,
+    sql: String,
+    session: SessionContext,
+) -> Result<SchemaRef, Status> {
+    let schema = engine
+        .plan_query_schema(&QueryRequest { sql, session })
+        .await
+        .map_err(status_from_error)?;
+
+    schema.ok_or_else(|| {
+        Status::invalid_argument(
+            "statement query cannot execute SQL that does not return rows; execute it as a statement update",
+        )
+    })
+}
+
+fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
+    let info = FlightInfo::new()
+        .try_with_schema(schema)
+        .map_err(status_from_error)?;
+    Ok(info.schema.to_vec())
+}
+
+fn flight_info_with_ipc_schema(
+    schema_ipc: Vec<u8>,
+    endpoint: FlightEndpoint,
+    descriptor: FlightDescriptor,
+) -> FlightInfo {
+    let mut info = FlightInfo::new()
+        .with_endpoint(endpoint)
+        .with_descriptor(descriptor);
+    info.schema = bytes::Bytes::from(schema_ipc);
+    info
 }
 
 fn anyhow_error_to_pgwire(error: anyhow::Error) -> PgWireError {
@@ -1688,11 +1713,40 @@ struct AnalyticsFlightSqlService {
 struct StatementTicketPayload {
     sql: String,
     session: SessionContext,
+    #[serde(default)]
+    row_schema_ipc: Option<Vec<u8>>,
 }
 
 #[async_trait]
 impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     type FlightService = Self;
+
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action = request.into_inner();
+        if action.r#type == "JoinCluster" {
+            let req: analyticsdb_control::raft::JoinRequest =
+                serde_json::from_slice(&action.body).map_err(status_from_error)?;
+            let res = self
+                .engine
+                .control_plane()
+                .join_cluster(req.node_id.as_deref(), &req.endpoint)
+                .await
+                .map_err(status_from_error)?;
+            let body = serde_json::to_vec(&res).map_err(status_from_error)?;
+            let response = FlightResult { body: body.into() };
+            return Ok(Response::new(Box::pin(stream::once(async {
+                Ok(response)
+            }))));
+        }
+
+        Err(Status::unimplemented(format!(
+            "Unknown action type: {}",
+            action.r#type
+        )))
+    }
 
     async fn do_handshake(
         &self,
@@ -1704,7 +1758,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         Status,
     > {
         let metadata = request.metadata().clone();
-        trace!("flight-sql: handshake request from {:?}", request.remote_addr());
+        trace!(
+            "flight-sql: handshake request from {:?}",
+            request.remote_addr()
+        );
         let mut stream = request.into_inner();
         let handshake_request =
             stream
@@ -1788,22 +1845,14 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<FlightInfo>, Status> {
         debug!("flight_sql_query: {}", query.query);
         let session = flight_session_from_metadata(request.metadata());
-        let execution = self
-            .execute_batches(QueryRequest {
-                sql: query.query.clone(),
-                session: session.clone(),
-            })
-            .await?;
+        let schema = plan_rows_schema(&self.engine, query.query.clone(), session.clone()).await?;
+        let schema_ipc = schema_to_ipc_bytes(schema.as_ref())?;
 
         let descriptor = request.into_inner();
-        let ticket = statement_ticket(query.query, session)?;
+        let ticket = statement_ticket(query.query, session, Some(schema_ipc.clone()))?;
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .with_descriptor(descriptor)
-            .try_with_schema(execution.schema.as_ref())
-            .map_err(status_from_error)?;
+        let info = flight_info_with_ipc_schema(schema_ipc, endpoint, descriptor);
 
         Ok(Response::new(info))
     }
@@ -1815,26 +1864,21 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let payload = decode_statement_ticket(ticket.statement_handle)?;
         let execution = self
-            .execute_batches(QueryRequest {
+            .engine
+            .execute_query_stream(&QueryRequest {
                 sql: payload.sql,
                 session: payload.session,
             })
-            .await?;
-
-        let schema = Arc::clone(&execution.schema);
-        let batches = if execution.batches.is_empty() {
-            vec![RecordBatch::new_empty(Arc::clone(&schema))]
-        } else {
-            execution.batches
-        };
+            .await
+            .map_err(status_from_error)?;
 
         let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(stream::iter(
-                batches
-                    .into_iter()
-                    .map(Ok::<_, arrow_flight::error::FlightError>),
-            ))
+            .with_schema(Arc::clone(&execution.schema))
+            .build(execution.stream.map(|batch| {
+                batch.map_err(|error| {
+                    arrow_flight::error::FlightError::from_external_error(Box::new(error))
+                })
+            }))
             .map_err(Status::from)
             .boxed();
 
@@ -1854,7 +1898,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             })
             .await?;
 
-        Ok(rows_affected_from_message(&execution.message) as i64)
+        Ok(statement_update_rows_affected(&execution))
     }
 
     async fn do_put_prepared_statement_update(
@@ -1870,7 +1914,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             })
             .await?;
 
-        Ok(rows_affected_from_message(&execution.message) as i64)
+        Ok(statement_update_rows_affected(&execution))
     }
 
     async fn get_flight_info_catalogs(
@@ -1905,8 +1949,8 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .map_err(status_from_error)?;
 
         let mut builder = query.into_builder();
-        for database in databases {
-            builder.append(&database);
+        for database in &databases {
+            builder.append(database);
         }
 
         Ok(Response::new(encoded_single_batch(
@@ -1950,7 +1994,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         };
 
         let mut builder = query.into_builder();
-        for database in databases {
+        for database in &databases {
             let schema_session = flight_session_for_database(&session, &database);
             let database_for_list = database.clone();
             let schemas = self
@@ -2005,7 +2049,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         };
 
         let mut builder = query.into_builder();
-        for database in databases {
+        for database in &databases {
             let db_session = flight_session_for_database(&session, &database);
             let database_for_schemas = database.clone();
             let schemas = self
@@ -2140,7 +2184,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         let session = flight_session_from_metadata(request.metadata());
         debug!("flight_sql_create_prepared_statement: {}", query.query);
 
-        let dataset_schema = match self
+        let row_schema_ipc = match self
             .engine
             .plan_query_schema(&QueryRequest {
                 sql: query.query.clone(),
@@ -2148,21 +2192,20 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             })
             .await
         {
-            Ok(Some(schema)) => {
-                use datafusion::arrow::ipc::writer::StreamWriter;
-                let mut buffer = Vec::new();
-                let mut writer = StreamWriter::try_new(&mut buffer, &schema).map_err(status_from_error)?;
-                writer.finish().map_err(status_from_error)?;
-                bytes::Bytes::from(buffer)
-            }
-            _ => bytes::Bytes::new(),
+            Ok(Some(schema)) => Some(schema_to_ipc_bytes(schema.as_ref())?),
+            _ => None,
         };
+        let dataset_schema = row_schema_ipc
+            .clone()
+            .map(bytes::Bytes::from)
+            .unwrap_or_else(bytes::Bytes::new);
 
-        // For this prototype, we treat "prepared statements" as just the SQL string 
+        // For this prototype, we treat "prepared statements" as just the SQL string
         // and session context wrapped in a handle.
         let payload = StatementTicketPayload {
             sql: query.query,
             session,
+            row_schema_ipc,
         };
         let handle = serde_json::to_vec(&payload).map_err(status_from_error)?;
 
@@ -2189,22 +2232,17 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<FlightInfo>, Status> {
         let payload = decode_statement_ticket(query.prepared_statement_handle)?;
         debug!("flight_sql_prepared_statement: {}", payload.sql);
-        let execution = self
-            .execute_batches(QueryRequest {
-                sql: payload.sql.clone(),
-                session: payload.session.clone(),
-            })
-            .await?;
+        let schema_ipc = payload.row_schema_ipc.clone().ok_or_else(|| {
+            Status::invalid_argument(
+                "prepared statement query cannot execute SQL that does not return rows; execute it as a prepared statement update",
+            )
+        })?;
 
         let descriptor = request.into_inner();
-        let ticket = statement_ticket(payload.sql, payload.session)?;
+        let ticket = statement_ticket(payload.sql, payload.session, Some(schema_ipc.clone()))?;
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .with_descriptor(descriptor)
-            .try_with_schema(execution.schema.as_ref())
-            .map_err(status_from_error)?;
+        let info = flight_info_with_ipc_schema(schema_ipc, endpoint, descriptor);
 
         Ok(Response::new(info))
     }
@@ -2232,6 +2270,7 @@ fn flight_session_from_metadata(metadata: &MetadataMap) -> SessionContext {
         auth_method: metadata_value(metadata, FLIGHT_AUTH_METHOD_HEADER)
             .unwrap_or_else(|| "flight-sql-metadata".to_string()),
         protocol: Protocol::ArrowFlightSql,
+        transaction_status: analyticsdb_core::TransactionStatus::Idle,
     }
 }
 
@@ -2243,6 +2282,7 @@ fn flight_session_for_database(session: &SessionContext, database: &str) -> Sess
         schema: session.schema.clone(),
         auth_method: session.auth_method.clone(),
         protocol: Protocol::ArrowFlightSql,
+        transaction_status: analyticsdb_core::TransactionStatus::Idle,
     }
 }
 
@@ -2279,8 +2319,16 @@ fn parse_basic_auth_from_metadata(
     Ok(Some((user.to_string(), password.to_string())))
 }
 
-fn statement_ticket(sql: String, session: SessionContext) -> Result<Ticket, Status> {
-    let payload = StatementTicketPayload { sql, session };
+fn statement_ticket(
+    sql: String,
+    session: SessionContext,
+    row_schema_ipc: Option<Vec<u8>>,
+) -> Result<Ticket, Status> {
+    let payload = StatementTicketPayload {
+        sql,
+        session,
+        row_schema_ipc,
+    };
     let bytes = serde_json::to_vec(&payload).map_err(status_from_error)?;
     let ticket = TicketStatementQuery {
         statement_handle: bytes.into(),
@@ -3374,7 +3422,7 @@ mod tests {
                 .expect("engine should initialize"),
         );
 
-        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine), None));
 
         let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
             .expect("endpoint should parse")
@@ -3430,6 +3478,141 @@ mod tests {
             "ok"
         );
 
+        let describe_update_count = client
+            .execute_update("DESCRIBE fact_metrics".to_string(), None)
+            .await
+            .expect("DESCRIBE should be tolerated on statement update paths");
+        assert_eq!(describe_update_count, 0);
+
+        let information_schema_update_count = client
+            .execute_update("SELECT * FROM information_schema.tables".to_string(), None)
+            .await
+            .expect("information_schema queries should be tolerated on statement update paths");
+        assert_eq!(information_schema_update_count, 0);
+
+        let information_schema_columns_update_count = client
+            .execute_update(
+                "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default \
+                 FROM information_schema.columns \
+                 WHERE table_name = 'fact_metrics' \
+                   AND table_schema = 'public' \
+                 ORDER BY ordinal_position"
+                    .to_string(),
+                None,
+            )
+            .await
+            .expect("information_schema.columns filters should be tolerated on statement update paths");
+        assert_eq!(information_schema_columns_update_count, 0);
+
+        let describe_info = client
+            .execute("DESCRIBE fact_metrics".to_string(), None)
+            .await
+            .expect("DESCRIBE should succeed on statement query path");
+        let describe_ticket = describe_info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("DESCRIBE ticket should exist");
+        let describe_batches = client
+            .do_get(describe_ticket)
+            .await
+            .expect("DESCRIBE do_get should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("DESCRIBE batches should collect");
+        assert_eq!(describe_batches[0].num_rows(), 2);
+        assert_eq!(
+            array_value_to_string(describe_batches[0].column(0).as_ref(), 0).expect("value"),
+            "metric"
+        );
+
+        let mut prepared_select = client
+            .prepare(
+                "SELECT metric, status FROM fact_metrics ORDER BY metric".to_string(),
+                None,
+            )
+            .await
+            .expect("SELECT prepared statement should be created");
+        assert_eq!(
+            prepared_select
+                .dataset_schema()
+                .expect("prepared SELECT dataset schema")
+                .fields()
+                .len(),
+            2
+        );
+        let prepared_select_info = prepared_select
+            .execute()
+            .await
+            .expect("prepared SELECT query path should succeed");
+        let prepared_select_ticket = prepared_select_info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("prepared SELECT ticket should exist");
+        let prepared_select_batches = client
+            .do_get(prepared_select_ticket)
+            .await
+            .expect("prepared SELECT do_get should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("prepared SELECT batches should collect");
+        assert_eq!(
+            array_value_to_string(prepared_select_batches[0].column(0).as_ref(), 0).expect("value"),
+            "11"
+        );
+
+        let mut prepared_describe = client
+            .prepare("DESCRIBE fact_metrics".to_string(), None)
+            .await
+            .expect("DESCRIBE prepared statement should be created");
+        assert_eq!(
+            prepared_describe
+                .dataset_schema()
+                .expect("prepared DESCRIBE dataset schema")
+                .fields()
+                .len(),
+            3
+        );
+        let prepared_describe_info = prepared_describe
+            .execute()
+            .await
+            .expect("prepared DESCRIBE query path should succeed");
+        let prepared_describe_ticket = prepared_describe_info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("prepared DESCRIBE ticket should exist");
+        let prepared_describe_batches = client
+            .do_get(prepared_describe_ticket)
+            .await
+            .expect("prepared DESCRIBE do_get should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("prepared DESCRIBE batches should collect");
+        assert_eq!(prepared_describe_batches[0].num_rows(), 2);
+
+        let mut prepared_insert = client
+            .prepare(
+                "INSERT INTO fact_metrics VALUES (12, 'via_prepared')".to_string(),
+                None,
+            )
+            .await
+            .expect("INSERT prepared statement should be created");
+        assert_eq!(
+            prepared_insert
+                .dataset_schema()
+                .expect("prepared INSERT dataset schema")
+                .fields()
+                .len(),
+            0
+        );
+        let prepared_inserted = prepared_insert
+            .execute_update()
+            .await
+            .expect("prepared INSERT update path should succeed");
+        assert_eq!(prepared_inserted, 1);
+
         server.abort();
         let _ = std::fs::remove_file(&catalog_path);
         let _ = std::fs::remove_dir_all(format!(
@@ -3465,7 +3648,7 @@ mod tests {
             .await
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
-        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine), None));
 
         let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
             .expect("endpoint should parse")
@@ -3544,7 +3727,7 @@ mod tests {
             .await
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
-        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine), None));
 
         let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
             .expect("endpoint should parse")
@@ -3655,7 +3838,7 @@ mod tests {
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
 
-        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine), None));
 
         let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
             .expect("endpoint should parse")
@@ -3701,7 +3884,7 @@ mod tests {
             .expect("bind should work");
         let addr = listener.local_addr().expect("local addr should exist");
         let engine = Arc::new(PrototypeEngine::new().expect("engine should initialize"));
-        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine)));
+        let server = tokio::spawn(serve_flight_sql(listener, Arc::clone(&engine), None));
 
         let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", addr.port()))
             .expect("endpoint should parse")

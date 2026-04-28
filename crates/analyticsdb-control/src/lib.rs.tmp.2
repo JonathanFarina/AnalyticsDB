@@ -1,0 +1,68 @@
+fn bootstrap_state() -> CatalogState {
+    let mut databases = BTreeMap::new();
+    databases.insert(
+        "postgres".to_string(),
+        CatalogDatabase {
+            name: "postgres".to_string(),
+            schemas: BTreeSet::from(["public".to_string()]),
+            owner: "postgres".to_string(),
+            parameters: BTreeMap::new(),
+        },
+    );
+
+    let mut users = BTreeMap::new();
+    users.insert(
+        "postgres".to_string(),
+        CatalogUser {
+            name: "postgres".to_string(),
+            is_admin: true,
+            password: Some("postgres".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+        },
+    );
+    users.insert(
+        "analytics_reader".to_string(),
+        CatalogUser {
+            name: "analytics_reader".to_string(),
+            is_admin: false,
+            password: Some("analytics_reader".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+        },
+    );
+    users.insert(
+        "analyticsdb_admin".to_string(),
+        CatalogUser {
+            name: "analyticsdb_admin".to_string(),
+            is_admin: false,
+            password: Some("analyticsdb_admin".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+        },
+    );
+
+    let nodes = BTreeMap::new();
+    let relations = BTreeMap::new();
+
+    let config = Some(ClusterConfig {
+        base_postgres_port: 5432,
+        base_flight_sql_port: 50051,
+        catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+        tls_cert_path: None,
+        tls_key_path: None,
+        next_available_port_offset: 0,
+    });
+
+    CatalogState {
+        databases,
+        users,
+        nodes,
+        relations,
+        aggregates: BTreeMap::new(),
+        collations: BTreeMap::new(),
+        conversions: BTreeMap::new(),
+        functions: BTreeMap::new(),
+        config,
+    }
+}

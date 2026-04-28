@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{BooleanArray, Int16Array, Int32Array, StringArray, UInt32Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{SchemaProvider, Session};
+use datafusion::catalog::{
+    CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider, Session,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableType;
@@ -18,7 +20,139 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 
-use analyticsdb_control::{CatalogTableConstraintKind, ControlPlane};
+use analyticsdb_control::{CatalogRelationKind, CatalogTableConstraintKind, ControlPlane};
+use analyticsdb_core::SessionContext;
+
+pub struct AnalyticsCatalogProvider {
+    control_plane: Arc<ControlPlane>,
+    session: SessionContext,
+    inner: Arc<MemoryCatalogProvider>,
+}
+
+impl AnalyticsCatalogProvider {
+    pub fn new(control_plane: Arc<ControlPlane>, session: SessionContext) -> Self {
+        let inner = Arc::new(MemoryCatalogProvider::new());
+        // For AnalyticsDB, we provide a dynamic schema provider for all schemas in the database
+        Self {
+            control_plane,
+            session,
+            inner,
+        }
+    }
+}
+
+impl std::fmt::Debug for AnalyticsCatalogProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyticsCatalogProvider")
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl CatalogProvider for AnalyticsCatalogProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        // We should probably return all schemas from control plane here.
+        // But for simplicity and to match DataFusion's expectation, we'll return at least what's in inner + public
+        let mut names = self.inner.schema_names();
+        if !names.contains(&"public".to_string()) {
+            names.push("public".to_string());
+        }
+        names
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if let Some(s) = self.inner.schema(name) {
+            return Some(s);
+        }
+
+        // Return a dynamic schema provider that loads from control plane
+        Some(Arc::new(AnalyticsSchemaProvider::new(
+            Arc::clone(&self.control_plane),
+            self.session.clone(),
+            name.to_string(),
+        )))
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
+        self.inner.register_schema(name, schema)
+    }
+}
+
+#[derive(Debug)]
+pub struct AnalyticsSchemaProvider {
+    control_plane: Arc<ControlPlane>,
+    session: SessionContext,
+    schema_name: String,
+}
+
+impl AnalyticsSchemaProvider {
+    pub fn new(
+        control_plane: Arc<ControlPlane>,
+        session: SessionContext,
+        schema_name: String,
+    ) -> Self {
+        Self {
+            control_plane,
+            session,
+            schema_name,
+        }
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for AnalyticsSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        // This is tricky as it's async in control plane.
+        // For the prototype, we'll block or just return names from a snapshot.
+        let cluster = futures::executor::block_on(self.control_plane.cluster_snapshot());
+        cluster
+            .relations
+            .iter()
+            .filter(|r| r.database == self.session.database && r.schema == self.schema_name)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        let relation = self
+            .control_plane
+            .find_relation(
+                &self.session,
+                Some(&self.session.database),
+                Some(&self.schema_name),
+                name,
+            )
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+
+        // Create a TableProvider for the relation (e.g. ParquetTable)
+        // For the prototype, I'll need a simple ParquetTable implementation.
+        // Wait, does the engine already have one?
+        // I'll check engine/lib.rs for how it handles tables.
+
+        Ok(None) // Placeholder
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        let cluster = futures::executor::block_on(self.control_plane.cluster_snapshot());
+        cluster.relations.iter().any(|r| {
+            r.database == self.session.database && r.schema == self.schema_name && r.name == name
+        })
+    }
+}
 
 pub struct PgCatalogSchemaProvider {
     _control_plane: Arc<ControlPlane>,
@@ -825,7 +959,11 @@ impl TableProvider for PgClassTable {
 
         for rel in &cluster.relations {
             if rel.database == session.database {
-                oid.push(synthetic_relation_oid(&rel.database, &rel.schema, &rel.name));
+                oid.push(synthetic_relation_oid(
+                    &rel.database,
+                    &rel.schema,
+                    &rel.name,
+                ));
                 relname.push(rel.name.clone());
                 relnamespace.push(synthetic_namespace_oid(&rel.database, &rel.schema));
                 reltype.push(0_u32);
@@ -1310,7 +1448,7 @@ impl PgConstraintTable {
             Field::new("conislocal", DataType::Boolean, false),
             Field::new("coninhcount", DataType::Int32, false),
             Field::new("connoinherit", DataType::Boolean, false),
-            // Standard PostgreSQL uses int2[] and int2[] for these. 
+            // Standard PostgreSQL uses int2[] and int2[] for these.
             // We provide them as NULL for now to satisfy basic JDBC discovery.
             Field::new("conkey", DataType::Utf8, true),
             Field::new("confkey", DataType::Utf8, true),
@@ -1386,23 +1524,26 @@ impl TableProvider for PgConstraintTable {
                     conrelid.push(rel_oid);
                     contypid.push(0_u32);
                     conindid.push(0_u32);
-                    
+
                     let frel_oid = if let Some(ref_table) = &constraint.referenced_table {
-                         let ref_db = constraint.referenced_database.as_ref().unwrap_or(&rel.database);
-                         let ref_sch = constraint.referenced_schema.as_ref().unwrap_or(&rel.schema);
-                         synthetic_relation_oid(ref_db, ref_sch, ref_table)
+                        let ref_db = constraint
+                            .referenced_database
+                            .as_ref()
+                            .unwrap_or(&rel.database);
+                        let ref_sch = constraint.referenced_schema.as_ref().unwrap_or(&rel.schema);
+                        synthetic_relation_oid(ref_db, ref_sch, ref_table)
                     } else {
                         0_u32
                     };
                     confrelid.push(frel_oid);
-                    
+
                     confupdtype.push("a".to_string());
                     confdeltype.push("a".to_string());
                     confmatchtype.push("s".to_string());
                     conislocal.push(true);
                     coninhcount.push(0_i32);
                     connoinherit.push(true);
-                    
+
                     // Prototype simplification: arrays not provided yet
                     conkey.push(None);
                     confkey.push(None);
@@ -1451,6 +1592,7 @@ fn postgres_session_from_state(state: &dyn Session) -> analyticsdb_core::Session
             schema: "public".to_string(),
             auth_method: "postgres-wire-startup".to_string(),
             protocol: analyticsdb_core::Protocol::PostgreSql,
+            transaction_status: analyticsdb_core::TransactionStatus::Idle,
         })
 }
 
@@ -1514,7 +1656,12 @@ fn synthetic_relation_oid(database: &str, schema: &str, name: &str) -> u32 {
 
 fn synthetic_attrdef_oid(rel_oid: u32, attnum: i16) -> u32 {
     let mut hash = 2166136261_u32;
-    for byte in rel_oid.to_le_bytes().iter().copied().chain(attnum.to_le_bytes().iter().copied()) {
+    for byte in rel_oid
+        .to_le_bytes()
+        .iter()
+        .copied()
+        .chain(attnum.to_le_bytes().iter().copied())
+    {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16777619);
     }

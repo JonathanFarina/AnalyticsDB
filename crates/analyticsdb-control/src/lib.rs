@@ -11,21 +11,25 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub mod raft;
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 pub enum NodeRole {
+    #[default]
     Control,
     Compute,
     Storage,
     Gateway,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 pub enum NodeStatus {
+    #[default]
     Ready,
     Unavailable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterNode {
     pub id: String,
     pub role: NodeRole,
@@ -39,6 +43,41 @@ pub struct ClusterNode {
 pub struct CatalogDatabase {
     pub name: String,
     pub schemas: BTreeSet<String>,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogAggregate {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogCollation {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogConversion {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogFunction {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub owner: String,
+    pub definition_sql: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +182,7 @@ pub struct ClusterSnapshot {
     pub databases: Vec<CatalogDatabase>,
     pub users: Vec<CatalogUser>,
     pub relations: Vec<CatalogRelation>,
+    pub functions: Vec<CatalogFunction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,27 +191,74 @@ pub struct QueryAdmission {
     pub coordinator_node_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterConfig {
+    pub base_postgres_port: u16,
+    pub base_flight_sql_port: u16,
+    pub catalog_path: String,
+    #[serde(alias = "tls_cert")]
+    pub tls_cert_path: Option<String>,
+    #[serde(alias = "tls_key")]
+    pub tls_key_path: Option<String>,
+    pub next_available_port_offset: u16,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct CatalogState {
     databases: BTreeMap<String, CatalogDatabase>,
     users: BTreeMap<String, CatalogUser>,
     nodes: BTreeMap<String, ClusterNode>,
     relations: BTreeMap<String, CatalogRelation>,
+    #[serde(default)]
+    aggregates: BTreeMap<String, CatalogAggregate>,
+    #[serde(default)]
+    collations: BTreeMap<String, CatalogCollation>,
+    #[serde(default)]
+    conversions: BTreeMap<String, CatalogConversion>,
+    #[serde(default)]
+    functions: BTreeMap<String, CatalogFunction>,
+    #[serde(default)]
+    config: Option<ClusterConfig>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AlterTableOperation {
-    AddColumn {
-        column: TableColumnDefinition,
-    },
-    RenameTable {
-        new_name: String,
-    },
+    AddColumn { column: TableColumnDefinition },
+    RenameTable { new_name: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterDatabaseOperation {
+    Rename { new_name: String },
+    OwnerTo { new_owner: String },
+    SetParam { name: String, value: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterObjectOperation {
+    Rename { new_name: String },
+    OwnerTo { new_owner: String },
+    SetSchema { new_schema: String },
 }
 
 #[derive(Debug, Clone)]
 pub enum MetadataStatement {
     CreateDatabase {
+        name: String,
+    },
+    CreateAggregate {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+    },
+    CreateCollation {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+    },
+    CreateConversion {
+        database: Option<String>,
+        schema: Option<String>,
         name: String,
     },
     CreateSchema {
@@ -240,6 +327,48 @@ pub enum MetadataStatement {
         name: String,
         new_name: String,
     },
+    AlterDatabase {
+        name: String,
+        operation: AlterDatabaseOperation,
+    },
+    AlterAggregate {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        operation: AlterObjectOperation,
+    },
+    AlterCollation {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        operation: AlterObjectOperation,
+    },
+    AlterConversion {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        operation: AlterObjectOperation,
+    },
+    CreateFunction {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        or_replace: bool,
+        definition_sql: String,
+    },
+    AlterFunction {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        operation: AlterObjectOperation,
+    },
+    DropFunction {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     ShowDatabases,
     ShowSchemas {
         database: Option<String>,
@@ -256,7 +385,7 @@ pub enum MetadataStatement {
     ShowColumns {
         database: Option<String>,
         schema: Option<String>,
-        name: String,
+        table: String,
     },
     InformationSchemaSchemata {
         sql: String,
@@ -372,7 +501,8 @@ impl ControlPlane {
         let coordinator_node_id = if ready_nodes.is_empty() {
             self.coordinator_node_id.clone()
         } else {
-            let index = self.next_round_robin_index.fetch_add(1, Ordering::SeqCst) % ready_nodes.len();
+            let index =
+                self.next_round_robin_index.fetch_add(1, Ordering::SeqCst) % ready_nodes.len();
             ready_nodes[index].id.clone()
         };
 
@@ -414,11 +544,7 @@ impl ControlPlane {
 
         let database = state.databases.get(&session.database).unwrap();
         if !database.schemas.contains(&session.schema) {
-            bail!(
-                "Unknown schema '{}.{}'",
-                session.database,
-                session.schema
-            );
+            bail!("Unknown schema '{}.{}'", session.database, session.schema);
         }
 
         Ok(())
@@ -433,6 +559,7 @@ impl ControlPlane {
             databases: state.databases.values().cloned().collect(),
             users: state.users.values().cloned().collect(),
             relations: state.relations.values().cloned().collect(),
+            functions: state.functions.values().cloned().collect(),
         }
     }
 
@@ -440,18 +567,154 @@ impl ControlPlane {
         &self,
         session: &SessionContext,
         statement: &MetadataStatement,
-    ) -> Result<String> {
-        match statement {
-            MetadataStatement::CreateDatabase { name } => self.create_database(session, name).await,
+    ) -> Result<(String, SessionContext)> {
+        let mut new_session = session.clone();
+        let message = match statement {
+            MetadataStatement::CreateDatabase { name } => {
+                self.create_database(session, name).await?
+            }
+            MetadataStatement::CreateAggregate {
+                database,
+                schema,
+                name,
+            } => {
+                self.create_aggregate(session, database.as_deref(), schema.as_deref(), name)
+                    .await?
+            }
+            MetadataStatement::CreateCollation {
+                database,
+                schema,
+                name,
+            } => {
+                self.create_collation(session, database.as_deref(), schema.as_deref(), name)
+                    .await?
+            }
+            MetadataStatement::CreateConversion {
+                database,
+                schema,
+                name,
+            } => {
+                self.create_conversion(session, database.as_deref(), schema.as_deref(), name)
+                    .await?
+            }
+            MetadataStatement::AlterDatabase { name, operation } => {
+                self.alter_database(session, name, operation).await?
+            }
+            MetadataStatement::AlterAggregate {
+                database,
+                schema,
+                name,
+                operation,
+            } => {
+                self.alter_aggregate(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    operation,
+                )
+                .await?
+            }
+            MetadataStatement::AlterCollation {
+                database,
+                schema,
+                name,
+                operation,
+            } => {
+                self.alter_collation(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    operation,
+                )
+                .await?
+            }
+            MetadataStatement::AlterConversion {
+                database,
+                schema,
+                name,
+                operation,
+            } => {
+                self.alter_conversion(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    operation,
+                )
+                .await?
+            }
+            MetadataStatement::CreateFunction {
+                database,
+                schema,
+                name,
+                or_replace,
+                definition_sql,
+            } => {
+                self.create_function(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    *or_replace,
+                    definition_sql,
+                )
+                .await?
+            }
+            MetadataStatement::AlterFunction {
+                database,
+                schema,
+                name,
+                operation,
+            } => {
+                self.alter_function(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    operation,
+                )
+                .await?
+            }
+            MetadataStatement::DropFunction {
+                database,
+                schema,
+                name,
+                if_exists,
+                cascade,
+            } => {
+                self.drop_function(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    *if_exists,
+                    *cascade,
+                )
+                .await?
+            }
             MetadataStatement::CreateSchema { database, name } => {
-                self.create_schema(session, database.as_deref(), name).await
+                self.create_schema(session, database.as_deref(), name)
+                    .await?
             }
             MetadataStatement::AlterUserPassword { name, password } => {
-                self.rotate_user_password(session, name, password).await
+                self.rotate_user_password(session, name, password).await?
             }
-            MetadataStatement::Begin | MetadataStatement::Commit | MetadataStatement::Rollback => {
+            MetadataStatement::Begin => {
                 self.validate_session(session).await?;
-                Ok("Command completed. 0 row(s) affected.".to_string())
+                new_session.transaction_status = analyticsdb_core::TransactionStatus::InTransaction;
+                "Command completed. 0 row(s) affected.".to_string()
+            }
+            MetadataStatement::Commit => {
+                self.validate_session(session).await?;
+                new_session.transaction_status = analyticsdb_core::TransactionStatus::Idle;
+                "Command completed. 0 row(s) affected.".to_string()
+            }
+            MetadataStatement::Rollback => {
+                self.validate_session(session).await?;
+                new_session.transaction_status = analyticsdb_core::TransactionStatus::Idle;
+                "Command completed. 0 row(s) affected.".to_string()
             }
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
@@ -471,7 +734,7 @@ impl ControlPlane {
             }
             MetadataStatement::ShowDatabases => {
                 self.validate_session(session).await?;
-                Ok("Command completed.".to_string())
+                "Command completed.".to_string()
             }
             MetadataStatement::ShowSchemas { .. }
             | MetadataStatement::ShowNodes
@@ -488,9 +751,11 @@ impl ControlPlane {
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
             | MetadataStatement::InformationSchemaReferentialConstraints { .. } => {
                 self.validate_session(session).await?;
-                Ok("Command completed.".to_string())
+                "Command completed.".to_string()
             }
-        }
+        };
+
+        Ok((message, new_session))
     }
 
     pub async fn register_node(&self, mut node: ClusterNode) -> Result<()> {
@@ -525,7 +790,9 @@ impl ControlPlane {
         {
             let mut state = self.state.write().await;
             for node in state.nodes.values_mut() {
-                if node.status == NodeStatus::Ready && now - node.last_heartbeat_at_epoch_ms > threshold_ms {
+                if node.status == NodeStatus::Ready
+                    && now - node.last_heartbeat_at_epoch_ms > threshold_ms
+                {
                     node.status = NodeStatus::Unavailable;
                     changed = true;
                 }
@@ -540,6 +807,74 @@ impl ControlPlane {
     pub async fn list_nodes(&self) -> Result<Vec<ClusterNode>> {
         let state = self.state.read().await;
         Ok(state.nodes.values().cloned().collect())
+    }
+
+    pub async fn join_cluster(
+        &self,
+        requested_node_id: Option<&str>,
+        endpoint: &str,
+    ) -> Result<raft::JoinResponse> {
+        let (node_id, postgres_port, flight_sql_port, new_config) = {
+            let mut state = self.state.write().await;
+
+            let config = state
+                .config
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Cluster config not initialized"))?;
+
+            // 1. Determine Node ID
+            let node_id = match requested_node_id {
+                Some(id) => id.to_string(),
+                None => {
+                    let mut idx = state.nodes.len() + 1;
+                    let mut candidate = format!("node-{}", idx);
+                    while state.nodes.contains_key(&candidate) {
+                        idx += 1;
+                        candidate = format!("node-{}", idx);
+                    }
+                    candidate
+                }
+            };
+
+            // 2. Allocate ports
+            let offset = config.next_available_port_offset + 1;
+            let postgres_port = config.base_postgres_port + offset;
+            let flight_sql_port = config.base_flight_sql_port + offset;
+
+            // 3. Update offset in config
+            let mut new_config = config.clone();
+            new_config.next_available_port_offset = offset;
+            state.config = Some(new_config.clone());
+
+            // 4. Register the node as Ready
+            let node = ClusterNode {
+                id: node_id.clone(),
+                role: NodeRole::Compute, // Default to compute for joining nodes
+                endpoint: endpoint.to_string(),
+                status: NodeStatus::Ready,
+                last_heartbeat_at_epoch_ms: current_epoch_millis(),
+            };
+            state.nodes.insert(node_id.clone(), node);
+            (node_id, postgres_port, flight_sql_port, new_config)
+        };
+
+        self.persist().await?;
+
+        Ok(raft::JoinResponse {
+            node_id,
+            postgres_port,
+            flight_sql_port,
+            config: new_config,
+        })
+    }
+
+    pub async fn update_cluster_config(&self, config: ClusterConfig) -> Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state.config = Some(config);
+        }
+        self.persist().await?;
+        Ok(())
     }
 
     async fn create_database(&self, session: &SessionContext, name: &str) -> Result<String> {
@@ -562,12 +897,453 @@ impl ControlPlane {
                 CatalogDatabase {
                     name: name.to_string(),
                     schemas: BTreeSet::from(["public".to_string()]),
+                    owner: session.user.clone(),
+                    parameters: BTreeMap::new(),
                 },
             );
         }
 
         self.persist().await?;
         Ok(format!("Database '{}' created successfully.", name))
+    }
+
+    async fn alter_database(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        operation: &AlterDatabaseOperation,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can alter databases");
+            }
+
+            match operation {
+                AlterDatabaseOperation::Rename { new_name } => {
+                    validate_identifier(new_name)?;
+                    if state.databases.contains_key(new_name) {
+                        bail!("Database '{}' already exists", new_name);
+                    }
+
+                    let mut db_data = state.databases.remove(name).unwrap();
+                    db_data.name = new_name.to_string();
+                    state.databases.insert(new_name.to_string(), db_data);
+
+                    // Update relations
+                    let keys_to_move: Vec<String> = state
+                        .relations
+                        .keys()
+                        .filter(|k| k.starts_with(&format!("{}.", name)))
+                        .cloned()
+                        .collect();
+                    for key in keys_to_move {
+                        let mut rel = state.relations.remove(&key).unwrap();
+                        rel.database = new_name.to_string();
+                        let new_key = relation_key(&rel.database, &rel.schema, &rel.name);
+                        state.relations.insert(new_key, rel);
+                    }
+
+                    self.persist_state(&state).await?; // Persist inside because we changed maps
+                    return Ok(format!(
+                        "Database '{}' renamed to '{}' successfully.",
+                        name, new_name
+                    ));
+                }
+                AlterDatabaseOperation::OwnerTo { new_owner } => {
+                    if !state.users.contains_key(new_owner) {
+                        bail!("User '{}' does not exist", new_owner);
+                    }
+                }
+                _ => {}
+            }
+
+            let database = state
+                .databases
+                .get_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("Database '{}' does not exist", name))?;
+
+            match operation {
+                AlterDatabaseOperation::OwnerTo { new_owner } => {
+                    database.owner = new_owner.to_string();
+                }
+                AlterDatabaseOperation::SetParam {
+                    name: p_name,
+                    value,
+                } => {
+                    database
+                        .parameters
+                        .insert(p_name.to_string(), value.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("ALTER DATABASE completed for '{}'.", name))
+    }
+
+    async fn create_aggregate(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            if state.aggregates.contains_key(&key) {
+                bail!("Aggregate '{}' already exists", key);
+            }
+            state.aggregates.insert(
+                key.clone(),
+                CatalogAggregate {
+                    database: database_name,
+                    schema: schema_name,
+                    name: name.to_string(),
+                    owner: session.user.clone(),
+                },
+            );
+        }
+        self.persist().await?;
+        Ok(format!("Aggregate '{}' created successfully.", key))
+    }
+
+    async fn alter_aggregate(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        operation: &AlterObjectOperation,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            let mut aggregate = state
+                .aggregates
+                .remove(&key)
+                .ok_or_else(|| anyhow::anyhow!("Aggregate '{}' not found", key))?;
+
+            match operation {
+                AlterObjectOperation::Rename { new_name } => {
+                    validate_identifier(new_name)?;
+                    aggregate.name = new_name.to_string();
+                }
+                AlterObjectOperation::OwnerTo { new_owner } => {
+                    if !state.users.contains_key(new_owner) {
+                        bail!("User '{}' does not exist", new_owner);
+                    }
+                    aggregate.owner = new_owner.to_string();
+                }
+                AlterObjectOperation::SetSchema { new_schema } => {
+                    validate_identifier(new_schema)?;
+                    let database = state.databases.get(&aggregate.database).ok_or_else(|| {
+                        anyhow::anyhow!("Database '{}' does not exist", aggregate.database)
+                    })?;
+                    if !database.schemas.contains(new_schema) {
+                        bail!(
+                            "Schema '{}.{}' does not exist",
+                            aggregate.database,
+                            new_schema
+                        );
+                    }
+                    aggregate.schema = new_schema.to_string();
+                }
+            }
+            let new_key = format!(
+                "{}.{}.{}",
+                aggregate.database, aggregate.schema, aggregate.name
+            );
+            if new_key != key && state.aggregates.contains_key(&new_key) {
+                state.aggregates.insert(key.clone(), aggregate);
+                bail!("Aggregate '{}' already exists", new_key);
+            }
+            state.aggregates.insert(new_key, aggregate);
+        }
+        self.persist().await?;
+        Ok(format!("ALTER AGGREGATE completed for '{}'.", key))
+    }
+
+    async fn create_collation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            if state.collations.contains_key(&key) {
+                bail!("Collation '{}' already exists", key);
+            }
+            state.collations.insert(
+                key.clone(),
+                CatalogCollation {
+                    database: database_name,
+                    schema: schema_name,
+                    name: name.to_string(),
+                },
+            );
+        }
+        self.persist().await?;
+        Ok(format!("Collation '{}' created successfully.", key))
+    }
+
+    async fn alter_collation(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        operation: &AlterObjectOperation,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            let mut collation = state
+                .collations
+                .remove(&key)
+                .ok_or_else(|| anyhow::anyhow!("Collation '{}' not found", key))?;
+            match operation {
+                AlterObjectOperation::Rename { new_name } => {
+                    validate_identifier(new_name)?;
+                    collation.name = new_name.to_string();
+                }
+                AlterObjectOperation::OwnerTo { .. } => {} // Collations don't have explicit owners in our model yet
+                AlterObjectOperation::SetSchema { new_schema } => {
+                    validate_identifier(new_schema)?;
+                    let database = state.databases.get(&collation.database).ok_or_else(|| {
+                        anyhow::anyhow!("Database '{}' does not exist", collation.database)
+                    })?;
+                    if !database.schemas.contains(new_schema) {
+                        bail!(
+                            "Schema '{}.{}' does not exist",
+                            collation.database,
+                            new_schema
+                        );
+                    }
+                    collation.schema = new_schema.to_string();
+                }
+            }
+            let new_key = format!(
+                "{}.{}.{}",
+                collation.database, collation.schema, collation.name
+            );
+            if new_key != key && state.collations.contains_key(&new_key) {
+                state.collations.insert(key.clone(), collation);
+                bail!("Collation '{}' already exists", new_key);
+            }
+            state.collations.insert(new_key, collation);
+        }
+        self.persist().await?;
+        Ok(format!("ALTER COLLATION completed for '{}'.", key))
+    }
+
+    async fn create_conversion(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+        {
+            let mut state = self.state.write().await;
+            state.conversions.insert(
+                key.clone(),
+                CatalogConversion {
+                    database: database_name,
+                    schema: schema_name,
+                    name: name.to_string(),
+                },
+            );
+        }
+        self.persist().await?;
+        Ok(format!("Conversion '{}' created successfully.", key))
+    }
+
+    async fn alter_conversion(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        operation: &AlterObjectOperation,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+        {
+            let mut state = self.state.write().await;
+            let mut conversion = state
+                .conversions
+                .remove(&key)
+                .ok_or_else(|| anyhow::anyhow!("Conversion '{}' not found", key))?;
+            match operation {
+                AlterObjectOperation::Rename { new_name } => conversion.name = new_name.to_string(),
+                AlterObjectOperation::OwnerTo { .. } => {}
+                AlterObjectOperation::SetSchema { new_schema } => {
+                    conversion.schema = new_schema.to_string()
+                }
+            }
+            let new_key = format!(
+                "{}.{}.{}",
+                conversion.database, conversion.schema, conversion.name
+            );
+            state.conversions.insert(new_key, conversion);
+        }
+        self.persist().await?;
+        Ok(format!("ALTER CONVERSION completed for '{}'.", key))
+    }
+
+    async fn create_function(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        or_replace: bool,
+        definition_sql: &str,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            if state.functions.contains_key(&key) && !or_replace {
+                bail!("Function '{}' already exists", key);
+            }
+            state.functions.insert(
+                key.clone(),
+                CatalogFunction {
+                    database: database_name,
+                    schema: schema_name,
+                    name: name.to_string(),
+                    owner: session.user.clone(),
+                    definition_sql: definition_sql.to_string(),
+                },
+            );
+        }
+        self.persist().await?;
+        Ok(format!("Function '{}' created successfully.", key))
+    }
+
+    async fn alter_function(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        operation: &AlterObjectOperation,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            let mut function = state
+                .functions
+                .remove(&key)
+                .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", key))?;
+
+            match operation {
+                AlterObjectOperation::Rename { new_name } => {
+                    validate_identifier(new_name)?;
+                    function.name = new_name.to_string();
+                }
+                AlterObjectOperation::OwnerTo { new_owner } => {
+                    if !state.users.contains_key(new_owner) {
+                        bail!("User '{}' does not exist", new_owner);
+                    }
+                    function.owner = new_owner.to_string();
+                }
+                AlterObjectOperation::SetSchema { new_schema } => {
+                    validate_identifier(new_schema)?;
+                    let database = state.databases.get(&function.database).ok_or_else(|| {
+                        anyhow::anyhow!("Database '{}' does not exist", function.database)
+                    })?;
+                    if !database.schemas.contains(new_schema) {
+                        bail!(
+                            "Schema '{}.{}' does not exist",
+                            function.database,
+                            new_schema
+                        );
+                    }
+                    function.schema = new_schema.to_string();
+                }
+            }
+            let new_key = format!(
+                "{}.{}.{}",
+                function.database, function.schema, function.name
+            );
+            if new_key != key && state.functions.contains_key(&new_key) {
+                state.functions.insert(key.clone(), function);
+                bail!("Function '{}' already exists", new_key);
+            }
+            state.functions.insert(new_key, function);
+        }
+        self.persist().await?;
+        Ok(format!("ALTER FUNCTION completed for '{}'.", key))
+    }
+
+    async fn drop_function(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        if_exists: bool,
+        _cascade: bool,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = format!("{}.{}.{}", database_name, schema_name, name);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+            if state.functions.remove(&key).is_none() {
+                if if_exists {
+                    return Ok(format!("Function '{}' does not exist, skipping.", key));
+                } else {
+                    bail!("Function '{}' does not exist", key);
+                }
+            }
+        }
+        self.persist().await?;
+        Ok(format!("Function '{}' dropped successfully.", key))
     }
 
     async fn create_schema(
@@ -626,6 +1402,20 @@ impl ControlPlane {
         Ok(database.schemas.iter().cloned().collect())
     }
 
+    pub async fn list_all_relations(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<CatalogRelation>> {
+        let state = self.state.read().await;
+        self._validate_session(&state, session)?;
+        Ok(state
+            .relations
+            .values()
+            .filter(|rel| rel.database == session.database)
+            .cloned()
+            .collect())
+    }
+
     pub async fn list_relations(
         &self,
         session: &SessionContext,
@@ -642,7 +1432,9 @@ impl ControlPlane {
         Ok(state
             .relations
             .values()
-            .filter(|rel| rel.kind == kind && rel.database == database_name && rel.schema == schema_name)
+            .filter(|rel| {
+                rel.kind == kind && rel.database == database_name && rel.schema == schema_name
+            })
             .cloned()
             .collect())
     }
@@ -914,17 +1706,32 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
 
             let relation_key = relation_key(database_name, schema_name, table_name);
-            let relation = state
-                .relations
-                .get_mut(&relation_key)
-                .ok_or_else(|| anyhow::anyhow!("Table '{}.{}.{}' not found", database_name, schema_name, table_name))?;
+            let relation = state.relations.get_mut(&relation_key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table '{}.{}.{}' not found",
+                    database_name,
+                    schema_name,
+                    table_name
+                )
+            })?;
 
             if relation.kind != CatalogRelationKind::Table {
-                bail!("Relation '{}.{}.{}' is not a table", database_name, schema_name, table_name);
+                bail!(
+                    "Relation '{}.{}.{}' is not a table",
+                    database_name,
+                    schema_name,
+                    table_name
+                );
             }
 
             if relation.columns.iter().any(|c| c.name == column.name) {
-                bail!("Column '{}' already exists in table '{}.{}.{}'", column.name, database_name, schema_name, table_name);
+                bail!(
+                    "Column '{}' already exists in table '{}.{}.{}'",
+                    column.name,
+                    database_name,
+                    schema_name,
+                    table_name
+                );
             }
 
             relation.columns.push(column);
@@ -957,11 +1764,21 @@ impl ControlPlane {
             let new_key = relation_key(database_name, schema_name, new_name);
 
             if !state.relations.contains_key(&old_key) {
-                bail!("Relation '{}.{}.{}' not found", database_name, schema_name, name);
+                bail!(
+                    "Relation '{}.{}.{}' not found",
+                    database_name,
+                    schema_name,
+                    name
+                );
             }
 
             if state.relations.contains_key(&new_key) {
-                bail!("Relation '{}.{}.{}' already exists", database_name, schema_name, new_name);
+                bail!(
+                    "Relation '{}.{}.{}' already exists",
+                    database_name,
+                    schema_name,
+                    new_name
+                );
             }
 
             let mut relation = state.relations.remove(&old_key).unwrap();
@@ -1029,10 +1846,10 @@ impl ControlPlane {
                 let mut relation = state.relations.remove(&old_key).unwrap();
                 relation.schema = new_name.to_string();
                 let new_key = format!("{}{}", new_prefix, relation.name);
-                
+
                 // If it's a managed table, we might need to update the storage path too.
                 // But let's handle that in the engine for now or keep it simple.
-                
+
                 state.relations.insert(new_key, relation);
             }
         }
@@ -1060,10 +1877,14 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
 
             let key = relation_key(database_name, schema_name, name);
-            let relation = state
-                .relations
-                .get_mut(&key)
-                .ok_or_else(|| anyhow::anyhow!("Relation '{}.{}.{}' not found", database_name, schema_name, name))?;
+            let relation = state.relations.get_mut(&key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Relation '{}.{}.{}' not found",
+                    database_name,
+                    schema_name,
+                    name
+                )
+            })?;
 
             relation.storage_path = Some(new_storage_path.to_string());
         }
@@ -1153,18 +1974,39 @@ impl ControlPlane {
             let key = relation_key(database_name, schema_name, name);
             if let Some(rel) = state.relations.get(&key) {
                 if rel.kind != kind {
-                    bail!("Relation '{}' is a {}, not a {:?}", key, if rel.kind == CatalogRelationKind::Table { "table" } else { "view" }, kind);
+                    bail!(
+                        "Relation '{}' is a {}, not a {:?}",
+                        key,
+                        if rel.kind == CatalogRelationKind::Table {
+                            "table"
+                        } else {
+                            "view"
+                        },
+                        kind
+                    );
                 }
                 state.relations.remove(&key);
             } else {
                 if if_exists {
                     return Ok(format!(
                         "{} '{}' does not exist, skipping.",
-                        if kind == CatalogRelationKind::Table { "Table" } else { "View" },
+                        if kind == CatalogRelationKind::Table {
+                            "Table"
+                        } else {
+                            "View"
+                        },
                         key
                     ));
                 } else {
-                    bail!("{} '{}' not found", if kind == CatalogRelationKind::Table { "Table" } else { "View" }, key);
+                    bail!(
+                        "{} '{}' not found",
+                        if kind == CatalogRelationKind::Table {
+                            "Table"
+                        } else {
+                            "View"
+                        },
+                        key
+                    );
                 }
             }
         }
@@ -1172,7 +2014,11 @@ impl ControlPlane {
         self.persist().await?;
         Ok(format!(
             "{} '{}.{}.{}' dropped successfully.",
-            if kind == CatalogRelationKind::Table { "Table" } else { "View" },
+            if kind == CatalogRelationKind::Table {
+                "Table"
+            } else {
+                "View"
+            },
             database_name,
             schema_name,
             name
@@ -1201,7 +2047,9 @@ impl ControlPlane {
 
             if let Some(_db) = state.databases.remove(name) {
                 // Cascade: Remove all relations belonging to this database
-                state.relations.retain(|key, _| !key.starts_with(&format!("{name}.")));
+                state
+                    .relations
+                    .retain(|key, _| !key.starts_with(&format!("{name}.")));
             } else {
                 if if_exists {
                     return Ok(format!("Database '{}' does not exist, skipping.", name));
@@ -1239,11 +2087,14 @@ impl ControlPlane {
                     .databases
                     .get(database_name)
                     .ok_or_else(|| anyhow::anyhow!("Unknown database '{}'", database_name))?;
-                
+
                 let exists = db.schemas.contains(name);
                 let has_rels = if exists {
                     let schema_prefix = format!("{database_name}.{name}.");
-                    state.relations.keys().any(|k| k.starts_with(&schema_prefix))
+                    state
+                        .relations
+                        .keys()
+                        .any(|k| k.starts_with(&schema_prefix))
                 } else {
                     false
                 };
@@ -1252,17 +2103,26 @@ impl ControlPlane {
 
             if schema_exists {
                 if has_relations && !cascade {
-                    bail!("Schema '{}.{}' is not empty and CASCADE was not specified", database_name, name);
+                    bail!(
+                        "Schema '{}.{}' is not empty and CASCADE was not specified",
+                        database_name,
+                        name
+                    );
                 }
 
                 // Remove schema and its relations
                 let db = state.databases.get_mut(database_name).unwrap();
                 db.schemas.remove(name);
                 let schema_prefix = format!("{database_name}.{name}.");
-                state.relations.retain(|key, _| !key.starts_with(&schema_prefix));
+                state
+                    .relations
+                    .retain(|key, _| !key.starts_with(&schema_prefix));
             } else {
                 if if_exists {
-                    return Ok(format!("Schema '{}.{}' does not exist, skipping.", database_name, name));
+                    return Ok(format!(
+                        "Schema '{}.{}' does not exist, skipping.",
+                        database_name, name
+                    ));
                 } else {
                     bail!("Schema '{}.{}' not found", database_name, name);
                 }
@@ -1270,10 +2130,18 @@ impl ControlPlane {
         }
 
         self.persist().await?;
-        Ok(format!("Schema '{}.{}' dropped successfully.", database_name, name))
+        Ok(format!(
+            "Schema '{}.{}' dropped successfully.",
+            database_name, name
+        ))
     }
 
     async fn persist(&self) -> Result<()> {
+        let state = self.state.read().await;
+        self.persist_state(&state).await
+    }
+
+    async fn persist_state(&self, state: &CatalogState) -> Result<()> {
         let Some(path) = &self.catalog_path else {
             return Ok(());
         };
@@ -1282,10 +2150,8 @@ impl ControlPlane {
             fs::create_dir_all(parent).await?;
         }
 
-        let state = self.state.read().await.clone();
-        let raw = serde_json::to_string_pretty(&state)?;
+        let raw = serde_json::to_string_pretty(state)?;
         fs::write(path, raw).await?;
-
         Ok(())
     }
 
@@ -1337,9 +2203,8 @@ impl ControlPlane {
             .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
 
         if let Some(expected) = &catalog_user.password {
-            let provided = password.ok_or_else(|| {
-                anyhow::anyhow!("Password required for user '{}'", user)
-            })?;
+            let provided =
+                password.ok_or_else(|| anyhow::anyhow!("Password required for user '{}'", user))?;
             if provided != expected {
                 bail!("Invalid credentials for user '{}'", user);
             }
@@ -1362,7 +2227,10 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
 
             if !state.users.get(&session.user).unwrap().is_admin {
-                bail!("User '{}' is not allowed to rotate credentials", session.user);
+                bail!(
+                    "User '{}' is not allowed to rotate credentials",
+                    session.user
+                );
             }
 
             let user = state
@@ -1376,7 +2244,10 @@ impl ControlPlane {
         }
 
         self.persist().await?;
-        Ok(format!("Password for user '{}' rotated successfully.", user_name))
+        Ok(format!(
+            "Password for user '{}' rotated successfully.",
+            user_name
+        ))
     }
 }
 
@@ -1387,6 +2258,8 @@ fn bootstrap_state() -> CatalogState {
         CatalogDatabase {
             name: "postgres".to_string(),
             schemas: BTreeSet::from(["public".to_string()]),
+            owner: "postgres".to_string(),
+            parameters: BTreeMap::new(),
         },
     );
 
@@ -1425,11 +2298,25 @@ fn bootstrap_state() -> CatalogState {
     let nodes = BTreeMap::new();
     let relations = BTreeMap::new();
 
+    let config = Some(ClusterConfig {
+        base_postgres_port: 5432,
+        base_flight_sql_port: 50051,
+        catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+        tls_cert_path: None,
+        tls_key_path: None,
+        next_available_port_offset: 0,
+    });
+
     CatalogState {
         databases,
         users,
         nodes,
         relations,
+        aggregates: BTreeMap::new(),
+        collations: BTreeMap::new(),
+        conversions: BTreeMap::new(),
+        functions: BTreeMap::new(),
+        config,
     }
 }
 
@@ -1556,10 +2443,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 }
                 _ => return None,
             };
-            Some(MetadataStatement::CreateSchema {
-                database: db,
-                name,
-            })
+            Some(MetadataStatement::CreateSchema { database: db, name })
         }
         sqlparser::ast::Statement::CreateTable(create_table) => {
             let name = &create_table.name;
@@ -1631,7 +2515,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         });
                     }
                     sqlparser::ast::TableConstraint::Unique(u) => {
-                         constraints.push(TableConstraintDefinition::Unique {
+                        constraints.push(TableConstraintDefinition::Unique {
                             name: u.name.as_ref().map(|i| i.to_string()),
                             columns: u.columns.iter().map(|c| c.to_string()).collect(),
                         });
@@ -1646,6 +2530,23 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 name: table_name,
                 columns,
                 constraints,
+            })
+        }
+        sqlparser::ast::Statement::CreateFunction(create_func) => {
+            let idents: Vec<String> = create_func.name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, func_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            Some(MetadataStatement::CreateFunction {
+                database,
+                schema,
+                name: func_name,
+                or_replace: create_func.or_replace,
+                definition_sql: sql.to_string(),
             })
         }
         sqlparser::ast::Statement::Insert(insert) => {
@@ -1695,12 +2596,10 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         }
         sqlparser::ast::Statement::Delete(delete) => {
             let table_name_obj = match &delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(v) => {
-                    match &v[0].relation {
-                        sqlparser::ast::TableFactor::Table { name, .. } => name,
-                        _ => return None,
-                    }
-                }
+                sqlparser::ast::FromTable::WithFromKeyword(v) => match &v[0].relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => name,
+                    _ => return None,
+                },
                 _ => return None,
             };
             let idents: Vec<String> = table_name_obj.0.iter().map(|i| i.to_string()).collect();
@@ -1751,9 +2650,12 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
             let mut result_assignments = Vec::new();
             for assignment in &update.assignments {
                 let col = match &assignment.target {
-                    sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                        name.0.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
-                    }
+                    sqlparser::ast::AssignmentTarget::ColumnName(name) => name
+                        .0
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join("."),
                     _ => return None, // Unsupported assignment target (e.g. Tuple)
                 };
                 result_assignments.push((col, assignment.value.to_string()));
@@ -1801,9 +2703,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         database,
                         schema,
                         name: table_name,
-                        operation: AlterTableOperation::RenameTable {
-                            new_name,
-                        },
+                        operation: AlterTableOperation::RenameTable { new_name },
                     })
                 }
                 _ => None,
@@ -1841,7 +2741,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
         } => {
             let name = &names[0];
             let idents: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
-            
+
             match object_type {
                 sqlparser::ast::ObjectType::Table => {
                     let (database, schema, obj_name) = match idents.as_slice() {
@@ -1902,8 +2802,110 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 _ => None,
             }
         }
+        sqlparser::ast::Statement::DropFunction(drop_func) => {
+            // Note: We only support dropping one function at a time for now
+            let desc = drop_func.func_desc.first()?;
+            let idents: Vec<String> = desc.name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, func_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            Some(MetadataStatement::DropFunction {
+                database,
+                schema,
+                name: func_name,
+                if_exists: drop_func.if_exists,
+                cascade: matches!(
+                    drop_func.drop_behavior,
+                    Some(sqlparser::ast::DropBehavior::Cascade)
+                ),
+            })
+        }
         _ => parse_metadata_statement_fallback(sql),
     }
+}
+
+fn parse_alter_database_remainder(remainder: &str) -> Option<(String, AlterDatabaseOperation)> {
+    let tokens: Vec<&str> = remainder.split_whitespace().collect();
+    if tokens.len() < 4 {
+        return None;
+    }
+
+    let name = tokens[0].to_string();
+    let op_upper = tokens[1].to_ascii_uppercase();
+
+    if op_upper == "RENAME" && tokens[2].eq_ignore_ascii_case("TO") {
+        return Some((
+            name,
+            AlterDatabaseOperation::Rename {
+                new_name: tokens[3].to_string(),
+            },
+        ));
+    }
+    if op_upper == "OWNER" && tokens[2].eq_ignore_ascii_case("TO") {
+        return Some((
+            name,
+            AlterDatabaseOperation::OwnerTo {
+                new_owner: tokens[3].to_string(),
+            },
+        ));
+    }
+    if op_upper == "SET" {
+        // SET name = value OR SET name TO value
+        let param_name = tokens[2].to_string();
+        let value =
+            if tokens.len() >= 5 && (tokens[3] == "=" || tokens[3].eq_ignore_ascii_case("TO")) {
+                tokens[4..].join(" ")
+            } else {
+                tokens[3..].join(" ")
+            };
+        return Some((
+            name,
+            AlterDatabaseOperation::SetParam {
+                name: param_name,
+                value,
+            },
+        ));
+    }
+
+    None
+}
+
+fn parse_alter_object_remainder(
+    remainder: &str,
+) -> Option<(Option<String>, Option<String>, String, AlterObjectOperation)> {
+    let upper = remainder.to_ascii_uppercase();
+
+    let (name_part, op_part) = if let Some(idx) = upper.find(" RENAME TO ") {
+        (&remainder[..idx], &remainder[idx..])
+    } else if let Some(idx) = upper.find(" OWNER TO ") {
+        (&remainder[..idx], &remainder[idx..])
+    } else if let Some(idx) = upper.find(" SET SCHEMA ") {
+        (&remainder[..idx], &remainder[idx..])
+    } else {
+        return None;
+    };
+
+    let (database, schema, name) = parse_qualified_name(name_part.trim(), None, None).ok()?;
+    let op_tokens: Vec<&str> = op_part.split_whitespace().collect();
+
+    let operation = match op_tokens[0].to_ascii_uppercase().as_str() {
+        "RENAME" => AlterObjectOperation::Rename {
+            new_name: op_tokens[2].to_string(),
+        },
+        "OWNER" => AlterObjectOperation::OwnerTo {
+            new_owner: op_tokens[2].to_string(),
+        },
+        "SET" => AlterObjectOperation::SetSchema {
+            new_schema: op_tokens[2].to_string(),
+        },
+        _ => return None,
+    };
+
+    Some((database, schema, name, operation))
 }
 
 fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
@@ -1921,8 +2923,120 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
     if upper == "COMMIT" || upper == "END" || upper == "END TRANSACTION" {
         return Some(MetadataStatement::Commit);
     }
-    if upper == "ROLLBACK" || upper == "ABORT" {
+    if upper == "ROLLBACK"
+        || upper == "ABORT"
+        || upper == "ABORT WORK"
+        || upper == "ABORT TRANSACTION"
+    {
         return Some(MetadataStatement::Rollback);
+    }
+
+    if upper.starts_with("CREATE AGGREGATE ") {
+        let (database, schema, name) =
+            parse_qualified_name(trimmed["CREATE AGGREGATE ".len()..].trim(), None, None).ok()?;
+        return Some(MetadataStatement::CreateAggregate {
+            database,
+            schema,
+            name,
+        });
+    }
+    if upper.starts_with("CREATE COLLATION ") {
+        let (database, schema, name) =
+            parse_qualified_name(trimmed["CREATE COLLATION ".len()..].trim(), None, None).ok()?;
+        return Some(MetadataStatement::CreateCollation {
+            database,
+            schema,
+            name,
+        });
+    }
+    if upper.starts_with("CREATE CONVERSION ") {
+        let (database, schema, name) =
+            parse_qualified_name(trimmed["CREATE CONVERSION ".len()..].trim(), None, None).ok()?;
+        return Some(MetadataStatement::CreateConversion {
+            database,
+            schema,
+            name,
+        });
+    }
+
+    if upper.starts_with("ALTER AGGREGATE ") {
+        let remainder = trimmed["ALTER AGGREGATE ".len()..].trim();
+        let (database, schema, name, op) = parse_alter_object_remainder(remainder)?;
+        return Some(MetadataStatement::AlterAggregate {
+            database,
+            schema,
+            name,
+            operation: op,
+        });
+    }
+    if upper.starts_with("ALTER COLLATION ") {
+        let remainder = trimmed["ALTER COLLATION ".len()..].trim();
+        let (database, schema, name, op) = parse_alter_object_remainder(remainder)?;
+        return Some(MetadataStatement::AlterCollation {
+            database,
+            schema,
+            name,
+            operation: op,
+        });
+    }
+    if upper.starts_with("ALTER CONVERSION ") {
+        let remainder = trimmed["ALTER CONVERSION ".len()..].trim();
+        let (database, schema, name, op) = parse_alter_object_remainder(remainder)?;
+        return Some(MetadataStatement::AlterConversion {
+            database,
+            schema,
+            name,
+            operation: op,
+        });
+    }
+    if upper.starts_with("ALTER FUNCTION ") {
+        let remainder = trimmed["ALTER FUNCTION ".len()..].trim();
+        let (database, schema, name, op) = parse_alter_object_remainder(remainder)?;
+        return Some(MetadataStatement::AlterFunction {
+            database,
+            schema,
+            name,
+            operation: op,
+        });
+    }
+
+    if upper.starts_with("ALTER DATABASE ") {
+        let remainder = trimmed["ALTER DATABASE ".len()..].trim();
+        let (name, operation) = parse_alter_database_remainder(remainder)?;
+        return Some(MetadataStatement::AlterDatabase { name, operation });
+    }
+
+    if upper.starts_with("DROP FUNCTION ") {
+        let mut cascade = false;
+        let mut target_sql = trimmed;
+        if upper.ends_with(" CASCADE") {
+            cascade = true;
+            target_sql = &trimmed[..trimmed.len() - " CASCADE".len()].trim();
+        } else if upper.ends_with(" RESTRICT") {
+            target_sql = &trimmed[..trimmed.len() - " RESTRICT".len()].trim();
+        }
+
+        let upper_target = target_sql.to_ascii_uppercase();
+        let (database, schema, name, if_exists) = if upper_target.contains(" IF EXISTS ") {
+            let name_remainder = if upper_target.starts_with("DROP FUNCTION IF EXISTS ") {
+                &target_sql["DROP FUNCTION IF EXISTS ".len()..]
+            } else {
+                &target_sql["DROP FUNCTION ".len()..].replace("IF EXISTS ", "")
+            };
+            let (db, sch, n) = parse_qualified_name(name_remainder.trim(), None, None).ok()?;
+            (db, sch, n, true)
+        } else {
+            let name_remainder = &target_sql["DROP FUNCTION ".len()..];
+            let (db, sch, n) = parse_qualified_name(name_remainder.trim(), None, None).ok()?;
+            (db, sch, n, false)
+        };
+        return Some(MetadataStatement::DropFunction {
+            database,
+            schema,
+            name,
+            if_exists,
+            cascade,
+        });
     }
 
     if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.SCHEMATA") {
@@ -2209,7 +3323,7 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         return Some(MetadataStatement::ShowColumns {
             database,
             schema,
-            name,
+            table: name,
         });
     }
 
@@ -2220,7 +3334,7 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         return Some(MetadataStatement::ShowColumns {
             database,
             schema,
-            name,
+            table: name,
         });
     }
 
@@ -2361,16 +3475,10 @@ fn parse_table_constraint_definition(raw: &str) -> Result<Option<TableConstraint
 
         let ref_remainder = after_columns["REFERENCES ".len()..].trim();
         let open_ref = ref_remainder.find('(').ok_or_else(|| {
-            anyhow::anyhow!(
-                "FOREIGN KEY REFERENCES requires column list in '{}'.",
-                raw
-            )
+            anyhow::anyhow!("FOREIGN KEY REFERENCES requires column list in '{}'.", raw)
         })?;
         let close_ref = ref_remainder.rfind(')').ok_or_else(|| {
-            anyhow::anyhow!(
-                "FOREIGN KEY REFERENCES requires closing ')' in '{}'.",
-                raw
-            )
+            anyhow::anyhow!("FOREIGN KEY REFERENCES requires closing ')' in '{}'.", raw)
         })?;
 
         let raw_table = ref_remainder[..open_ref].trim();

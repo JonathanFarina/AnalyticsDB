@@ -8,6 +8,13 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Idle,
+    InTransaction,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionContext {
     pub user: String,
     pub role: String,
@@ -15,6 +22,12 @@ pub struct SessionContext {
     pub schema: String,
     pub auth_method: String,
     pub protocol: Protocol,
+    #[serde(default = "default_transaction_status")]
+    pub transaction_status: TransactionStatus,
+}
+
+fn default_transaction_status() -> TransactionStatus {
+    TransactionStatus::Idle
 }
 
 impl Default for SessionContext {
@@ -26,6 +39,7 @@ impl Default for SessionContext {
             schema: "public".to_string(),
             auth_method: "embedded-prototype".to_string(),
             protocol: Protocol::Embedded,
+            transaction_status: TransactionStatus::Idle,
         }
     }
 }
@@ -51,4 +65,10 @@ impl QueryResponse {
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StatementOutcome {
+    Rows,
+    Command { tag: String, rows_affected: u64 },
 }

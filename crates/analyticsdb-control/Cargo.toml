@@ -8,8 +8,13 @@ version.workspace = true
 [dependencies]
 analyticsdb-core = { path = "../analyticsdb-core" }
 anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+openraft.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
-tokio = { workspace = true, features = ["sync", "fs"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt"] }
+tonic.workspace = true
 uuid.workspace = true

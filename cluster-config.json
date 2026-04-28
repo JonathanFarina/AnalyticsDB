@@ -1,0 +1,8 @@
+{
+   "base_postgres_port": 5432,
+   "base_flight_sql_port": 50051,
+   "catalog_path": "cluster-catalog.json",
+   "tls_cert_path": "certs/server.crt",
+   "tls_key_path": "certs/server.key",
+   "next_available_port_offset": 0
+}

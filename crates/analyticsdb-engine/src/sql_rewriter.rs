@@ -70,7 +70,8 @@ fn rewrite_query_recursive<'a>(
             match &mut order_by.kind {
                 sqlparser::ast::OrderByKind::Expressions(exprs) => {
                     for order_by_expr in exprs {
-                        rewrite_expr_recursive(&mut order_by_expr.expr, control_plane, session).await?;
+                        rewrite_expr_recursive(&mut order_by_expr.expr, control_plane, session)
+                            .await?;
                     }
                 }
                 _ => {}
@@ -79,12 +80,17 @@ fn rewrite_query_recursive<'a>(
 
         if let Some(limit_clause) = &mut query.limit_clause {
             match limit_clause {
-                sqlparser::ast::LimitClause::LimitOffset { limit, offset, limit_by } => {
+                sqlparser::ast::LimitClause::LimitOffset {
+                    limit,
+                    offset,
+                    limit_by,
+                } => {
                     if let Some(limit_expr) = limit {
                         rewrite_expr_recursive(limit_expr, control_plane, session).await?;
                     }
                     if let Some(offset_struct) = offset {
-                        rewrite_expr_recursive(&mut offset_struct.value, control_plane, session).await?;
+                        rewrite_expr_recursive(&mut offset_struct.value, control_plane, session)
+                            .await?;
                     }
                     for e in limit_by {
                         rewrite_expr_recursive(e, control_plane, session).await?;
@@ -108,7 +114,9 @@ fn rewrite_set_expr_recursive<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         match set_expr {
-            SetExpr::Select(select) => rewrite_select_recursive(select, control_plane, session).await,
+            SetExpr::Select(select) => {
+                rewrite_select_recursive(select, control_plane, session).await
+            }
             SetExpr::Query(query) => rewrite_query_recursive(query, control_plane, session).await,
             SetExpr::SetOperation { left, right, .. } => {
                 rewrite_set_expr_recursive(left, control_plane, session).await?;
@@ -179,19 +187,19 @@ fn rewrite_select_recursive<'a>(
                 }
                 SelectItem::QualifiedWildcard(kind, _) => {
                     let alias = match kind {
-                        SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                            name.0.last().map(|i| i.to_string()).unwrap_or_else(|| kind.to_string())
-                        }
+                        SelectItemQualifiedWildcardKind::ObjectName(name) => name
+                            .0
+                            .last()
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| kind.to_string()),
                         SelectItemQualifiedWildcardKind::Expr(expr) => expr.to_string(),
                     };
 
                     if let Some(columns) = table_schemas.get(&alias) {
                         for col in columns {
-                            new_projection
-                                .push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
-                                    Ident::new(alias.clone()),
-                                    Ident::new(col.clone()),
-                                ])));
+                            new_projection.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(
+                                vec![Ident::new(alias.clone()), Ident::new(col.clone())],
+                            )));
                         }
                     } else {
                         new_projection.push(item.clone());
@@ -276,8 +284,11 @@ fn resolve_table_schemas_recursive<'a>(
                     return Ok(());
                 }
 
-                let idents: Vec<String> =
-                    name.0.iter().map(|i| i.to_string().to_lowercase()).collect();
+                let idents: Vec<String> = name
+                    .0
+                    .iter()
+                    .map(|i| i.to_string().to_lowercase())
+                    .collect();
                 let effective_alias = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -293,58 +304,246 @@ fn resolve_table_schemas_recursive<'a>(
                             ObjectNamePart::Identifier(Ident::new(n.clone())),
                         ]);
                         Some(n.as_str())
-                    },
+                    }
                     _ => None,
                 };
 
                 if let Some(lower_n) = matched_pg_catalog {
                     match lower_n {
                         "pg_database" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "datname".to_string(), "datdba".to_string(), "encoding".to_string(), "datcollate".to_string(), "datctype".to_string(), "datistemplate".to_string(), "datallowconn".to_string(), "datconnlimit".to_string(), "datlastsysoid".to_string(), "datfrozenxid".to_string(), "datminmxid".to_string(), "dattablespace".to_string(), "datacl".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "datname".to_string(),
+                                    "datdba".to_string(),
+                                    "encoding".to_string(),
+                                    "datcollate".to_string(),
+                                    "datctype".to_string(),
+                                    "datistemplate".to_string(),
+                                    "datallowconn".to_string(),
+                                    "datconnlimit".to_string(),
+                                    "datlastsysoid".to_string(),
+                                    "datfrozenxid".to_string(),
+                                    "datminmxid".to_string(),
+                                    "dattablespace".to_string(),
+                                    "datacl".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_namespace" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "nspname".to_string(), "nspowner".to_string(), "nspacl".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "nspname".to_string(),
+                                    "nspowner".to_string(),
+                                    "nspacl".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_tables" => {
-                            schemas.insert(effective_alias, vec!["schemaname".to_string(), "tablename".to_string(), "tableowner".to_string(), "tablespace".to_string(), "hasindexes".to_string(), "hasrules".to_string(), "hastriggers".to_string(), "rowsecurity".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "schemaname".to_string(),
+                                    "tablename".to_string(),
+                                    "tableowner".to_string(),
+                                    "tablespace".to_string(),
+                                    "hasindexes".to_string(),
+                                    "hasrules".to_string(),
+                                    "hastriggers".to_string(),
+                                    "rowsecurity".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_views" => {
-                            schemas.insert(effective_alias, vec!["schemaname".to_string(), "viewname".to_string(), "viewowner".to_string(), "definition".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "schemaname".to_string(),
+                                    "viewname".to_string(),
+                                    "viewowner".to_string(),
+                                    "definition".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_roles" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "rolname".to_string(), "rolsuper".to_string(), "rolinherit".to_string(), "rolcreaterole".to_string(), "rolcreatedb".to_string(), "rolcanlogin".to_string(), "rolreplication".to_string(), "rolbypassrls".to_string(), "rolconnlimit".to_string(), "rolpassword".to_string(), "rolvaliduntil".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "rolname".to_string(),
+                                    "rolsuper".to_string(),
+                                    "rolinherit".to_string(),
+                                    "rolcreaterole".to_string(),
+                                    "rolcreatedb".to_string(),
+                                    "rolcanlogin".to_string(),
+                                    "rolreplication".to_string(),
+                                    "rolbypassrls".to_string(),
+                                    "rolconnlimit".to_string(),
+                                    "rolpassword".to_string(),
+                                    "rolvaliduntil".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_type" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "typname".to_string(), "typnamespace".to_string(), "typowner".to_string(), "typlen".to_string(), "typbyval".to_string(), "typtype".to_string(), "typcategory".to_string(), "typispreferred".to_string(), "typisdefined".to_string(), "typdelim".to_string(), "typrelid".to_string(), "typelem".to_string(), "typarray".to_string(), "typinput".to_string(), "typbasetype".to_string(), "typtypmod".to_string(), "typndims".to_string(), "typcollation".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "typname".to_string(),
+                                    "typnamespace".to_string(),
+                                    "typowner".to_string(),
+                                    "typlen".to_string(),
+                                    "typbyval".to_string(),
+                                    "typtype".to_string(),
+                                    "typcategory".to_string(),
+                                    "typispreferred".to_string(),
+                                    "typisdefined".to_string(),
+                                    "typdelim".to_string(),
+                                    "typrelid".to_string(),
+                                    "typelem".to_string(),
+                                    "typarray".to_string(),
+                                    "typinput".to_string(),
+                                    "typbasetype".to_string(),
+                                    "typtypmod".to_string(),
+                                    "typndims".to_string(),
+                                    "typcollation".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_class" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "relname".to_string(), "relnamespace".to_string(), "reltype".to_string(), "reloftype".to_string(), "relowner".to_string(), "relam".to_string(), "relfilenode".to_string(), "reltablespace".to_string(), "relpages".to_string(), "reltuples".to_string(), "relallvisible".to_string(), "reltoastrelid".to_string(), "relhasindex".to_string(), "relisshared".to_string(), "relpersistence".to_string(), "relkind".to_string(), "relnatts".to_string(), "relchecks".to_string(), "relhasrules".to_string(), "relhastriggers".to_string(), "relhassubclass".to_string(), "relrowsecurity".to_string(), "relforcerowsecurity".to_string(), "relispartition".to_string(), "relrewrite".to_string(), "relfrozenxid".to_string(), "relminmxid".to_string(), "relacl".to_string(), "reloptions".to_string(), "relpartbound".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "relname".to_string(),
+                                    "relnamespace".to_string(),
+                                    "reltype".to_string(),
+                                    "reloftype".to_string(),
+                                    "relowner".to_string(),
+                                    "relam".to_string(),
+                                    "relfilenode".to_string(),
+                                    "reltablespace".to_string(),
+                                    "relpages".to_string(),
+                                    "reltuples".to_string(),
+                                    "relallvisible".to_string(),
+                                    "reltoastrelid".to_string(),
+                                    "relhasindex".to_string(),
+                                    "relisshared".to_string(),
+                                    "relpersistence".to_string(),
+                                    "relkind".to_string(),
+                                    "relnatts".to_string(),
+                                    "relchecks".to_string(),
+                                    "relhasrules".to_string(),
+                                    "relhastriggers".to_string(),
+                                    "relhassubclass".to_string(),
+                                    "relrowsecurity".to_string(),
+                                    "relforcerowsecurity".to_string(),
+                                    "relispartition".to_string(),
+                                    "relrewrite".to_string(),
+                                    "relfrozenxid".to_string(),
+                                    "relminmxid".to_string(),
+                                    "relacl".to_string(),
+                                    "reloptions".to_string(),
+                                    "relpartbound".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_attribute" => {
-                            schemas.insert(effective_alias, vec!["attrelid".to_string(), "attname".to_string(), "atttypid".to_string(), "attnum".to_string(), "attnotnull".to_string(), "atttypmod".to_string(), "attndims".to_string(), "atthasdef".to_string(), "attidentity".to_string(), "attgenerated".to_string(), "attisdropped".to_string(), "attislocal".to_string(), "attinhcount".to_string(), "attcollation".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "attrelid".to_string(),
+                                    "attname".to_string(),
+                                    "atttypid".to_string(),
+                                    "attnum".to_string(),
+                                    "attnotnull".to_string(),
+                                    "atttypmod".to_string(),
+                                    "attndims".to_string(),
+                                    "atthasdef".to_string(),
+                                    "attidentity".to_string(),
+                                    "attgenerated".to_string(),
+                                    "attisdropped".to_string(),
+                                    "attislocal".to_string(),
+                                    "attinhcount".to_string(),
+                                    "attcollation".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_description" => {
-                            schemas.insert(effective_alias, vec!["objoid".to_string(), "classoid".to_string(), "objsubid".to_string(), "description".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "objoid".to_string(),
+                                    "classoid".to_string(),
+                                    "objsubid".to_string(),
+                                    "description".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_attrdef" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "adrelid".to_string(), "adnum".to_string(), "adbin".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "adrelid".to_string(),
+                                    "adnum".to_string(),
+                                    "adbin".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_depend" => {
-                            schemas.insert(effective_alias, vec!["classid".to_string(), "objid".to_string(), "objsubid".to_string(), "refclassid".to_string(), "refobjid".to_string(), "refobjsubid".to_string(), "deptype".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "classid".to_string(),
+                                    "objid".to_string(),
+                                    "objsubid".to_string(),
+                                    "refclassid".to_string(),
+                                    "refobjid".to_string(),
+                                    "refobjsubid".to_string(),
+                                    "deptype".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         "pg_constraint" => {
-                            schemas.insert(effective_alias, vec!["oid".to_string(), "conname".to_string(), "connamespace".to_string(), "contype".to_string(), "condeferrable".to_string(), "condeferred".to_string(), "convalidated".to_string(), "conrelid".to_string(), "contypid".to_string(), "conindid".to_string(), "confrelid".to_string(), "confupdtype".to_string(), "confdeltype".to_string(), "confmatchtype".to_string(), "conislocal".to_string(), "coninhcount".to_string(), "connoinherit".to_string(), "conkey".to_string(), "confkey".to_string()]);
+                            schemas.insert(
+                                effective_alias,
+                                vec![
+                                    "oid".to_string(),
+                                    "conname".to_string(),
+                                    "connamespace".to_string(),
+                                    "contype".to_string(),
+                                    "condeferrable".to_string(),
+                                    "condeferred".to_string(),
+                                    "convalidated".to_string(),
+                                    "conrelid".to_string(),
+                                    "contypid".to_string(),
+                                    "conindid".to_string(),
+                                    "confrelid".to_string(),
+                                    "confupdtype".to_string(),
+                                    "confdeltype".to_string(),
+                                    "confmatchtype".to_string(),
+                                    "conislocal".to_string(),
+                                    "coninhcount".to_string(),
+                                    "connoinherit".to_string(),
+                                    "conkey".to_string(),
+                                    "confkey".to_string(),
+                                ],
+                            );
                             return Ok(());
                         }
                         _ => {}
@@ -440,7 +639,9 @@ fn rewrite_expr_recursive<'a>(
                         Expr::Value(v) => match &mut v.value {
                             sqlparser::ast::Value::SingleQuotedString(s) => {
                                 let oid = synthetic_relation_oid_from_name(s);
-                                *expr = Expr::Value(sqlparser::ast::Value::Number(oid.to_string(), false).into());
+                                *expr = Expr::Value(
+                                    sqlparser::ast::Value::Number(oid.to_string(), false).into(),
+                                );
                                 return Ok(());
                             }
                             _ => {
@@ -570,19 +771,27 @@ fn rewrite_expr_recursive<'a>(
                     _ => {}
                 }
             }
-            Expr::InList { expr: inner, list, .. } => {
+            Expr::InList {
+                expr: inner, list, ..
+            } => {
                 rewrite_expr_recursive(inner, control_plane, session).await?;
                 for e in list {
                     rewrite_expr_recursive(e, control_plane, session).await?;
                 }
             }
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
                 if let Some(o) = operand {
                     rewrite_expr_recursive(o, control_plane, session).await?;
                 }
                 for condition in conditions {
-                     rewrite_expr_recursive(&mut condition.condition, control_plane, session).await?;
-                     rewrite_expr_recursive(&mut condition.result, control_plane, session).await?;
+                    rewrite_expr_recursive(&mut condition.condition, control_plane, session)
+                        .await?;
+                    rewrite_expr_recursive(&mut condition.result, control_plane, session).await?;
                 }
                 if let Some(e) = else_result {
                     rewrite_expr_recursive(e, control_plane, session).await?;

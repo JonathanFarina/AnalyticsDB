@@ -73,6 +73,8 @@ Responsibilities:
 Rules:
 
 - PostgreSQL and Flight SQL must land in the same logical session model
+- PostgreSQL and Flight SQL adapters must consume the shared engine statement outcome contract for row-returning SQL versus command SQL; protocol-local string-prefix classification and affected-row scraping are not architectural sources of truth
+- Flight SQL row-returning paths should stream from the shared engine row stream and must not re-plan solely because a client moves from `GetFlightInfo` to `DoGet`
 - differences in wire protocol must not create different product capabilities
 - error codes, metadata visibility, and auth semantics must be intentionally mapped and tested
 
@@ -112,6 +114,7 @@ Responsibilities:
 Rules:
 
 - the compute plane may cache aggressively, but may not become the durable system of record
+- single-node prototype session contexts may cache DataFusion catalog/table registration per logical session, but catalog-changing commands must invalidate that cache
 - a single-node fallback mode is acceptable for prototype work, but must not redefine the target architecture
 - distributed plans must expose stage-level metrics and trace links
 
@@ -130,6 +133,7 @@ Rules:
 
 - native and external tables must share one SQL surface
 - native storage uses Parquet for high-performance columnar scanning
+- prototype managed-table bulk materialization should use DataFusion Parquet sinks instead of bespoke serial writers where possible
 - storage policy selection may be automatic, but must always be inspectable
 - node-local disks may be used for cache or spill, not as the primary durable database store
 
@@ -201,4 +205,3 @@ Avoid:
 - designs that require sticky routing to the same compute node for correctness
 - durable dependence on executor-local state
 - one-off protocol behavior in a single node that cannot scale horizontally
-

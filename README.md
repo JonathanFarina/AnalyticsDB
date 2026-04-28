@@ -24,7 +24,7 @@ What exists now:
 - `analyticsdb-engine`: prototype single-process SQL execution wrapper
 - `analyticsdb-protocol`: prototype PostgreSQL wire and Arrow Flight SQL server surfaces
 - `analyticsdb-server`: prototype server binary that exposes both protocol listeners
-- `analyticsdb-cli`: CLI test client that can submit SQL in embedded mode, against the prototype PostgreSQL wire and Arrow Flight SQL listeners, and through a tested parameterized PostgreSQL extended-query subset
+- `analyticsdb-cli`: CLI test client that can submit one-shot SQL or run an interactive shell in embedded mode, against the prototype PostgreSQL wire and Arrow Flight SQL listeners, and through a tested parameterized PostgreSQL extended-query subset
 - `analyticsdb-core`: shared request/response models
 
 Current metadata SQL subset:
@@ -152,6 +152,62 @@ cargo run -p analyticsdb-server -- --catalog-path /tmp/analyticsdb-catalog.json 
 cargo run -p analyticsdb-cli -- query --protocol postgres --endpoint 127.0.0.1:55432 --sql "SELECT 1 AS one"
 cargo run -p analyticsdb-cli -- query --protocol postgres --endpoint 127.0.0.1:55432 --sql "SELECT $1 AS metric, $2 AS status" --param 11 --param '"ok"'
 cargo run -p analyticsdb-cli -- query --protocol flight-sql --endpoint http://127.0.0.1:55051 --sql "SELECT 1 AS one"
+cargo run -p analyticsdb-cli -- query --protocol flight-sql --endpoint https://127.0.0.1:50051 --tls-ca-cert certs/server.crt --tls-domain localhost --sql "SELECT 1 AS one"
+cargo run -p analyticsdb-cli -- query --timing --sql "SELECT COUNT(*) AS row_count FROM fact_metrics"
+cargo run -p analyticsdb-cli -- interactive --catalog-path /tmp/analyticsdb-catalog.json
+cargo run -p analyticsdb-cli -- interactive --protocol postgres --endpoint 127.0.0.1:55432
+cargo run -p analyticsdb-cli -- interactive --protocol flight-sql --endpoint https://127.0.0.1:50051 --tls-ca-cert certs/server.crt --tls-domain localhost
+```
+
+In interactive mode, enter SQL terminated by `;`. The shell supports keyboard line editing, persistent history in `~/.analyticsdb_history`, multiline statements, and meta commands:
+
+- `\q` or `\quit` exits
+- `\?` or `\help` shows help
+- `\conninfo` prints the current protocol/session target
+- `\timing [on|off]` toggles detailed timing after each statement
+
+## Multi-Node Cluster with Dynamic Scaling
+
+AnalyticsDB supports a distributed coordination layer for dynamic cluster scaling.
+
+#### 1. Start the Cluster Coordinator
+The first node initializes the cluster configuration.
+```bash
+cargo run -p analyticsdb-server -- \
+  --node-id node-1 \
+  --role control \
+  --postgres-addr 127.0.0.1:5432 \
+  --flight-sql-addr 127.0.0.1:50051 \
+  --catalog-path cluster-catalog.json \
+  --tls-cert certs/server.crt \
+  --tls-key certs/server.key
+```
+
+#### 2. Join additional nodes (Dynamic Port Assignment)
+Subsequent nodes can join the cluster by pointing to the coordinator. They will automatically receive their assigned ports and common configuration.
+```bash
+cargo run -p analyticsdb-server -- \
+  --node-id node-2 \
+  --role compute \
+  --join https://127.0.0.1:50051 \
+  --tls-ca-cert certs/server.crt \
+  --tls-domain localhost
+```
+
+For the bundled local development certificate, `--tls-domain localhost` is required because the certificate is issued for `localhost` and `127.0.0.1` is only the socket address.
+
+#### 3. View the Cluster
+Use the CLI to see the registered nodes and their dynamically assigned ports:
+```bash
+cargo run -p analyticsdb-cli -- query --sql "SHOW NODES"
+```
+
+#### 4. Automatic Client Failover
+The CLI supports comma-separated endpoints for automatic failover:
+```bash
+cargo run -p analyticsdb-cli -- query \
+  --endpoint 127.0.0.1:5432,127.0.0.1:5433 \
+  --sql "SELECT 1"
 ```
 
 ## Repository Guides

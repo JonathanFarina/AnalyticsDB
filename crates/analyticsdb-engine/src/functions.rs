@@ -1,8 +1,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::{Array, Float64Array, IntervalMonthDayNanoArray};
+use datafusion::arrow::datatypes::{DataType, IntervalMonthDayNanoType};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
@@ -20,7 +20,7 @@ pub fn register_postgres_functions(context: &SessionContext) {
     context.register_udf(ScalarUDF::from(FormatTypeFunc::new()));
     context.register_udf(ScalarUDF::from(ObjDescriptionFunc::new()));
     context.register_udf(ScalarUDF::from(ColDescriptionFunc::new()));
-    
+
     // pg_catalog qualified UDFs for explicit client calls
     context.register_udf(ScalarUDF::from(PgGetExprFunc::new()));
     context.register_udf(ScalarUDF::from(PgGetPartkeydefFunc::new()));
@@ -31,9 +31,15 @@ pub fn register_postgres_functions(context: &SessionContext) {
     context.register_udf(ScalarUDF::from(DivideIntervalFunc::new()));
 
     // Multipart name registration for schema-qualified calls
-    context.register_udf(ScalarUDF::new_from_impl(PgGetExprFunc::with_name("pg_catalog.pg_get_expr")));
-    context.register_udf(ScalarUDF::new_from_impl(PgGetPartkeydefFunc::with_name("pg_catalog.pg_get_partkeydef")));
-    context.register_udf(ScalarUDF::new_from_impl(PgGetConstraintdefFunc::with_name("pg_catalog.pg_get_constraintdef")));
+    context.register_udf(ScalarUDF::new_from_impl(PgGetExprFunc::with_name(
+        "pg_catalog.pg_get_expr",
+    )));
+    context.register_udf(ScalarUDF::new_from_impl(PgGetPartkeydefFunc::with_name(
+        "pg_catalog.pg_get_partkeydef",
+    )));
+    context.register_udf(ScalarUDF::new_from_impl(PgGetConstraintdefFunc::with_name(
+        "pg_catalog.pg_get_constraintdef",
+    )));
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -457,7 +463,7 @@ impl PgGetExprFunc {
             signature: Signature::variadic_any(Volatility::Immutable),
         }
     }
-    
+
     fn with_name(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -490,13 +496,17 @@ impl ScalarUDFImpl for PgGetExprFunc {
         }
         // Just return the first arg as text if possible
         match &args[0] {
-            ColumnarValue::Scalar(s) => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(s.to_string())))),
+            ColumnarValue::Scalar(s) => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                s.to_string(),
+            )))),
             ColumnarValue::Array(a) => {
                 let mut results = Vec::with_capacity(a.len());
                 for i in 0..a.len() {
                     results.push(Some(ScalarValue::try_from_array(a, i)?.to_string()));
                 }
-                Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::StringArray::from(results))))
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::StringArray::from(results),
+                )))
             }
         }
     }
@@ -515,7 +525,7 @@ impl PgGetPartkeydefFunc {
             signature: Signature::variadic_any(Volatility::Immutable),
         }
     }
-    
+
     fn with_name(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -635,112 +645,154 @@ impl ScalarUDFImpl for MultiplyIntervalFunc {
                 let interval = match s {
                     ScalarValue::IntervalMonthDayNano(Some(v)) => *v,
                     _ => {
-                        return Err(datafusion::error::DataFusionError::Execution(
-                            format!("Expected interval, found {:?}", s),
-                        ))
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "Expected interval, found {:?}",
+                            s
+                        )))
                     }
                 };
                 let factor = match f {
                     ScalarValue::Float64(Some(v)) => *v,
                     ScalarValue::Int64(Some(v)) => *v as f64,
-                    ScalarValue::Decimal128(Some(v), _, scale) => *v as f64 / 10f64.powi(*scale as i32),
+                    ScalarValue::Decimal128(Some(v), _, scale) => {
+                        *v as f64 / 10f64.powi(*scale as i32)
+                    }
                     _ => {
-                        return Err(datafusion::error::DataFusionError::Execution(
-                            format!("Expected numeric factor, found {:?}", f),
-                        ))
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "Expected numeric factor, found {:?}",
+                            f
+                        )))
                     }
                 };
 
-                let months = (interval.months as f64 * factor) as i32;
-                let days = (interval.days as f64 * factor) as i32;
-                let nanos = (interval.nanoseconds as f64 * factor) as i64;
+                let (months, days, nanoseconds) = IntervalMonthDayNanoType::to_parts(interval);
+                let months = (months as f64 * factor) as i32;
+                let days = (days as f64 * factor) as i32;
+                let nanos = (nanoseconds as f64 * factor) as i64;
 
                 Ok(ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(
-                    Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(
-                        months, days, nanos,
-                    )),
+                    Some(IntervalMonthDayNanoType::make_value(months, days, nanos)),
                 )))
             }
             (ColumnarValue::Array(s), ColumnarValue::Array(f)) => {
-                // For simplicity in prototype, we'll convert to scalars if they are arrays of size 1,
-                // or bail. In a real DB we'd implement full vectorized multiply.
-                if s.len() == f.len() {
-                    let mut results = Vec::with_capacity(s.len());
-                    for i in 0..s.len() {
-                         let interval_scalar = ScalarValue::try_from_array(s, i)?;
-                         let factor_scalar = ScalarValue::try_from_array(f, i)?;
-                         
-                         let interval = match interval_scalar {
-                             ScalarValue::IntervalMonthDayNano(Some(v)) => v,
-                             _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
-                         };
-                         let factor = match factor_scalar {
-                            ScalarValue::Float64(Some(v)) => v,
-                            ScalarValue::Int64(Some(v)) => v as f64,
-                            ScalarValue::Decimal128(Some(v), _, scale) => v as f64 / 10f64.powi(scale as i32),
-                            _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
-                         };
+                let s = s
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
+                            "Expected IntervalMonthDayNanoArray".to_string(),
+                        )
+                    })?;
+                let f = f.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Expected Float64Array".to_string(),
+                    )
+                })?;
 
-                        let months = (interval.months as f64 * factor) as i32;
-                        let days = (interval.days as f64 * factor) as i32;
-                        let nanos = (interval.nanoseconds as f64 * factor) as i64;
-                        
-                        results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(
+                if s.len() != f.len() {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "Mismatched array lengths in multiply_interval".to_string(),
+                    ));
+                }
+
+                let mut results = Vec::with_capacity(s.len());
+                for i in 0..s.len() {
+                    if s.is_null(i) || f.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let (months, days, nanoseconds) =
+                            IntervalMonthDayNanoType::to_parts(s.value(i));
+                        let factor = f.value(i);
+
+                        let months = (months as f64 * factor) as i32;
+                        let days = (days as f64 * factor) as i32;
+                        let nanos = (nanoseconds as f64 * factor) as i64;
+
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
                             months, days, nanos,
                         )));
                     }
-                    Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
-                } else {
-                    Err(datafusion::error::DataFusionError::Execution("Mismatched array lengths in multiply_interval".to_string()))
                 }
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
             }
             (ColumnarValue::Array(s), ColumnarValue::Scalar(f)) => {
-                let mut results = Vec::with_capacity(s.len());
+                let s = s
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
+                            "Expected IntervalMonthDayNanoArray".to_string(),
+                        )
+                    })?;
                 let factor = match f {
                     ScalarValue::Float64(Some(v)) => *v,
                     ScalarValue::Int64(Some(v)) => *v as f64,
-                    ScalarValue::Decimal128(Some(v), _, scale) => *v as f64 / 10f64.powi(*scale as i32),
-                    _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
-                 };
-
-                for i in 0..s.len() {
-                    let interval_scalar = ScalarValue::try_from_array(s, i)?;
-                    let interval = match interval_scalar {
-                        ScalarValue::IntervalMonthDayNano(Some(v)) => v,
-                        _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
-                    };
-                    let months = (interval.months as f64 * factor) as i32;
-                    let days = (interval.days as f64 * factor) as i32;
-                    let nanos = (interval.nanoseconds as f64 * factor) as i64;
-                    results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(
-                        months, days, nanos,
-                    )));
-                }
-                Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
-            }
-            (ColumnarValue::Scalar(s), ColumnarValue::Array(f)) => {
-                let mut results = Vec::with_capacity(f.len());
-                let interval = match s {
-                    ScalarValue::IntervalMonthDayNano(Some(v)) => *v,
-                    _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
+                    ScalarValue::Decimal128(Some(v), _, scale) => {
+                        *v as f64 / 10f64.powi(*scale as i32)
+                    }
+                    _ => {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "Expected numeric factor".to_string(),
+                        ))
+                    }
                 };
 
-                for i in 0..f.len() {
-                    let factor_scalar = ScalarValue::try_from_array(f, i)?;
-                    let factor = match factor_scalar {
-                        ScalarValue::Float64(Some(v)) => v,
-                        ScalarValue::Int64(Some(v)) => v as f64,
-                        ScalarValue::Decimal128(Some(v), _, scale) => v as f64 / 10f64.powi(scale as i32),
-                        _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
-                    };
-                    let months = (interval.months as f64 * factor) as i32;
-                    let days = (interval.days as f64 * factor) as i32;
-                    let nanos = (interval.nanoseconds as f64 * factor) as i64;
-                    results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(
-                        months, days, nanos,
-                    )));
+                let mut results = Vec::with_capacity(s.len());
+                for i in 0..s.len() {
+                    if s.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let (months, days, nanoseconds) =
+                            IntervalMonthDayNanoType::to_parts(s.value(i));
+                        let months = (months as f64 * factor) as i32;
+                        let days = (days as f64 * factor) as i32;
+                        let nanos = (nanoseconds as f64 * factor) as i64;
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
+                            months, days, nanos,
+                        )));
+                    }
                 }
-                Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
+            }
+            (ColumnarValue::Scalar(s), ColumnarValue::Array(f)) => {
+                let interval_val = match s {
+                    ScalarValue::IntervalMonthDayNano(Some(v)) => *v,
+                    _ => {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "Expected interval".to_string(),
+                        ))
+                    }
+                };
+                let (months_in, days_in, nanos_in) =
+                    IntervalMonthDayNanoType::to_parts(interval_val);
+
+                let f = f.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Expected Float64Array".to_string(),
+                    )
+                })?;
+
+                let mut results = Vec::with_capacity(f.len());
+                for i in 0..f.len() {
+                    if f.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let factor = f.value(i);
+                        let months = (months_in as f64 * factor) as i32;
+                        let days = (days_in as f64 * factor) as i32;
+                        let nanos = (nanos_in as f64 * factor) as i64;
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
+                            months, days, nanos,
+                        )));
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
             }
         }
     }
@@ -815,92 +867,150 @@ impl ScalarUDFImpl for DivideIntervalFunc {
                     ));
                 }
 
-                let months = (interval.months as f64 / factor) as i32;
-                let days = (interval.days as f64 / factor) as i32;
-                let nanos = (interval.nanoseconds as f64 / factor) as i64;
+                let (months, days, nanoseconds) = IntervalMonthDayNanoType::to_parts(interval);
+                let months = (months as f64 / factor) as i32;
+                let days = (days as f64 / factor) as i32;
+                let nanos = (nanoseconds as f64 / factor) as i64;
 
                 Ok(ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(
-                    Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(
-                        months, days, nanos,
-                    )),
+                    Some(IntervalMonthDayNanoType::make_value(months, days, nanos)),
                 )))
             }
             (ColumnarValue::Array(s), ColumnarValue::Array(f)) => {
-                if s.len() == f.len() {
-                    let mut results = Vec::with_capacity(s.len());
-                    for i in 0..s.len() {
-                        let interval_scalar = ScalarValue::try_from_array(s, i)?;
-                        let factor_scalar = ScalarValue::try_from_array(f, i)?;
-                        let interval = match interval_scalar {
-                            ScalarValue::IntervalMonthDayNano(Some(v)) => v,
-                            _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
-                        };
-                        let factor = match factor_scalar {
-                            ScalarValue::Float64(Some(v)) => v,
-                            ScalarValue::Int64(Some(v)) => v as f64,
-                            ScalarValue::Decimal128(Some(v), _, scale) => v as f64 / 10f64.powi(scale as i32),
-                            _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
-                        };
-                        if factor == 0.0 {
-                             return Err(datafusion::error::DataFusionError::Execution("Division by zero in divide_interval".to_string()));
-                        }
-                        let months = (interval.months as f64 / factor) as i32;
-                        let days = (interval.days as f64 / factor) as i32;
-                        let nanos = (interval.nanoseconds as f64 / factor) as i64;
-                        results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(months, days, nanos)));
-                    }
-                    Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
-                } else {
-                    Err(datafusion::error::DataFusionError::Execution("Mismatched array lengths in divide_interval".to_string()))
+                let s = s
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
+                            "Expected IntervalMonthDayNanoArray".to_string(),
+                        )
+                    })?;
+                let f = f.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Expected Float64Array".to_string(),
+                    )
+                })?;
+
+                if s.len() != f.len() {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "Mismatched array lengths in divide_interval".to_string(),
+                    ));
                 }
+
+                let mut results = Vec::with_capacity(s.len());
+                for i in 0..s.len() {
+                    if s.is_null(i) || f.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let (months, days, nanoseconds) =
+                            IntervalMonthDayNanoType::to_parts(s.value(i));
+                        let factor = f.value(i);
+
+                        if factor == 0.0 {
+                            return Err(datafusion::error::DataFusionError::Execution(
+                                "Division by zero in divide_interval".to_string(),
+                            ));
+                        }
+
+                        let months = (months as f64 / factor) as i32;
+                        let days = (days as f64 / factor) as i32;
+                        let nanos = (nanoseconds as f64 / factor) as i64;
+
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
+                            months, days, nanos,
+                        )));
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
             }
             (ColumnarValue::Array(s), ColumnarValue::Scalar(f)) => {
+                let s = s
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(
+                            "Expected IntervalMonthDayNanoArray".to_string(),
+                        )
+                    })?;
                 let factor = match f {
                     ScalarValue::Float64(Some(v)) => *v,
                     ScalarValue::Int64(Some(v)) => *v as f64,
-                    ScalarValue::Decimal128(Some(v), _, scale) => *v as f64 / 10f64.powi(*scale as i32),
-                    _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
+                    ScalarValue::Decimal128(Some(v), _, scale) => {
+                        *v as f64 / 10f64.powi(*scale as i32)
+                    }
+                    _ => {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "Expected numeric factor".to_string(),
+                        ))
+                    }
                 };
                 if factor == 0.0 {
-                    return Err(datafusion::error::DataFusionError::Execution("Division by zero in divide_interval".to_string()));
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "Division by zero in divide_interval".to_string(),
+                    ));
                 }
+
                 let mut results = Vec::with_capacity(s.len());
                 for i in 0..s.len() {
-                    let interval_scalar = ScalarValue::try_from_array(s, i)?;
-                    let interval = match interval_scalar {
-                        ScalarValue::IntervalMonthDayNano(Some(v)) => v,
-                        _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
-                    };
-                    let months = (interval.months as f64 / factor) as i32;
-                    let days = (interval.days as f64 / factor) as i32;
-                    let nanos = (interval.nanoseconds as f64 / factor) as i64;
-                    results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(months, days, nanos)));
+                    if s.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let (months, days, nanoseconds) =
+                            IntervalMonthDayNanoType::to_parts(s.value(i));
+                        let months = (months as f64 / factor) as i32;
+                        let days = (days as f64 / factor) as i32;
+                        let nanos = (nanoseconds as f64 / factor) as i64;
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
+                            months, days, nanos,
+                        )));
+                    }
                 }
-                Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
             }
             (ColumnarValue::Scalar(s), ColumnarValue::Array(f)) => {
-                let interval = match s {
+                let interval_val = match s {
                     ScalarValue::IntervalMonthDayNano(Some(v)) => *v,
-                    _ => return Err(datafusion::error::DataFusionError::Execution("Expected interval".to_string())),
+                    _ => {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "Expected interval".to_string(),
+                        ))
+                    }
                 };
+                let (months_in, days_in, nanos_in) =
+                    IntervalMonthDayNanoType::to_parts(interval_val);
+
+                let f = f.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Expected Float64Array".to_string(),
+                    )
+                })?;
+
                 let mut results = Vec::with_capacity(f.len());
                 for i in 0..f.len() {
-                    let factor_scalar = ScalarValue::try_from_array(f, i)?;
-                    let factor = match factor_scalar {
-                        ScalarValue::Float64(Some(v)) => v,
-                        ScalarValue::Int64(Some(v)) => v as f64,
-                        ScalarValue::Decimal128(Some(v), _, scale) => v as f64 / 10f64.powi(scale as i32),
-                        _ => return Err(datafusion::error::DataFusionError::Execution("Expected numeric factor".to_string())),
-                    };
-                    if factor == 0.0 {
-                        return Err(datafusion::error::DataFusionError::Execution("Division by zero in divide_interval".to_string()));
+                    if f.is_null(i) {
+                        results.push(None);
+                    } else {
+                        let factor = f.value(i);
+                        if factor == 0.0 {
+                            return Err(datafusion::error::DataFusionError::Execution(
+                                "Division by zero in divide_interval".to_string(),
+                            ));
+                        }
+                        let months = (months_in as f64 / factor) as i32;
+                        let days = (days_in as f64 / factor) as i32;
+                        let nanos = (nanos_in as f64 / factor) as i64;
+                        results.push(Some(IntervalMonthDayNanoType::make_value(
+                            months, days, nanos,
+                        )));
                     }
-                    let months = (interval.months as f64 / factor) as i32;
-                    let days = (interval.days as f64 / factor) as i32;
-                    let nanos = (interval.nanoseconds as f64 / factor) as i64;
-                    results.push(Some(datafusion::arrow::datatypes::IntervalMonthDayNanoType::make_value(months, days, nanos)));
                 }
-                Ok(ColumnarValue::Array(Arc::new(datafusion::arrow::array::IntervalMonthDayNanoArray::from(results))))
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::IntervalMonthDayNanoArray::from(results),
+                )))
             }
         }
     }

@@ -3,7 +3,6 @@
     "postgres": {
       "name": "postgres",
       "schemas": [
-        "information_schema",
         "public"
       ]
     }
@@ -14,271 +13,31 @@
       "is_admin": false,
       "password": "analytics_reader",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777034756872
+      "password_rotated_at_epoch_ms": 1777223763006
     },
     "analyticsdb_admin": {
       "name": "analyticsdb_admin",
-      "is_admin": true,
+      "is_admin": false,
       "password": "analyticsdb_admin",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777034756872
+      "password_rotated_at_epoch_ms": 1777223763006
     },
     "postgres": {
       "name": "postgres",
       "is_admin": true,
       "password": "postgres",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777034756872
+      "password_rotated_at_epoch_ms": 1777223763006
     }
   },
-  "nodes": {
-    "compute-1": {
-      "id": "compute-1",
-      "role": "Compute",
-      "endpoint": "embedded://compute-1",
-      "status": "Ready"
-    },
-    "control-1": {
-      "id": "control-1",
-      "role": "Control",
-      "endpoint": "embedded://control-1",
-      "status": "Ready"
-    }
-  },
-  "relations": {
-    "postgres.public.customers": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "customers",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "analyticsdb-catalog.managed/postgres__public__customers.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "first_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "last_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "email",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "created_at",
-          "data_type": "Timestamp(ns)",
-          "nullable": true,
-          "default_value": "CURRENT_TIMESTAMP"
-        }
-      ],
-      "constraints": [
-        {
-          "name": "customers_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ]
-    },
-    "postgres.public.customers_final": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "customers_final",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "analyticsdb-catalog.managed/postgres__public__customers_final.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "first_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "last_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "email",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "created_at",
-          "data_type": "Timestamp(ns)",
-          "nullable": true,
-          "default_value": null
-        }
-      ],
-      "constraints": [
-        {
-          "name": "customers_final_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ]
-    },
-    "postgres.public.customers_test_v2": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "customers_test_v2",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "analyticsdb-catalog.managed/postgres__public__customers_test_v2.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "first_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "last_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "email",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "created_at",
-          "data_type": "Timestamp(ns)",
-          "nullable": true,
-          "default_value": "CURRENT_TIMESTAMP"
-        }
-      ],
-      "constraints": [
-        {
-          "name": "customers_test_v2_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ]
-    },
-    "postgres.public.delete_test": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "delete_test",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "analyticsdb-catalog.managed/postgres__public__delete_test.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "name",
-          "data_type": "Utf8",
-          "nullable": true,
-          "default_value": null
-        }
-      ],
-      "constraints": [
-        {
-          "name": "delete_test_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ]
-    },
-    "postgres.public.truncate_test": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "truncate_test",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "analyticsdb-catalog.managed/postgres__public__truncate_test.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "val",
-          "data_type": "Utf8",
-          "nullable": true,
-          "default_value": null
-        }
-      ],
-      "constraints": [
-        {
-          "name": "truncate_test_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ]
-    }
+  "nodes": {},
+  "relations": {},
+  "config": {
+    "base_postgres_port": 5432,
+    "base_flight_sql_port": 50051,
+    "catalog_path": "analyticsdb-catalog.json",
+    "tls_cert_path": null,
+    "tls_key_path": null,
+    "next_available_port_offset": 0
   }
 }

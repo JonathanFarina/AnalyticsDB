@@ -5,12 +5,18 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use clap::{Parser, Subcommand, ValueEnum};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
-use futures::TryStreamExt;
+use futures::StreamExt;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tonic::transport::Certificate;
+use tonic::transport::ClientTlsConfig;
+use tonic::transport::Endpoint;
 
 #[tokio::main]
 async fn main() {
@@ -25,10 +31,122 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Query(options) => run_query(options).await,
+        Commands::Interactive(options) => run_interactive(options).await,
     }
 }
 
 async fn run_query(options: QueryOptions) -> Result<()> {
+    let sql = options.sql.clone();
+    let params = options.params.clone();
+    let client_options = ClientOptions::from_query(options);
+    let started_at = Instant::now();
+    let response = execute_sql(sql, &client_options, params).await?;
+    let response_received_at = Instant::now();
+
+    render_response(&response, client_options.format);
+    let rendered_at = Instant::now();
+    if client_options.timing {
+        render_timing(
+            &response,
+            response_received_at.duration_since(started_at).as_millis(),
+            rendered_at.duration_since(response_received_at).as_millis(),
+            rendered_at.duration_since(started_at).as_millis(),
+            client_options.format,
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_interactive(options: InteractiveOptions) -> Result<()> {
+    let mut client_options = ClientOptions::from_interactive(options);
+    let mut editor = DefaultEditor::new()?;
+
+    if let Some(path) = history_path() {
+        let _ = editor.load_history(&path);
+    }
+
+    println!("AnalyticsDB interactive client");
+    println!("Enter SQL terminated by ';'. Type \\q to quit or \\? for help.");
+
+    let mut buffer = String::new();
+    loop {
+        let prompt = if buffer.trim().is_empty() {
+            "analyticsdb=> "
+        } else {
+            "analyticsdb-> "
+        };
+
+        match editor.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = editor.add_history_entry(line.as_str());
+                }
+
+                if buffer.trim().is_empty() && trimmed.starts_with('\\') {
+                    match handle_meta_command(trimmed, &mut client_options)? {
+                        MetaCommandAction::Continue => continue,
+                        MetaCommandAction::Quit => break,
+                    }
+                }
+
+                if trimmed.is_empty() && buffer.trim().is_empty() {
+                    continue;
+                }
+
+                buffer.push_str(&line);
+                buffer.push('\n');
+
+                if sql_statement_is_complete(&buffer) {
+                    let sql = buffer.trim().to_string();
+                    buffer.clear();
+
+                    let started_at = Instant::now();
+                    match execute_sql(sql, &client_options, Vec::new()).await {
+                        Ok(response) => {
+                            let response_received_at = Instant::now();
+                            render_response(&response, client_options.format);
+                            let rendered_at = Instant::now();
+                            if client_options.timing {
+                                render_timing(
+                                    &response,
+                                    response_received_at.duration_since(started_at).as_millis(),
+                                    rendered_at.duration_since(response_received_at).as_millis(),
+                                    rendered_at.duration_since(started_at).as_millis(),
+                                    client_options.format,
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("ERROR: {error:#}"),
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if buffer.trim().is_empty() {
+                    println!("Use \\q to quit.");
+                } else {
+                    buffer.clear();
+                    println!("Query buffer cleared.");
+                }
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if let Some(path) = history_path() {
+        let _ = editor.save_history(&path);
+    }
+
+    Ok(())
+}
+
+async fn execute_sql(
+    sql: String,
+    options: &ClientOptions,
+    params: Vec<String>,
+) -> Result<QueryResponse> {
     let protocol = match options.protocol {
         ClientProtocol::Embedded => Protocol::Embedded,
         ClientProtocol::Postgres => Protocol::PostgreSql,
@@ -38,48 +156,47 @@ async fn run_query(options: QueryOptions) -> Result<()> {
     let session = SessionContext {
         user: options.user.clone(),
         role,
-        database: options.database,
-        schema: options.schema,
+        database: options.database.clone(),
+        schema: options.schema.clone(),
         auth_method: match protocol {
             Protocol::Embedded => "embedded-prototype".to_string(),
             Protocol::PostgreSql => "postgres-wire-startup".to_string(),
             Protocol::ArrowFlightSql => "flight-sql-header".to_string(),
         },
         protocol,
+        transaction_status: analyticsdb_core::TransactionStatus::Idle,
     };
 
-    let response = match options.protocol {
+    match options.protocol {
         ClientProtocol::Embedded => {
-            if !options.params.is_empty() {
+            if !params.is_empty() {
                 bail!("CLI parameters are currently only supported for PostgreSQL protocol mode");
             }
-            run_embedded_query(options.sql, session, options.catalog_path).await?
+            run_embedded_query(sql, session, options.catalog_path.clone()).await
         }
         ClientProtocol::Postgres => {
             run_postgres_query(
-                options.sql,
+                sql,
                 session,
-                options.endpoint,
-                options.params,
-                options.password,
+                options.endpoint.clone(),
+                params,
+                options.password.clone(),
             )
-            .await?
+            .await
         }
         ClientProtocol::FlightSql => {
             run_flight_sql_query(
-                options.sql,
+                sql,
                 session,
-                options.endpoint,
-                options.params,
-                options.password,
+                options.endpoint.clone(),
+                params,
+                options.password.clone(),
+                options.tls_ca_cert.clone(),
+                options.tls_domain.clone(),
             )
-            .await?
+            .await
         }
-    };
-
-    render_response(&response, options.format);
-
-    Ok(())
+    }
 }
 
 async fn run_embedded_query(
@@ -90,7 +207,9 @@ async fn run_embedded_query(
     let request = QueryRequest { sql, session };
     let engine = PrototypeEngine::from_catalog_path(&catalog_path).await?;
 
-    engine.execute_query(&request).await
+    let result = engine.execute_query(&request).await?;
+    Ok(result.to_query_response())
+
 }
 
 async fn run_postgres_query(
@@ -117,7 +236,9 @@ async fn run_postgres_query(
 
             let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
                 .await
-                .with_context(|| format!("failed to connect to PostgreSQL endpoint '{endpoint}'"))?;
+                .with_context(|| {
+                    format!("failed to connect to PostgreSQL endpoint '{endpoint}'")
+                })?;
             tokio::spawn(async move {
                 let _ = connection.await;
             });
@@ -232,6 +353,8 @@ async fn run_flight_sql_query(
     endpoint: Option<String>,
     params: Vec<String>,
     password: Option<String>,
+    tls_ca_cert: Option<String>,
+    tls_domain: Option<String>,
 ) -> Result<QueryResponse> {
     let endpoints_str = endpoint.unwrap_or_else(|| "http://127.0.0.1:50051".to_string());
     let endpoints: Vec<&str> = endpoints_str.split(',').collect();
@@ -240,13 +363,12 @@ async fn run_flight_sql_query(
     for endpoint in endpoints {
         let result = async {
             let normalized_endpoint = normalize_flight_endpoint(endpoint);
-            let channel = tonic::transport::Endpoint::new(normalized_endpoint.clone())
-                .with_context(|| format!("invalid Flight SQL endpoint '{normalized_endpoint}'"))?
-                .connect()
-                .await
-                .with_context(|| {
-                    format!("failed to connect to Flight SQL endpoint '{normalized_endpoint}'")
-                })?;
+            let channel =
+                connect_flight_sql_endpoint(&normalized_endpoint, &tls_ca_cert, &tls_domain)
+                    .await
+                    .with_context(|| {
+                        format!("failed to connect to Flight SQL endpoint '{normalized_endpoint}'")
+                    })?;
 
             let mut client = FlightSqlServiceClient::new(channel);
             client.set_header("x-analyticsdb-user", session.user.clone());
@@ -292,23 +414,21 @@ async fn run_flight_sql_query(
                     .iter()
                     .map(|field| field.name().to_string())
                     .collect::<Vec<_>>();
-                let batches = client
+                let stream = client
                     .do_get(ticket)
                     .await
-                    .with_context(|| "Remote result retrieval failed".to_string())?
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .with_context(|| "Remote result stream collection failed".to_string())?;
+                    .with_context(|| "Remote result retrieval failed".to_string())?;
 
-                query_response_from_batches(
+                query_response_from_batch_stream(
                     "unavailable-via-flight-sql".to_string(),
                     "unavailable-via-flight-sql".to_string(),
                     session.clone(),
-                    batches,
+                    stream,
                     fallback_columns,
                     query_completed_message(),
                     started_at.elapsed().as_millis(),
                 )
+                .await
             } else {
                 let affected = client
                     .execute_update(sql.clone(), None)
@@ -339,29 +459,34 @@ async fn run_flight_sql_query(
     Err(last_error.unwrap_or_else(|| anyhow!("No endpoints provided")))
 }
 
-fn query_response_from_batches(
+async fn query_response_from_batch_stream<S, E>(
     query_id: String,
     coordinator_node_id: String,
     session: SessionContext,
-    batches: Vec<RecordBatch>,
+    mut batches: S,
     fallback_columns: Vec<String>,
     message: String,
     execution_time_ms: u128,
-) -> Result<QueryResponse> {
-    let columns = batches
-        .first()
-        .map(|batch| {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or(fallback_columns);
-
+) -> Result<QueryResponse>
+where
+    S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut columns = None;
     let mut rows = Vec::new();
-    for batch in batches {
+    while let Some(batch) = batches.next().await {
+        let batch = batch.map_err(|error| anyhow!("Remote result stream failed: {error}"))?;
+        if columns.is_none() {
+            columns = Some(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
         for row_index in 0..batch.num_rows() {
             let mut row = Vec::new();
             for column_index in 0..batch.num_columns() {
@@ -380,7 +505,7 @@ fn query_response_from_batches(
         query_id,
         coordinator_node_id,
         session,
-        columns,
+        columns: columns.unwrap_or(fallback_columns),
         rows,
         message,
         execution_time_ms,
@@ -510,6 +635,35 @@ fn normalize_flight_endpoint(endpoint: &str) -> String {
     }
 }
 
+async fn connect_flight_sql_endpoint(
+    endpoint: &str,
+    tls_ca_cert: &Option<String>,
+    tls_domain: &Option<String>,
+) -> Result<tonic::transport::Channel> {
+    let mut endpoint_config = Endpoint::new(endpoint.to_string())
+        .with_context(|| format!("invalid Flight SQL endpoint '{endpoint}'"))?;
+
+    if endpoint.starts_with("https://") {
+        let mut tls_config = ClientTlsConfig::new();
+
+        if let Some(domain) = tls_domain {
+            tls_config = tls_config.domain_name(domain);
+        }
+
+        if let Some(cert_path) = tls_ca_cert {
+            let pem = std::fs::read(cert_path)
+                .with_context(|| format!("failed to read TLS CA certificate '{cert_path}'"))?;
+            tls_config = tls_config.ca_certificate(Certificate::from_pem(pem));
+        } else {
+            tls_config = tls_config.with_enabled_roots();
+        }
+
+        endpoint_config = endpoint_config.tls_config(tls_config)?;
+    }
+
+    endpoint_config.connect().await.map_err(Into::into)
+}
+
 fn query_completed_message() -> String {
     "Query executed successfully.".to_string()
 }
@@ -543,6 +697,119 @@ fn render_response(response: &QueryResponse, format: OutputFormat) {
             );
         }
     }
+}
+
+fn handle_meta_command(command: &str, options: &mut ClientOptions) -> Result<MetaCommandAction> {
+    let trimmed = command.trim();
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["\\timing"] => {
+            options.timing = !options.timing;
+            println!("Timing is {}.", if options.timing { "on" } else { "off" });
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\timing", value] if value.eq_ignore_ascii_case("on") => {
+            options.timing = true;
+            println!("Timing is on.");
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\timing", value] if value.eq_ignore_ascii_case("off") => {
+            options.timing = false;
+            println!("Timing is off.");
+            Ok(MetaCommandAction::Continue)
+        }
+        _ => match trimmed {
+            "\\q" | "\\quit" => Ok(MetaCommandAction::Quit),
+            "\\?" | "\\help" => {
+                print_interactive_help();
+                Ok(MetaCommandAction::Continue)
+            }
+            "\\conninfo" => {
+                print_connection_info(options);
+                Ok(MetaCommandAction::Continue)
+            }
+            _ => {
+                bail!(
+                    "unknown meta command '{}'. Type \\? for available commands.",
+                    command
+                )
+            }
+        },
+    }
+}
+
+fn print_interactive_help() {
+    println!("Meta commands:");
+    println!("  \\q, \\quit      quit");
+    println!("  \\?, \\help      show this help");
+    println!("  \\conninfo      show current connection/session options");
+    println!("  \\timing [on|off] toggle detailed timing output");
+    println!();
+    println!("SQL input:");
+    println!("  End SQL statements with ';'. Multiline statements are supported.");
+}
+
+fn print_connection_info(options: &ClientOptions) {
+    println!(
+        "protocol={:?} user={} database={} schema={}",
+        options.protocol, options.user, options.database, options.schema
+    );
+    match options.protocol {
+        ClientProtocol::Embedded => println!("catalog_path={}", options.catalog_path),
+        ClientProtocol::Postgres | ClientProtocol::FlightSql => {
+            println!(
+                "endpoint={}",
+                options.endpoint.as_deref().unwrap_or("<default>")
+            );
+            if options.protocol == ClientProtocol::FlightSql {
+                println!(
+                    "tls_ca_cert={}",
+                    options.tls_ca_cert.as_deref().unwrap_or("<default roots>")
+                );
+                println!(
+                    "tls_domain={}",
+                    options.tls_domain.as_deref().unwrap_or("<endpoint host>")
+                );
+            }
+        }
+    }
+}
+
+fn history_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".analyticsdb_history"))
+}
+
+fn sql_statement_is_complete(sql: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut last_significant = None;
+    let chars = sql.char_indices().collect::<Vec<_>>();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let (_, ch) = chars[index];
+        if ch == '\'' && !in_double_quote {
+            if in_single_quote && index + 1 < chars.len() && chars[index + 1].1 == '\'' {
+                index += 1;
+            } else {
+                in_single_quote = !in_single_quote;
+            }
+        } else if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        }
+
+        if !ch.is_whitespace() && !in_single_quote && !in_double_quote {
+            last_significant = Some(ch);
+        } else if ch == ';' && !in_single_quote && !in_double_quote {
+            last_significant = Some(ch);
+        }
+
+        index += 1;
+    }
+
+    last_significant == Some(';') && !in_single_quote && !in_double_quote
 }
 
 fn render_table(response: &QueryResponse) {
@@ -582,6 +849,23 @@ fn render_table(response: &QueryResponse) {
     println!("Rows: {}", response.row_count());
 }
 
+fn render_timing(
+    response: &QueryResponse,
+    client_query_ms: u128,
+    render_ms: u128,
+    end_to_end_ms: u128,
+    format: OutputFormat,
+) {
+    let text = format!(
+        "Timing: query/fetch={} ms, client_total={} ms, render={} ms, end_to_end={} ms",
+        response.execution_time_ms, client_query_ms, render_ms, end_to_end_ms
+    );
+    match format {
+        OutputFormat::Table => println!("{text}"),
+        OutputFormat::Json => eprintln!("{text}"),
+    }
+}
+
 fn build_divider(widths: &[usize]) -> String {
     let mut divider = String::from("+");
 
@@ -613,9 +897,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Query(QueryOptions),
+    Interactive(InteractiveOptions),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 struct QueryOptions {
     #[arg(long)]
     sql: String,
@@ -637,8 +922,99 @@ struct QueryOptions {
     catalog_path: String,
     #[arg(long)]
     endpoint: Option<String>,
+    #[arg(long)]
+    tls_ca_cert: Option<String>,
+    #[arg(long)]
+    tls_domain: Option<String>,
     #[arg(long = "param", action = clap::ArgAction::Append)]
     params: Vec<String>,
+    #[arg(long)]
+    timing: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct InteractiveOptions {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
+    #[arg(long, value_enum, default_value_t = ClientProtocol::Embedded)]
+    protocol: ClientProtocol,
+    #[arg(long, default_value = "postgres")]
+    database: String,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long, default_value = "public")]
+    schema: String,
+    #[arg(long, default_value = "postgres")]
+    user: String,
+    #[arg(long, default_value = "analyticsdb-catalog.json")]
+    catalog_path: String,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    tls_ca_cert: Option<String>,
+    #[arg(long)]
+    tls_domain: Option<String>,
+    #[arg(long)]
+    timing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ClientOptions {
+    format: OutputFormat,
+    protocol: ClientProtocol,
+    database: String,
+    role: Option<String>,
+    password: Option<String>,
+    schema: String,
+    user: String,
+    catalog_path: String,
+    endpoint: Option<String>,
+    tls_ca_cert: Option<String>,
+    tls_domain: Option<String>,
+    timing: bool,
+}
+
+impl ClientOptions {
+    fn from_query(options: QueryOptions) -> Self {
+        Self {
+            format: options.format,
+            protocol: options.protocol,
+            database: options.database,
+            role: options.role,
+            password: options.password,
+            schema: options.schema,
+            user: options.user,
+            catalog_path: options.catalog_path,
+            endpoint: options.endpoint,
+            tls_ca_cert: options.tls_ca_cert,
+            tls_domain: options.tls_domain,
+            timing: options.timing,
+        }
+    }
+
+    fn from_interactive(options: InteractiveOptions) -> Self {
+        Self {
+            format: options.format,
+            protocol: options.protocol,
+            database: options.database,
+            role: options.role,
+            password: options.password,
+            schema: options.schema,
+            user: options.user,
+            catalog_path: options.catalog_path,
+            endpoint: options.endpoint,
+            tls_ca_cert: options.tls_ca_cert,
+            tls_domain: options.tls_domain,
+            timing: options.timing,
+        }
+    }
+}
+
+enum MetaCommandAction {
+    Continue,
+    Quit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -706,5 +1082,78 @@ impl CliParamValue {
             Self::Int(_) => Type::INT8,
             Self::String(_) => Type::TEXT,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_sql_completion_requires_semicolon_outside_quotes() {
+        assert!(sql_statement_is_complete("SELECT 1;"));
+        assert!(sql_statement_is_complete("SELECT ';';"));
+        assert!(sql_statement_is_complete(
+            "INSERT INTO t VALUES ('it''s done');"
+        ));
+        assert!(!sql_statement_is_complete("SELECT 1"));
+        assert!(!sql_statement_is_complete("SELECT ';'"));
+        assert!(!sql_statement_is_complete("SELECT 'unterminated;"));
+    }
+
+    #[test]
+    fn interactive_meta_commands_cover_quit_and_help() {
+        let options = ClientOptions {
+            format: OutputFormat::Table,
+            protocol: ClientProtocol::Embedded,
+            database: "postgres".to_string(),
+            role: None,
+            password: None,
+            schema: "public".to_string(),
+            user: "postgres".to_string(),
+            catalog_path: "analyticsdb-catalog.json".to_string(),
+            endpoint: None,
+            tls_ca_cert: None,
+            tls_domain: None,
+            timing: false,
+        };
+
+        assert!(matches!(
+            handle_meta_command("\\q", &mut options.clone()).expect("\\q should parse"),
+            MetaCommandAction::Quit
+        ));
+        assert!(matches!(
+            handle_meta_command("\\?", &mut options.clone()).expect("\\? should parse"),
+            MetaCommandAction::Continue
+        ));
+        assert!(handle_meta_command("\\missing", &mut options.clone()).is_err());
+    }
+
+    #[test]
+    fn interactive_timing_meta_command_toggles_output() {
+        let mut options = ClientOptions {
+            format: OutputFormat::Table,
+            protocol: ClientProtocol::Embedded,
+            database: "postgres".to_string(),
+            role: None,
+            password: None,
+            schema: "public".to_string(),
+            user: "postgres".to_string(),
+            catalog_path: "analyticsdb-catalog.json".to_string(),
+            endpoint: None,
+            tls_ca_cert: None,
+            tls_domain: None,
+            timing: false,
+        };
+
+        assert!(matches!(
+            handle_meta_command("\\timing", &mut options).expect("\\timing should parse"),
+            MetaCommandAction::Continue
+        ));
+        assert!(options.timing);
+        handle_meta_command("\\timing off", &mut options).expect("\\timing off should parse");
+        assert!(!options.timing);
+        handle_meta_command("\\timing on", &mut options).expect("\\timing on should parse");
+        assert!(options.timing);
     }
 }

@@ -17,6 +17,7 @@ arrow-flight.workspace = true
 clap.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+rustyline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
