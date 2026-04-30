@@ -1995,7 +1995,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
         let mut builder = query.into_builder();
         for database in &databases {
-            let schema_session = flight_session_for_database(&session, &database);
+            let schema_session = flight_session_for_database(&session, database);
             let database_for_list = database.clone();
             let schemas = self
                 .engine
@@ -2004,7 +2004,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 .map_err(status_from_error)?;
 
             for schema in schemas {
-                builder.append(&database, &schema);
+                builder.append(database, &schema);
             }
         }
 
@@ -2050,7 +2050,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
         let mut builder = query.into_builder();
         for database in &databases {
-            let db_session = flight_session_for_database(&session, &database);
+            let db_session = flight_session_for_database(&session, database);
             let database_for_schemas = database.clone();
             let schemas = self
                 .engine
@@ -2059,12 +2059,12 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 .map_err(status_from_error)?;
 
             for schema_name in schemas {
-                let table_session = flight_session_for_database(&session, &database);
+                let table_session = flight_session_for_database(&session, database);
                 let tables = self
                     .engine
                     .list_relations(
                         &table_session,
-                        Some(&database),
+                        Some(database),
                         Some(&schema_name),
                         CatalogRelationKind::Table,
                     )
@@ -2074,16 +2074,16 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 for table in tables {
                     let schema = catalog_relation_to_arrow_schema(&table.columns);
                     builder
-                        .append(&database, &schema_name, &table.name, "TABLE", &schema)
+                        .append(database, &schema_name, &table.name, "TABLE", &schema)
                         .map_err(status_from_error)?;
                 }
 
-                let view_session = flight_session_for_database(&session, &database);
+                let view_session = flight_session_for_database(&session, database);
                 let views = self
                     .engine
                     .list_relations(
                         &view_session,
-                        Some(&database),
+                        Some(database),
                         Some(&schema_name),
                         CatalogRelationKind::View,
                     )
@@ -2093,7 +2093,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 for view in views {
                     let schema = catalog_relation_to_arrow_schema(&view.columns);
                     builder
-                        .append(&database, &schema_name, &view.name, "VIEW", &schema)
+                        .append(database, &schema_name, &view.name, "VIEW", &schema)
                         .map_err(status_from_error)?;
                 }
             }

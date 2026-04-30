@@ -333,7 +333,7 @@ impl ScalarUDFImpl for FormatTypeFunc {
                     ScalarValue::Int64(Some(oid)) => oid_to_type_name(*oid as u32),
                     ScalarValue::UInt64(Some(oid)) => oid_to_type_name(*oid as u32),
                     ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-                        s.split('.').last().unwrap_or(s).to_string()
+                        s.split('.').next_back().unwrap_or(s).to_string()
                     }
                     _ => "unknown".to_string(),
                 };
@@ -349,7 +349,7 @@ impl ScalarUDFImpl for FormatTypeFunc {
                         ScalarValue::Int64(Some(oid)) => oid_to_type_name(oid as u32),
                         ScalarValue::UInt64(Some(oid)) => oid_to_type_name(oid as u32),
                         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-                            s.split('.').last().unwrap_or(&s).to_string()
+                            s.split('.').next_back().unwrap_or(&s).to_string()
                         }
                         _ => "unknown".to_string(),
                     };

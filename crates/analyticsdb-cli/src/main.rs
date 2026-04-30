@@ -20,6 +20,7 @@ use tonic::transport::Endpoint;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
     if let Err(error) = run().await {
         eprintln!("ERROR: {error:#}");
         std::process::exit(1);
@@ -209,7 +210,6 @@ async fn run_embedded_query(
 
     let result = engine.execute_query(&request).await?;
     Ok(result.to_query_response())
-
 }
 
 async fn run_postgres_query(
@@ -801,8 +801,6 @@ fn sql_statement_is_complete(sql: &str) -> bool {
         }
 
         if !ch.is_whitespace() && !in_single_quote && !in_double_quote {
-            last_significant = Some(ch);
-        } else if ch == ';' && !in_single_quote && !in_double_quote {
             last_significant = Some(ch);
         }
 

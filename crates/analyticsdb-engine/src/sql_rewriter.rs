@@ -67,14 +67,10 @@ fn rewrite_query_recursive<'a>(
         rewrite_set_expr_recursive(&mut query.body, control_plane, session).await?;
 
         if let Some(order_by) = &mut query.order_by {
-            match &mut order_by.kind {
-                sqlparser::ast::OrderByKind::Expressions(exprs) => {
-                    for order_by_expr in exprs {
-                        rewrite_expr_recursive(&mut order_by_expr.expr, control_plane, session)
-                            .await?;
-                    }
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind {
+                for order_by_expr in exprs {
+                    rewrite_expr_recursive(&mut order_by_expr.expr, control_plane, session).await?;
                 }
-                _ => {}
             }
         }
 
@@ -157,12 +153,11 @@ fn rewrite_select_recursive<'a>(
                     sqlparser::ast::JoinOperator::Inner(constraint)
                     | sqlparser::ast::JoinOperator::LeftOuter(constraint)
                     | sqlparser::ast::JoinOperator::RightOuter(constraint)
-                    | sqlparser::ast::JoinOperator::FullOuter(constraint) => match constraint {
-                        sqlparser::ast::JoinConstraint::On(expr) => {
+                    | sqlparser::ast::JoinOperator::FullOuter(constraint) => {
+                        if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
                             rewrite_expr_recursive(expr, control_plane, session).await?;
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -176,9 +171,11 @@ fn rewrite_select_recursive<'a>(
                     // Expand all tables
                     for (_alias, columns) in table_schemas.iter() {
                         for col in columns {
-                            new_projection.push(SelectItem::UnnamedExpr(Expr::Identifier(
-                                Ident::new(col.clone()),
-                            )));
+                            if col != "_row_id" {
+                                new_projection.push(SelectItem::UnnamedExpr(Expr::Identifier(
+                                    Ident::new(col.clone()),
+                                )));
+                            }
                         }
                     }
                     if table_schemas.is_empty() {
@@ -197,9 +194,11 @@ fn rewrite_select_recursive<'a>(
 
                     if let Some(columns) = table_schemas.get(&alias) {
                         for col in columns {
-                            new_projection.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(
-                                vec![Ident::new(alias.clone()), Ident::new(col.clone())],
-                            )));
+                            if col != "_row_id" {
+                                new_projection.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(
+                                    vec![Ident::new(alias.clone()), Ident::new(col.clone())],
+                                )));
+                            }
                         }
                     } else {
                         new_projection.push(item.clone());
@@ -252,13 +251,10 @@ fn rewrite_select_recursive<'a>(
             rewrite_expr_recursive(selection, control_plane, session).await?;
         }
 
-        match &mut select.group_by {
-            sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-                for expr in exprs {
-                    rewrite_expr_recursive(expr, control_plane, session).await?;
-                }
+        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+            for expr in exprs {
+                rewrite_expr_recursive(expr, control_plane, session).await?;
             }
-            _ => {}
         }
 
         if let Some(having) = &mut select.having {
@@ -581,7 +577,7 @@ fn resolve_table_schemas_recursive<'a>(
 }
 
 fn make_unique_alias(base: &str, seen: &HashSet<String>) -> String {
-    let base = base.split('.').last().unwrap_or(base);
+    let base = base.split('.').next_back().unwrap_or(base);
     let safe_base = if !base.is_empty()
         && base
             .chars()
@@ -748,27 +744,21 @@ fn rewrite_expr_recursive<'a>(
                     f.name.0.remove(0);
                 }
 
-                match &mut f.args {
-                    sqlparser::ast::FunctionArguments::List(arg_list) => {
-                        for arg in &mut arg_list.args {
-                            match arg {
-                                FunctionArg::Unnamed(arg_expr) => match arg_expr {
-                                    FunctionArgExpr::Expr(e) => {
-                                        rewrite_expr_recursive(e, control_plane, session).await?;
-                                    }
-                                    _ => {}
-                                },
-                                FunctionArg::Named { arg, .. } => match arg {
-                                    FunctionArgExpr::Expr(e) => {
-                                        rewrite_expr_recursive(e, control_plane, session).await?;
-                                    }
-                                    _ => {}
-                                },
-                                _ => {}
+                if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut f.args {
+                    for arg in &mut arg_list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                rewrite_expr_recursive(e, control_plane, session).await?;
                             }
+                            FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } => {
+                                rewrite_expr_recursive(e, control_plane, session).await?;
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 }
             }
             Expr::InList {

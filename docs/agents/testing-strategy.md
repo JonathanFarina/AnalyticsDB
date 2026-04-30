@@ -87,6 +87,8 @@ At the current repository stage:
 - current protocol-crate integration coverage now includes Flight SQL metadata API assertions (`get_db_schemas`, `get_tables`) for schema/table/view discovery aligned with the current pg_catalog compatibility setup
 - current protocol-crate and CLI SQL coverage now validates the shared statement outcome contract: row-returning metadata SQL stays row-returning across PostgreSQL and Flight SQL, Flight SQL update RPCs tolerate row-returning metadata probes with `0` affected rows, and DML/DDL update paths report affected rows without parsing human-readable messages
 - current engine/protocol/CLI coverage now exercises direct Parquet relation registration, cached session-context invalidation after mutating commands, Flight SQL row-stream retrieval, and DataFusion Parquet-sink writes for bounded `INSERT INTO ... SELECT ...` / CTAS-style managed-table materialization paths
+- current CLI SQL coverage now exercises the prototype managed-table index path for `PRIMARY KEY`, column/table `UNIQUE`, `CREATE INDEX`, `ALTER INDEX RENAME TO`, `DROP INDEX`, unique-key rejection, duplicate-name rejection, constraint-backed-index protection, atomic failure rollback for `CREATE UNIQUE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY`, versioned index-manifest publication, indexed equality/`IN`/bounded-range lookup, and post-`TRUNCATE` index recovery through the CLI
+- current CLI SQL coverage now includes PostgreSQL wire and Flight SQL listener validation for the current standalone-index lifecycle and predicate slice (`CREATE INDEX`, `ALTER INDEX RENAME TO`, `DROP INDEX`, `IN`, and bounded-range lookup) plus protocol-visible rejection of dropping a primary-key backing index
 
 ## Required Assertions For CLI SQL Tests
 

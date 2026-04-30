@@ -172,7 +172,10 @@ async fn test_alter_aggregate_and_collation_coverage() {
     );
 
     run_sql(&endpoint, "CREATE CONVERSION utf8_to_ascii");
-    let conv = run_sql(&endpoint, "ALTER CONVERSION utf8_to_ascii RENAME TO utf8_to_ascii_v2");
+    let conv = run_sql(
+        &endpoint,
+        "ALTER CONVERSION utf8_to_ascii RENAME TO utf8_to_ascii_v2",
+    );
     assert!(
         conv.contains("Command completed. 0 row(s) affected."),
         "Actual output: {}",

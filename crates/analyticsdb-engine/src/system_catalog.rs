@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{BooleanArray, Int16Array, Int32Array, StringArray, UInt32Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{
-    CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider, Session,
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, SchemaProvider, Session};
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DataFusionResult;
@@ -20,7 +22,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 
-use analyticsdb_control::{CatalogRelationKind, CatalogTableConstraintKind, ControlPlane};
+use analyticsdb_control::{CatalogTableConstraintKind, ControlPlane};
 use analyticsdb_core::SessionContext;
 
 pub struct AnalyticsCatalogProvider {
@@ -127,7 +129,7 @@ impl SchemaProvider for AnalyticsSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        let relation = self
+        let relation_result = self
             .control_plane
             .find_relation(
                 &self.session,
@@ -135,15 +137,28 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                 Some(&self.schema_name),
                 name,
             )
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+            .await;
 
-        // Create a TableProvider for the relation (e.g. ParquetTable)
-        // For the prototype, I'll need a simple ParquetTable implementation.
-        // Wait, does the engine already have one?
-        // I'll check engine/lib.rs for how it handles tables.
+        let relation = match relation_result {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
 
-        Ok(None) // Placeholder
+        if relation.kind == analyticsdb_control::CatalogRelationKind::Table {
+            if let Some(storage_path) = &relation.storage_path {
+                let schema = catalog_relation_to_schema(&relation);
+
+                let table_path = ListingTableUrl::parse(storage_path)?;
+                let config = ListingTableConfig::new(table_path)
+                    .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+                    .with_schema(schema);
+
+                let table = ListingTable::try_new(config)?;
+                return Ok(Some(Arc::new(table)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -152,6 +167,27 @@ impl SchemaProvider for AnalyticsSchemaProvider {
             r.database == self.session.database && r.schema == self.schema_name && r.name == name
         })
     }
+}
+
+fn catalog_relation_to_schema(relation: &analyticsdb_control::CatalogRelation) -> SchemaRef {
+    let fields: Vec<Field> = relation
+        .columns
+        .iter()
+        .map(|c| {
+            let dt = match c.data_type.to_lowercase().as_str() {
+                "bool" | "boolean" => DataType::Boolean,
+                "int2" | "smallint" => DataType::Int16,
+                "int4" | "integer" | "int" => DataType::Int32,
+                "int8" | "bigint" => DataType::Int64,
+                "float4" | "real" => DataType::Float32,
+                "float8" | "double precision" | "double" => DataType::Float64,
+                "text" | "varchar" | "char" => DataType::Utf8,
+                _ => DataType::Utf8, // Default to text for prototype
+            };
+            Field::new(&c.name, dt, c.nullable)
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
 }
 
 pub struct PgCatalogSchemaProvider {
@@ -312,7 +348,7 @@ impl TableProvider for PgTablesTable {
                 tablename.push(rel.name.clone());
                 tableowner.push("postgres".to_string());
                 tablespace.push(None::<String>);
-                hasindexes.push("false".to_string());
+                hasindexes.push((!rel.indexes.is_empty()).to_string());
                 hasrules.push("false".to_string());
                 hastriggers.push("false".to_string());
                 rowsecurity.push("false".to_string());
@@ -976,14 +1012,15 @@ impl TableProvider for PgClassTable {
                 reltuples.push(0.0_f32);
                 relallvisible.push(0_i32);
                 reltoastrelid.push(0_u32);
-                relhasindex.push(false);
+                relhasindex.push(!rel.indexes.is_empty());
                 relisshared.push(false);
                 relpersistence.push("p".to_string());
                 relkind.push(match rel.kind {
                     analyticsdb_control::CatalogRelationKind::Table => "r".to_string(),
                     analyticsdb_control::CatalogRelationKind::View => "v".to_string(),
                 });
-                relnatts.push(rel.columns.len() as i16);
+                let natts = rel.columns.iter().filter(|c| c.name != "_row_id").count();
+                relnatts.push(natts as i16);
                 relchecks.push(0_i16);
                 relhasrules.push(false);
                 relhastriggers.push(false);
@@ -1114,7 +1151,11 @@ impl TableProvider for PgAttributeTable {
         for rel in &cluster.relations {
             if rel.database == session.database {
                 let rel_oid = synthetic_relation_oid(&rel.database, &rel.schema, &rel.name);
-                for (idx, col) in rel.columns.iter().enumerate() {
+                let mut att_num = 1;
+                for col in &rel.columns {
+                    if col.name == "_row_id" {
+                        continue;
+                    }
                     attrelid.push(rel_oid);
                     attname.push(col.name.clone());
                     atttypid.push(match col.data_type.to_lowercase().as_str() {
@@ -1126,7 +1167,7 @@ impl TableProvider for PgAttributeTable {
                         "float8" | "double precision" | "double" => 701,
                         _ => 25, // text
                     });
-                    attnum.push((idx + 1) as i16);
+                    attnum.push(att_num as i16);
                     attnotnull.push(!col.nullable);
                     atttypmod.push(-1_i32);
                     attndims.push(0_i32);
@@ -1137,6 +1178,7 @@ impl TableProvider for PgAttributeTable {
                     attislocal.push(true);
                     attinhcount.push(0_i32);
                     attcollation.push(0_u32);
+                    att_num += 1;
                 }
             }
         }

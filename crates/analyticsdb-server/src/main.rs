@@ -14,11 +14,12 @@ use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
 const BANNER: &str = "
-  \x1b[1;36m___                _       _   _             ____  ____  \x1b[0m
- \x1b[1;36m/ _ \\ _ __   __ _  | |_   _| |_(_) ___ ___  |  _ \\| __ ) \x1b[0m
-\x1b[1;36m| | | | '_ \\ / _` | | \\ \\ / / __| |/ __/ __| | | | |  _ \\ \x1b[0m
-\x1b[1;36m| |_| | | | | (_| | | |\\ V /| |_| | (__\\__ \\ | |_| | |_) |\x1b[0m
- \x1b[1;36m\\___/|_| |_|\\__,_| |_| \\_/  \\__|_|\\___|___/ |____/|____/ \x1b[0m
+\x1b[1;36m     _                _       _   _          ____  ____  \x1b[0m
+\x1b[1;36m    / \\   _ __   __ _| |_   _| |_(_) ___ ___|  _ \\| __ ) \x1b[0m
+\x1b[1;36m   / _ \\ | '_ \\ / _` | | | | | __| |/ __/ __| | | |  _ \\ \x1b[0m
+\x1b[1;36m  / ___ \\| | | | (_| | | |_| | |_| | (__\\__ \\ |_| | |_) |\x1b[0m
+\x1b[1;36m /_/   \\_\\_| |_|\\__,_|_|\\__, |\\__|_|\\___|___/____/|____/ \x1b[0m
+\x1b[1;36m                        |___/                            \x1b[0m
 ";
 
 #[derive(Debug)]
@@ -267,8 +268,12 @@ async fn run() -> Result<()> {
         })
         .await?;
 
-    info!(
+    println!(
         " \x1b[1;32mRegistered node '{}' as {:?} in control plane\x1b[0m",
+        node_id, cli.role
+    );
+    info!(
+        "Registered node '{}' as {:?} in control plane",
         node_id, cli.role
     );
 

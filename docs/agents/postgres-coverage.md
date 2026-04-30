@@ -26,7 +26,7 @@ This file tracks the implementation and testing status of every SQL command list
 | ALTER FOREIGN TABLE | Unsupported | - | |
 | ALTER FUNCTION | Complete | `test_function_coverage`, `test_function_advanced_coverage` | RENAME TO, OWNER TO, and SET SCHEMA supported |
 | ALTER GROUP | Unsupported | - | |
-| ALTER INDEX | Unsupported | - | |
+| ALTER INDEX | Partial | `cli_supports_create_alter_and_drop_index_statements`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | `RENAME TO` supported for standalone managed-table indexes; constraint-backed indexes are intentionally protected and broader PostgreSQL index DDL remains unsupported |
 | ALTER LANGUAGE | Unsupported | - | |
 | ALTER LARGE OBJECT | Unsupported | - | |
 | ALTER MATERIALIZED VIEW | Unsupported | - | |
@@ -45,7 +45,7 @@ This file tracks the implementation and testing status of every SQL command list
 | ALTER STATISTICS | Unsupported | - | |
 | ALTER SUBSCRIPTION | Unsupported | - | |
 | ALTER SYSTEM | Unsupported | - | |
-| ALTER TABLE | Partial | `test_alter_table` | RENAME TO and ADD COLUMN supported |
+| ALTER TABLE | Partial | `test_alter_table`, `cli_supports_rename_column_drop_column_and_drop_constraint` | RENAME TO, ADD COLUMN, DROP COLUMN, RENAME COLUMN, DROP CONSTRAINT, and ALTER COLUMN (TYPE, SET/DROP NOT NULL, SET/DROP DEFAULT) supported |
 | ALTER TABLESPACE | Unsupported | - | |
 | ALTER TEXT SEARCH CONFIGURATION | Unsupported | - | |
 | ALTER TEXT SEARCH DICTIONARY | Unsupported | - | |
@@ -79,7 +79,7 @@ This file tracks the implementation and testing status of every SQL command list
 | CREATE FOREIGN TABLE | Unsupported | - | |
 | CREATE FUNCTION | Complete | `test_function_coverage`, `test_function_advanced_coverage` | OR REPLACE supported |
 | CREATE GROUP | Unsupported | - | |
-| CREATE INDEX | Unsupported | - | |
+| CREATE INDEX | Partial | `cli_supports_create_alter_and_drop_index_statements`, `cli_create_unique_index_failure_is_atomic`, `cli_rejects_duplicate_index_names_within_schema`, `cli_supports_index_manifests_and_broader_predicates`, `cli_supports_broader_index_predicates_across_postgres_and_flight_sql`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Managed-table prototype supports column-list indexes with schema-wide name uniqueness, versioned sidecar manifest publication, and duplicate validation plus the current equality/`IN`/bounded-range lookup slice; external/partial/expression/concurrent index features are unsupported |
 | CREATE LANGUAGE | Unsupported | - | |
 | CREATE MATERIALIZED VIEW | Unsupported | - | |
 | CREATE OPERATOR | Unsupported | - | |
@@ -126,7 +126,7 @@ This file tracks the implementation and testing status of every SQL command list
 | DROP FOREIGN TABLE | Unsupported | - | |
 | DROP FUNCTION | Complete | `test_function_coverage`, `test_function_advanced_coverage` | IF EXISTS and CASCADE/RESTRICT supported |
 | DROP GROUP | Unsupported | - | |
-| DROP INDEX | Unsupported | - | |
+| DROP INDEX | Partial | `cli_supports_create_alter_and_drop_index_statements`, `cli_rejects_dropping_primary_key_backing_index`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Standalone managed-table indexes can be dropped; indexes backing `PRIMARY KEY` / `UNIQUE` constraints are intentionally protected in the current prototype and sidecar manifests are removed together with the standalone index |
 | DROP LANGUAGE | Unsupported | - | |
 | DROP MATERIALIZED VIEW | Unsupported | - | |
 | DROP OPERATOR | Unsupported | - | |

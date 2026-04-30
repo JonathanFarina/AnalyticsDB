@@ -131,14 +131,6 @@ pub struct CatalogTableConstraint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CatalogIndex {
-    pub name: String,
-    pub columns: Vec<String>,
-    pub is_unique: bool,
-    pub is_primary: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogRelation {
     pub database: String,
     pub schema: String,
@@ -153,8 +145,6 @@ pub struct CatalogRelation {
     pub columns: Vec<CatalogColumn>,
     #[serde(default)]
     pub constraints: Vec<CatalogTableConstraint>,
-    #[serde(default)]
-    pub indexes: Vec<CatalogIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,46 +223,9 @@ struct CatalogState {
 
 #[derive(Debug, Clone)]
 pub enum AlterTableOperation {
-    AddColumn {
-        column: TableColumnDefinition,
-    },
-    RenameTable {
-        new_name: String,
-    },
-    AddConstraint {
-        constraint: TableConstraintDefinition,
-    },
-    DropColumn {
-        column_name: String,
-        if_exists: bool,
-        cascade: bool,
-    },
-    RenameColumn {
-        old_name: String,
-        new_name: String,
-    },
-    DropConstraint {
-        name: String,
-        if_exists: bool,
-        cascade: bool,
-    },
-    AlterColumn {
-        column_name: String,
-        operation: AlterColumnOperation,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum AlterColumnOperation {
-    SetDataType {
-        data_type: String,
-    },
-    SetNotNull,
-    DropNotNull,
-    SetDefault {
-        value: String,
-    },
-    DropDefault,
+    AddColumn { column: TableColumnDefinition },
+    RenameTable { new_name: String },
+    AddConstraint { constraint: TableConstraintDefinition },
 }
 
 #[derive(Debug, Clone)]
@@ -369,27 +322,6 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
         operation: AlterTableOperation,
-    },
-    CreateIndex {
-        database: Option<String>,
-        schema: Option<String>,
-        table: String,
-        name: String,
-        columns: Vec<String>,
-        unique: bool,
-    },
-    AlterIndex {
-        database: Option<String>,
-        schema: Option<String>,
-        name: String,
-        operation: AlterObjectOperation,
-    },
-    DropIndex {
-        database: Option<String>,
-        schema: Option<String>,
-        name: String,
-        if_exists: bool,
-        cascade: bool,
     },
     AlterSchema {
         database: Option<String>,
@@ -788,9 +720,6 @@ impl ControlPlane {
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
             | MetadataStatement::CreateTable { .. }
-            | MetadataStatement::CreateIndex { .. }
-            | MetadataStatement::AlterIndex { .. }
-            | MetadataStatement::DropIndex { .. }
             | MetadataStatement::CreateExternalTable { .. }
             | MetadataStatement::InsertInto { .. }
             | MetadataStatement::Update { .. }
@@ -1657,7 +1586,6 @@ impl ControlPlane {
                     external_format: None,
                     columns,
                     constraints: Vec::new(),
-                    indexes: Vec::new(),
                 },
             );
         }
@@ -1669,7 +1597,7 @@ impl ControlPlane {
         ))
     }
 
-    pub async fn managed_table_storage_location(
+    pub async fn managed_table_storage_path(
         &self,
         session: &SessionContext,
         database: Option<&str>,
@@ -1752,7 +1680,6 @@ impl ControlPlane {
                     external_format: None,
                     columns,
                     constraints,
-                    indexes: Vec::new(),
                 },
             );
         }
@@ -1818,28 +1745,6 @@ impl ControlPlane {
         ))
     }
 
-    pub async fn preview_add_constraint(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        constraint: &CatalogTableConstraint,
-    ) -> Result<CatalogRelation> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-        let state = self.state.read().await;
-        self._validate_session(&state, session)?;
-
-        build_relation_with_catalog_constraint(
-            &state,
-            database_name,
-            schema_name,
-            table_name,
-            constraint.clone(),
-        )
-    }
-
     pub async fn add_constraint(
         &self,
         session: &SessionContext,
@@ -1850,39 +1755,6 @@ impl ControlPlane {
     ) -> Result<String> {
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
-        let relation_key = relation_key(database_name, schema_name, table_name);
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-            let preview = build_relation_with_catalog_constraint(
-                &state,
-                database_name,
-                schema_name,
-                table_name,
-                constraint.clone(),
-            )?;
-            state.relations.insert(relation_key.clone(), preview);
-        }
-
-        self.persist().await?;
-        Ok(format!(
-            "Constraint '{}' added to '{}.{}.{}'.",
-            constraint.name, database_name, schema_name, table_name
-        ))
-    }
-
-    pub async fn drop_column(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        column_name: &str,
-        if_exists: bool,
-    ) -> Result<String> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
 
         {
             let mut state = self.state.write().await;
@@ -1898,333 +1770,43 @@ impl ControlPlane {
                 )
             })?;
 
-            if let Some(pos) = relation.columns.iter().position(|c| c.name == column_name) {
-                relation.columns.remove(pos);
-            } else if !if_exists {
+            if relation.kind != CatalogRelationKind::Table {
                 bail!(
-                    "Column '{}' not found in table '{}.{}.{}'",
-                    column_name,
-                    database_name,
-                    schema_name,
-                    table_name
-                );
-            }
-        }
-
-        self.persist().await?;
-        Ok(format!(
-            "Column '{}' dropped from '{}.{}.{}'.",
-            column_name, database_name, schema_name, table_name
-        ))
-    }
-
-    pub async fn index_relation(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        index_name: &str,
-    ) -> Result<CatalogRelation> {
-        let state = self.state.read().await;
-        self._validate_session(&state, session)?;
-
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-
-        state
-            .relations
-            .values()
-            .find(|rel| {
-                rel.database == database_name
-                    && rel.schema == schema_name
-                    && rel.indexes.iter().any(|idx| idx.name == index_name)
-            })
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Index '{}' not found", index_name))
-    }
-
-    pub async fn preview_create_index(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        index_name: &str,
-        columns: &[String],
-        unique: bool,
-    ) -> Result<CatalogRelation> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-        let state = self.state.read().await;
-        self._validate_session(&state, session)?;
-
-        let relation_key = relation_key(database_name, schema_name, table_name);
-        let relation = state.relations.get(&relation_key).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Table '{}.{}.{}' not found",
-                database_name,
-                schema_name,
-                table_name
-            )
-        })?;
-
-        if relation.kind != CatalogRelationKind::Table {
-            bail!(
-                "Relation '{}.{}.{}' is not a table",
-                database_name,
-                schema_name,
-                table_name
-            );
-        }
-
-        if schema_contains_index_name(&state, database_name, schema_name, index_name, None) {
-            bail!(
-                "Index '{}' already exists in schema '{}.{}'",
-                index_name,
-                database_name,
-                schema_name
-            );
-        }
-
-        let mut preview = relation.clone();
-        preview.indexes.push(CatalogIndex {
-            name: index_name.to_string(),
-            columns: columns.to_vec(),
-            is_unique: unique,
-            is_primary: false,
-        });
-
-        Ok(preview)
-    }
-
-    pub async fn rename_column(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<String> {
-        validate_identifier(new_name)?;
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            let relation_key = relation_key(database_name, schema_name, table_name);
-            let relation = state.relations.get_mut(&relation_key).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Table '{}.{}.{}' not found",
-                    database_name,
-                    schema_name,
-                    table_name
-                )
-            })?;
-
-            if relation.columns.iter().any(|c| c.name == new_name) {
-                bail!(
-                    "Column '{}' already exists in table '{}.{}.{}'",
-                    new_name,
+                    "Relation '{}.{}.{}' is not a table",
                     database_name,
                     schema_name,
                     table_name
                 );
             }
 
-            if let Some(col) = relation.columns.iter_mut().find(|c| c.name == old_name) {
-                col.name = new_name.to_string();
-            } else {
-                bail!(
-                    "Column '{}' not found in table '{}.{}.{}'",
-                    old_name,
-                    database_name,
-                    schema_name,
-                    table_name
-                );
-            }
-        }
-
-        self.persist().await?;
-        Ok(format!(
-            "Column '{}' renamed to '{}' in '{}.{}.{}'.",
-            old_name, new_name, database_name, schema_name, table_name
-        ))
-    }
-
-    pub async fn preview_drop_constraint(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        constraint_name: &str,
-        cascade: bool,
-    ) -> Result<CatalogRelation> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-        let state = self.state.read().await;
-        self._validate_session(&state, session)?;
-
-        build_relation_with_dropped_constraint(
-            &state,
-            database_name,
-            schema_name,
-            table_name,
-            constraint_name,
-            cascade,
-        )
-    }
-
-    pub async fn drop_constraint(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        constraint_name: &str,
-        if_exists: bool,
-        cascade: bool,
-    ) -> Result<String> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-        let relation_key = relation_key(database_name, schema_name, table_name);
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            match build_relation_with_dropped_constraint(
-                &state,
-                database_name,
-                schema_name,
-                table_name,
-                constraint_name,
-                cascade,
-            ) {
-                Ok(preview) => {
-                    state.relations.insert(relation_key.clone(), preview);
-
-                    if cascade {
-                        // Find and drop dependent foreign keys in other tables
-                        let mut dependent_updates = Vec::new();
-                        for (other_key, other_rel) in &state.relations {
-                            if other_key == &relation_key {
-                                continue;
-                            }
-
-                            let mut other_preview = other_rel.clone();
-                            let initial_len = other_preview.constraints.len();
-                            other_preview.constraints.retain(|c| {
-                                if let CatalogTableConstraintKind::ForeignKey = c.kind {
-                                    let ref_db =
-                                        c.referenced_database.as_deref().unwrap_or(database_name);
-                                    let ref_sch =
-                                        c.referenced_schema.as_deref().unwrap_or(schema_name);
-                                    let ref_tab = c.referenced_table.as_deref().unwrap_or("");
-
-                                    !(ref_db == database_name
-                                        && ref_sch == schema_name
-                                        && ref_tab == table_name)
-                                } else {
-                                    true
-                                }
-                            });
-
-                            if other_preview.constraints.len() < initial_len {
-                                dependent_updates.push((other_key.clone(), other_preview));
-                            }
-                        }
-
-                        for (key, rel) in dependent_updates {
-                            state.relations.insert(key, rel);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if if_exists && e.to_string().contains("not found") {
-                        return Ok(format!(
-                            "Constraint '{}' does not exist, skipping.",
-                            constraint_name
-                        ));
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        self.persist().await?;
-        Ok(format!(
-            "Constraint '{}' dropped from '{}.{}.{}'.",
-            constraint_name, database_name, schema_name, table_name
-        ))
-    }
-
-    pub async fn alter_column(
-        &self,
-        session: &SessionContext,
-        database: Option<&str>,
-        schema: Option<&str>,
-        table_name: &str,
-        column_name: &str,
-        operation: AlterColumnOperation,
-    ) -> Result<String> {
-        let database_name = database.unwrap_or(&session.database);
-        let schema_name = schema.unwrap_or(&session.schema);
-
-        {
-            let mut state = self.state.write().await;
-            self._validate_session(&state, session)?;
-
-            let relation_key = relation_key(database_name, schema_name, table_name);
-            let relation = state.relations.get_mut(&relation_key).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Table '{}.{}.{}' not found",
-                    database_name,
-                    schema_name,
-                    table_name
-                )
-            })?;
-
-            let column = relation
-                .columns
-                .iter_mut()
-                .find(|c| c.name == column_name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
+            // Validate columns exist
+            for col in &constraint.columns {
+                if !relation.columns.iter().any(|c| c.name == *col) {
+                    bail!(
                         "Column '{}' not found in table '{}.{}.{}'",
-                        column_name,
+                        col,
                         database_name,
                         schema_name,
                         table_name
-                    )
-                })?;
+                    );
+                }
+            }
 
-            match operation {
-                AlterColumnOperation::SetDataType { data_type } => {
-                    column.data_type = data_type;
-                }
-                AlterColumnOperation::SetNotNull => {
-                    column.nullable = false;
-                }
-                AlterColumnOperation::DropNotNull => {
-                    column.nullable = true;
-                }
-                AlterColumnOperation::SetDefault { value } => {
-                    column.default_value = Some(value);
-                }
-                AlterColumnOperation::DropDefault => {
-                    column.default_value = None;
+            relation.constraints.push(constraint);
+
+            // Update indexes based on new constraints
+            let new_indexes = indexes_from_constraints(table_name, &relation.constraints);
+            for new_idx in new_indexes {
+                if !relation.indexes.iter().any(|idx| idx.name == new_idx.name) {
+                    relation.indexes.push(new_idx);
                 }
             }
         }
 
         self.persist().await?;
         Ok(format!(
-            "Column '{}' altered in '{}.{}.{}'.",
-            column_name, database_name, schema_name, table_name
+            "Constraint added successfully to '{}.{}.{}'.",
+            database_name, schema_name, table_name
         ))
     }
 
@@ -2388,7 +1970,6 @@ impl ControlPlane {
         table_name: &str,
         location: &str,
         format: ExternalStorageFormat,
-        columns: Vec<CatalogColumn>,
     ) -> Result<String> {
         validate_identifier(table_name)?;
         let database_name = database.unwrap_or(&session.database);
@@ -2427,9 +2008,8 @@ impl ControlPlane {
                     definition_sql: None,
                     storage_path: Some(location.to_string()),
                     external_format: Some(format),
-                    columns,
+                    columns: Vec::new(), // Schema will be resolved during registration
                     constraints: Vec::new(),
-                    indexes: Vec::new(),
                 },
             );
         }
@@ -3178,22 +2758,26 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         operation: AlterTableOperation::AddColumn { column: col_def },
                     })
                 }
-                sqlparser::ast::AlterTableOperation::RenameTable {
-                    table_name: new_table_name,
-                } => Some(MetadataStatement::AlterTable {
-                    database,
-                    schema,
-                    name: table_name,
-                    operation: AlterTableOperation::RenameTable {
-                        new_name: new_table_name.to_string(),
-                    },
-                }),
+                sqlparser::ast::AlterTableOperation::RenameTable { table_name: name } => {
+                    let name_str = name.to_string();
+                    let new_name = if name_str.to_ascii_uppercase().starts_with("TO ") {
+                        name_str["TO ".len()..].trim().to_string()
+                    } else {
+                        name_str
+                    };
+                    Some(MetadataStatement::AlterTable {
+                        database,
+                        schema,
+                        name: table_name,
+                        operation: AlterTableOperation::RenameTable { new_name },
+                    })
+                }
                 sqlparser::ast::AlterTableOperation::AddConstraint { constraint, .. } => {
                     let constraint_def = match constraint {
                         sqlparser::ast::TableConstraint::PrimaryKey(p) => {
                             TableConstraintDefinition::PrimaryKey {
                                 name: p.name.as_ref().map(|i| i.to_string()),
-                                columns: p.columns.iter().map(|i| i.to_string()).collect(),
+                                columns: p.columns.iter().map(|c| c.to_string()).collect(),
                             }
                         }
                         sqlparser::ast::TableConstraint::Unique(u) => {
@@ -3211,7 +2795,6 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                                 [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
                                 _ => return None,
                             };
-
                             TableConstraintDefinition::ForeignKey {
                                 name: f.name.as_ref().map(|i| i.to_string()),
                                 columns: f.columns.iter().map(|i| i.to_string()).collect(),
@@ -3233,82 +2816,6 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         name: table_name,
                         operation: AlterTableOperation::AddConstraint {
                             constraint: constraint_def,
-                        },
-                    })
-                }
-                sqlparser::ast::AlterTableOperation::DropColumn {
-                    column_names,
-                    if_exists,
-                    ..
-                } => Some(MetadataStatement::AlterTable {
-                    database,
-                    schema,
-                    name: table_name,
-                    operation: AlterTableOperation::DropColumn {
-                        column_name: column_names[0].to_string(),
-                        if_exists: *if_exists,
-                        cascade: false,
-                    },
-                }),
-                sqlparser::ast::AlterTableOperation::RenameColumn {
-                    old_column_name,
-                    new_column_name,
-                } => Some(MetadataStatement::AlterTable {
-                    database,
-                    schema,
-                    name: table_name,
-                    operation: AlterTableOperation::RenameColumn {
-                        old_name: old_column_name.to_string(),
-                        new_name: new_column_name.to_string(),
-                    },
-                }),
-                sqlparser::ast::AlterTableOperation::DropConstraint {
-                    name,
-                    if_exists,
-                    drop_behavior,
-                } => Some(MetadataStatement::AlterTable {
-                    database,
-                    schema,
-                    name: table_name,
-                    operation: AlterTableOperation::DropConstraint {
-                        name: name.to_string(),
-                        if_exists: *if_exists,
-                        cascade: matches!(
-                            drop_behavior,
-                            Some(sqlparser::ast::DropBehavior::Cascade)
-                        ),
-                    },
-                }),
-                sqlparser::ast::AlterTableOperation::AlterColumn { column_name, op } => {
-                    let operation = match op {
-                        sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. } => {
-                            AlterColumnOperation::SetDataType {
-                                data_type: data_type.to_string(),
-                            }
-                        }
-                        sqlparser::ast::AlterColumnOperation::SetNotNull => {
-                            AlterColumnOperation::SetNotNull
-                        }
-                        sqlparser::ast::AlterColumnOperation::DropNotNull => {
-                            AlterColumnOperation::DropNotNull
-                        }
-                        sqlparser::ast::AlterColumnOperation::SetDefault { value } => {
-                            AlterColumnOperation::SetDefault {
-                                value: value.to_string(),
-                            }
-                        }
-                        sqlparser::ast::AlterColumnOperation::DropDefault => {
-                            AlterColumnOperation::DropDefault
-                        }
-                        _ => return None,
-                    };
-                    Some(MetadataStatement::AlterTable {
-                        database,
-                        schema,
-                        name: table_name,
-                        operation: AlterTableOperation::AlterColumn {
-                            column_name: column_name.to_string(),
-                            operation,
                         },
                     })
                 }
@@ -4234,334 +3741,4 @@ fn split_sql_top_level(input: &str, delimiter: char) -> Result<Vec<String>> {
     }
 
     Ok(parts)
-}
-
-fn schema_contains_index_name(
-    state: &CatalogState,
-    database_name: &str,
-    schema_name: &str,
-    index_name: &str,
-    skip_relation_key: Option<&str>,
-) -> bool {
-    for (rel_key, relation) in &state.relations {
-        if let Some(skip) = skip_relation_key {
-            if rel_key == skip {
-                continue;
-            }
-        }
-        if relation.database == database_name && relation.schema == schema_name {
-            if relation.indexes.iter().any(|i| i.name == index_name) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn build_relation_with_catalog_constraint(
-    state: &CatalogState,
-    database_name: &str,
-    schema_name: &str,
-    table_name: &str,
-    constraint: CatalogTableConstraint,
-) -> Result<CatalogRelation> {
-    let relation_key = relation_key(database_name, schema_name, table_name);
-    let relation = state.relations.get(&relation_key).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Table '{}.{}.{}' not found",
-            database_name,
-            schema_name,
-            table_name
-        )
-    })?;
-
-    if relation.kind != CatalogRelationKind::Table {
-        bail!(
-            "Relation '{}.{}.{}' is not a table",
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    if relation.constraints.iter().any(|c| c.name == constraint.name) {
-        bail!(
-            "Constraint '{}' already exists on table '{}.{}.{}'",
-            constraint.name,
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    // Check if index name already exists in schema (if this constraint has a backing index)
-    if matches!(
-        constraint.kind,
-        CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::Unique
-    ) {
-        if schema_contains_index_name(
-            state,
-            database_name,
-            schema_name,
-            &constraint.name,
-            Some(&relation_key),
-        ) {
-            bail!(
-                "Index '{}' already exists in schema '{}.{}'",
-                constraint.name,
-                database_name,
-                schema_name
-            );
-        }
-    }
-
-    let mut preview = relation.clone();
-    preview.constraints.push(constraint.clone());
-
-    // Update indexes if it's PK or Unique
-    if matches!(
-        constraint.kind,
-        CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::Unique
-    ) {
-        preview.indexes.push(CatalogIndex {
-            name: constraint.name.clone(),
-            columns: constraint.columns.clone(),
-            is_unique: true,
-            is_primary: matches!(constraint.kind, CatalogTableConstraintKind::PrimaryKey),
-        });
-    }
-
-    Ok(preview)
-}
-
-fn build_relation_with_added_constraint(
-    state: &CatalogState,
-    database_name: &str,
-    schema_name: &str,
-    table_name: &str,
-    constraint_def: TableConstraintDefinition,
-) -> Result<CatalogRelation> {
-    let relation_key = relation_key(database_name, schema_name, table_name);
-    let relation = state.relations.get(&relation_key).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Table '{}.{}.{}' not found",
-            database_name,
-            schema_name,
-            table_name
-        )
-    })?;
-
-    if relation.kind != CatalogRelationKind::Table {
-        bail!(
-            "Relation '{}.{}.{}' is not a table",
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    let (kind, name, columns, f_db, f_sch, f_table, f_cols) = match constraint_def {
-        TableConstraintDefinition::PrimaryKey { name, columns } => (
-            CatalogTableConstraintKind::PrimaryKey,
-            name.unwrap_or_else(|| "auto_constraint".to_string()),
-            columns,
-            None,
-            None,
-            None,
-            Vec::new(),
-        ),
-        TableConstraintDefinition::Unique { name, columns } => (
-            CatalogTableConstraintKind::Unique,
-            name.unwrap_or_else(|| "auto_constraint".to_string()),
-            columns,
-            None,
-            None,
-            None,
-            Vec::new(),
-        ),
-        TableConstraintDefinition::ForeignKey {
-            name,
-            columns,
-            referenced_database,
-            referenced_schema,
-            referenced_table,
-            referenced_columns,
-        } => (
-            CatalogTableConstraintKind::ForeignKey,
-            name.unwrap_or_else(|| "auto_constraint".to_string()),
-            columns,
-            referenced_database,
-            referenced_schema,
-            Some(referenced_table),
-            referenced_columns,
-        ),
-    };
-
-    let constraint = CatalogTableConstraint {
-        name,
-        kind,
-        columns,
-        referenced_database: f_db,
-        referenced_schema: f_sch,
-        referenced_table: f_table,
-        referenced_columns: f_cols,
-    };
-
-    if relation
-        .constraints
-        .iter()
-        .any(|existing| existing.name == constraint.name)
-    {
-        bail!(
-            "Constraint '{}' already exists on table '{}.{}.{}'",
-            constraint.name,
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    let mut preview = relation.clone();
-    preview.constraints.push(constraint);
-
-    let new_indexes = indexes_from_constraints(table_name, &preview.constraints);
-    for new_index in new_indexes {
-        if preview
-            .indexes
-            .iter()
-            .any(|existing| existing.name == new_index.name)
-        {
-            continue;
-        }
-
-        if schema_contains_index_name(
-            state,
-            database_name,
-            schema_name,
-            &new_index.name,
-            Some(&relation_key),
-        ) {
-            bail!(
-                "Index '{}' already exists in schema '{}.{}'",
-                new_index.name,
-                database_name,
-                schema_name
-            );
-        }
-        preview.indexes.push(new_index);
-    }
-
-    Ok(preview)
-}
-
-fn build_relation_with_dropped_constraint(
-    state: &CatalogState,
-    database_name: &str,
-    schema_name: &str,
-    table_name: &str,
-    constraint_name: &str,
-    cascade: bool,
-) -> Result<CatalogRelation> {
-    let relation_key = relation_key(database_name, schema_name, table_name);
-    let relation = state.relations.get(&relation_key).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Table '{}.{}.{}' not found",
-            database_name,
-            schema_name,
-            table_name
-        )
-    })?;
-
-    if relation.kind != CatalogRelationKind::Table {
-        bail!(
-            "Relation '{}.{}.{}' is not a table",
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    // Check for dependencies if it's a PK or Unique constraint
-    let mut is_referenced = false;
-    if let Some(target_con) = relation.constraints.iter().find(|c| c.name == constraint_name) {
-        if matches!(
-            target_con.kind,
-            CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::Unique
-        ) {
-            for (other_key, other_rel) in &state.relations {
-                if other_key == &relation_key {
-                    continue;
-                }
-                for con in &other_rel.constraints {
-                    if let CatalogTableConstraintKind::ForeignKey = con.kind {
-                        let ref_db = con.referenced_database.as_deref().unwrap_or(&other_rel.database);
-                        let ref_sch = con.referenced_schema.as_deref().unwrap_or(&other_rel.schema);
-                        let ref_tab = con.referenced_table.as_deref().unwrap_or("");
-
-                        if ref_db == database_name && ref_sch == schema_name && ref_tab == table_name
-                        {
-                            is_referenced = true;
-                            break;
-                        }
-                    }
-                }
-                if is_referenced {
-                    break;
-                }
-            }
-        }
-    }
-
-    if is_referenced && !cascade {
-        bail!("Cannot drop constraint '{}' on table '{}.{}.{}' because other objects depend on it. Use CASCADE to drop dependent objects.", constraint_name, database_name, schema_name, table_name);
-    }
-
-    let mut preview = relation.clone();
-    let original_len = preview.constraints.len();
-    preview.constraints.retain(|c| c.name != constraint_name);
-
-    if preview.constraints.len() == original_len {
-        bail!(
-            "Constraint '{}' not found on table '{}.{}.{}'",
-            constraint_name,
-            database_name,
-            schema_name,
-            table_name
-        );
-    }
-
-    // Also remove any backing index with the same name
-    preview.indexes.retain(|i| i.name != constraint_name);
-
-    Ok(preview)
-}
-
-fn indexes_from_constraints(
-    table_name: &str,
-    constraints: &[CatalogTableConstraint],
-) -> Vec<CatalogIndex> {
-    constraints
-        .iter()
-        .filter_map(|constraint| match constraint.kind {
-            CatalogTableConstraintKind::PrimaryKey => Some(CatalogIndex {
-                name: constraint.name.clone(),
-                columns: constraint.columns.clone(),
-                is_unique: true,
-                is_primary: true,
-            }),
-            CatalogTableConstraintKind::Unique => Some(CatalogIndex {
-                name: constraint.name.clone(),
-                columns: constraint.columns.clone(),
-                is_unique: true,
-                is_primary: false,
-            }),
-            CatalogTableConstraintKind::ForeignKey => None,
-        })
-        .map(|mut index| {
-            if index.name == "auto_constraint" {
-                index.name = format!("{}_{}_idx", table_name, index.columns.join("_"));
-            }
-            index
-        })
-        .collect()
 }

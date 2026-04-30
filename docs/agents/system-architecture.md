@@ -123,6 +123,7 @@ Rules:
 Responsibilities:
 
 - native columnar table storage using Parquet (local directory prototype)
+- managed-table indexes for the current prototype are maintained as versioned sidecar manifests beside managed Parquet directories, with managed-table storage locations now persisted as `file://` URIs; this is a tested acceleration path for equality, `IN`, and bounded range lookup in the single-node prototype, not the final remote object-storage index architecture
 - external table abstraction for Parquet and Iceberg
 - replication workflow and durability policy
 - metadata-backed snapshot management

@@ -8,6 +8,12 @@ use datafusion::optimizer::analyzer::AnalyzerRule;
 #[derive(Debug)]
 pub struct DuplicateColumnAlerter;
 
+impl Default for DuplicateColumnAlerter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DuplicateColumnAlerter {
     pub fn new() -> Self {
         Self

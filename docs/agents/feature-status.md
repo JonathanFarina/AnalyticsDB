@@ -56,6 +56,7 @@ A feature is `Complete` only when all of the following are true:
 | Tables/views metadata | Partial | persistent relation metadata with tests | stable DDL, metadata parity, and admin visibility |
 | Persistent catalog/metadata store | Partial | durable metadata persistence with tests | resilient storage, migration story, and operator controls |
 | Managed tables (prototype columnar snapshots) | Partial | CTAS persistence and query path with tests | broader DDL, production durability, and storage-engine maturity |
+| Managed table indexes | Partial | SQL-driven primary-key/unique index metadata plus create/alter/drop index and tested equality/`IN`/range lookup coverage | remote object-store backends, broader planner integration, multi-node maintenance semantics, and wider protocol conformance coverage |
 | Table schema introspection | Partial | persisted column metadata with tests | broader metadata parity and information-schema style coverage |
 | Users, roles, groups | Prototype | authz model and basic tests | audited admin workflows, grants, revokes, and metadata parity |
 | Single-node local query execution | Partial | tested local execution path | durable state, broader query coverage, and non-embedded protocol support |
@@ -134,7 +135,8 @@ A feature is `Complete` only when all of the following are true:
 - Prototype engine caches DataFusion session contexts per logical session and invalidates the cache after catalog/table-mutating command outcomes; managed and external Parquet relation registration now uses direct DataFusion Parquet table registration with catalog schema metadata when available
 - Managed table inserts support column-list insertion for the current tested embedded prototype subset
 - Managed tables now support **UPDATE**, **DELETE**, **TRUNCATE**, **DROP**, and **RENAME** operations through SQL
-- Managed tables now support **ALTER TABLE ADD COLUMN** for schema evolution, including physical snapshot updates to maintain Parquet readability
+- Managed tables now support **ALTER TABLE** (ADD COLUMN, DROP COLUMN, RENAME COLUMN, DROP CONSTRAINT, ALTER COLUMN) for schema evolution, including physical snapshot updates to maintain Parquet readability and **CASCADE** support for DROP CONSTRAINT to handle dependent objects like foreign keys
+- Managed tables now support a prototype sidecar index path for table-defined `PRIMARY KEY` / `UNIQUE` constraints plus `CREATE INDEX`, `ALTER INDEX RENAME TO`, and `DROP INDEX`; managed-table storage locations are persisted as `file://` URIs, index snapshots publish through versioned manifests, same-table mutations are serialized in-process, and equality/`IN`/prefix/range filters over the current supported managed-table slice can be answered from the sidecar instead of scanning every Parquet file, with schema-wide index-name enforcement, protected constraint-backed indexes, pre-commit duplicate validation for new unique constraints/indexes, and rebuild-safe recovery after table rewrites
 - Table and view metadata listing supports schema-scoped `SHOW TABLES FROM ...` and `SHOW VIEWS FROM ...` in the current tested embedded prototype subset
 - Table and view metadata now support **DROP VIEW**, **DROP SCHEMA**, **DROP DATABASE**, and **ALTER SCHEMA RENAME TO** through SQL, with tested CASCADE behavior for schemas
 - Prototype engine now supports the **EXPLAIN** command to expose query plans across wire protocols
