@@ -77,8 +77,8 @@ A feature is `Complete` only when all of the following are true:
 | Encryption at rest | Prototype | key management design and hooks | end-to-end encrypted storage path with rotation story |
 | CLI | Partial | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, and initial meta commands (`\q`, `\?`, `\conninfo`) | broader psql-style meta-command coverage and polished timing UX complete |
 | CLI speed measurement | Partial | timing output scaffold with detailed query/fetch, client total, render, and end-to-end timings behind `--timing` / `\timing` | accurate and documented timing behavior |
-| Web console query editor | Prototype | page scaffold | query execution, messages, results, and timing complete |
-| Web console explorer | Prototype | metadata browsing scaffold | stable navigation across databases, schemas, tables, and views |
+| Web console query editor | Prototype | Vite TypeScript UI with prototype client, editor, messages, result grid, query id, and timing cards | query execution against a real web gateway, auth/session handling, and protocol parity proof |
+| Web console explorer | Prototype | Vite TypeScript UI with prototype database/schema/table/view explorer backed by sample metadata | stable navigation against live metadata across databases, schemas, tables, and views |
 | Web console admin: databases | Prototype | UI scaffold | create/manage flows with authz and audit coverage |
 | Web console admin: users | Prototype | UI scaffold | role/group management with authz and audit coverage |
 | Web console admin: metrics | Prototype | UI scaffold | useful operator metrics with live or near-live accuracy |

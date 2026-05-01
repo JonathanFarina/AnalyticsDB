@@ -94,6 +94,7 @@ The repository now contains a real prototype foundation. Today that means:
 - a PostgreSQL wire prototype that supports connection startup, simple queries, and a tested parameterized extended-query subset against the current engine path
 - an Arrow Flight SQL prototype that supports statement query, statement update, **prepared statements** (with schema planning), **TLS encryption**, and basic metadata discovery for catalogs, schemas, tables, and table types
 - integrated **structured logging and tracing** via the `tracing` crate, with `RUST_LOG` support
+- a prototype Vite TypeScript web admin console with a local UI harness for query editing, database/schema/table/view exploration, result grids, engine messages, query IDs, and timing cards
 - build/test automation that verifies current SQL behavior through the CLI
 
 Everything beyond that remains early-stage. In particular:
@@ -101,7 +102,7 @@ Everything beyond that remains early-stage. In particular:
 - no distributed execution exists yet
 - no native managed storage exists yet (currently local Parquet directories)
 - no external Iceberg table path exists yet
-- no web console exists yet
+- no web console execution path against a live AnalyticsDB web gateway exists yet
 - no Kubernetes deployment assets exist yet
 - no benchmark claims are valid yet
 - no broad PostgreSQL compatibility claims are valid yet

@@ -26,6 +26,7 @@ What exists now:
 - `analyticsdb-server`: prototype server binary that exposes both protocol listeners
 - `analyticsdb-cli`: CLI test client that can submit one-shot SQL or run an interactive shell in embedded mode, against the prototype PostgreSQL wire and Arrow Flight SQL listeners, and through a tested parameterized PostgreSQL extended-query subset
 - `analyticsdb-core`: shared request/response models
+- `web/admin-console`: prototype Vite + TypeScript web admin console with a database explorer, SQL editor, result grid, query messages, and timing cards backed by a local UI harness
 
 Current metadata SQL subset:
 
@@ -72,7 +73,7 @@ What does not exist yet:
 - object-storage-backed production columnar managed-table storage (currently local Parquet directories)
 - object-storage-backed native tables
 - external Iceberg integration
-- web console
+- web console execution against a live AnalyticsDB web gateway
 - Kubernetes deployment assets
 - PostgreSQL prepared statements beyond the current parameterized prototype subset, real auth, and broad compatibility coverage
 - broad Flight SQL parity coverage beyond standard JDBC query/prepare flows
@@ -128,6 +129,9 @@ make test
 make test-sql-cli
 make fmt
 make lint
+make web-admin-install
+make web-admin-test
+make web-admin-build
 ```
 
 ## Example

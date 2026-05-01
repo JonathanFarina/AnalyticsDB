@@ -1,6 +1,9 @@
 /target
-/node_modules
-/.DS_Store
+node_modules/
+dist/
+.DS_Store
 
 *.parquet
 analyticsdb-catalog.managed/.DS_Store
+cluster-catalog.managed/.DS_Store
+docs/.DS_Store

@@ -27,3 +27,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  web-admin-console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/admin-console/package-lock.json
+      - name: Install dependencies
+        working-directory: web/admin-console
+        run: npm ci
+      - name: Test
+        working-directory: web/admin-console
+        run: npm test
+      - name: Build
+        working-directory: web/admin-console
+        run: npm run build

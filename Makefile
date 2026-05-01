@@ -1,4 +1,4 @@
-.PHONY: build test test-sql-cli fmt lint
+.PHONY: build test test-sql-cli fmt lint web-admin-install web-admin-test web-admin-build
 
 build:
 	. "$$HOME/.cargo/env" && cargo build --workspace
@@ -15,3 +15,11 @@ fmt:
 lint:
 	. "$$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
 
+web-admin-install:
+	cd web/admin-console && npm install
+
+web-admin-test:
+	cd web/admin-console && npm test
+
+web-admin-build:
+	cd web/admin-console && npm run build
