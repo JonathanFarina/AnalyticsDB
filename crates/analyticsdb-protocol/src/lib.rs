@@ -1669,11 +1669,7 @@ async fn plan_rows_schema(
         .await
         .map_err(status_from_error)?;
 
-    schema.ok_or_else(|| {
-        Status::invalid_argument(
-            "statement query cannot execute SQL that does not return rows; execute it as a statement update",
-        )
-    })
+    Ok(schema.unwrap_or_else(|| Arc::new(Schema::empty())))
 }
 
 fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
@@ -2232,11 +2228,9 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<FlightInfo>, Status> {
         let payload = decode_statement_ticket(query.prepared_statement_handle)?;
         debug!("flight_sql_prepared_statement: {}", payload.sql);
-        let schema_ipc = payload.row_schema_ipc.clone().ok_or_else(|| {
-            Status::invalid_argument(
-                "prepared statement query cannot execute SQL that does not return rows; execute it as a prepared statement update",
-            )
-        })?;
+        let schema_ipc = payload.row_schema_ipc.clone().unwrap_or_else(|| {
+            schema_to_ipc_bytes(&Schema::empty()).unwrap_or_default()
+        });
 
         let descriptor = request.into_inner();
         let ticket = statement_ticket(payload.sql, payload.session, Some(schema_ipc.clone()))?;

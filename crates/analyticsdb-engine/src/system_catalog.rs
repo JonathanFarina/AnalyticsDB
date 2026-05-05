@@ -170,23 +170,40 @@ impl SchemaProvider for AnalyticsSchemaProvider {
 }
 
 fn catalog_relation_to_schema(relation: &analyticsdb_control::CatalogRelation) -> SchemaRef {
-    let fields: Vec<Field> = relation
+    let mut fields: Vec<Field> = relation
         .columns
         .iter()
         .map(|c| {
-            let dt = match c.data_type.to_lowercase().as_str() {
-                "bool" | "boolean" => DataType::Boolean,
-                "int2" | "smallint" => DataType::Int16,
-                "int4" | "integer" | "int" => DataType::Int32,
-                "int8" | "bigint" => DataType::Int64,
-                "float4" | "real" => DataType::Float32,
-                "float8" | "double precision" | "double" => DataType::Float64,
-                "text" | "varchar" | "char" => DataType::Utf8,
-                _ => DataType::Utf8, // Default to text for prototype
+            let lower = c.data_type.to_lowercase();
+            let dt = if lower.starts_with("numeric") || lower.starts_with("decimal") {
+                DataType::Decimal128(38, 10)
+            } else {
+                match lower.as_str() {
+                    "bool" | "boolean" => DataType::Boolean,
+                    "int2" | "smallint" => DataType::Int16,
+                    "int4" | "integer" | "int" | "int32" => DataType::Int32,
+                    "int8" | "bigint" | "int64" => DataType::Int64,
+                    "float4" | "real" | "float32" => DataType::Float32,
+                    "float8" | "double precision" | "double" | "float64" => DataType::Float64,
+                    "text" | "varchar" | "char" | "utf8" => DataType::Utf8,
+                    "date" => DataType::Date32,
+                    _ => {
+                        if lower.starts_with("timestamp") {
+                            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None)
+                        } else {
+                            DataType::Utf8 // Default to text for prototype
+                        }
+                    }
+                }
             };
             Field::new(&c.name, dt, c.nullable)
         })
         .collect();
+
+    if !fields.iter().any(|f| f.name() == "_row_id") {
+        fields.push(Field::new("_row_id", DataType::Utf8, false));
+    }
+
     Arc::new(Schema::new(fields))
 }
 
@@ -230,6 +247,10 @@ impl PgCatalogSchemaProvider {
         tables.insert(
             "pg_attribute".to_string(),
             Arc::new(PgAttributeTable::new(Arc::clone(&control_plane))),
+        );
+        tables.insert(
+            "pg_index".to_string(),
+            Arc::new(PgIndexTable::new(Arc::clone(&control_plane))),
         );
         tables.insert(
             "pg_description".to_string(),
@@ -1034,6 +1055,45 @@ impl TableProvider for PgClassTable {
                 relacl.push(None::<String>);
                 reloptions.push(None::<String>);
                 relpartbound.push(None::<String>);
+
+                // Add indexes
+                for index in &rel.indexes {
+                    oid.push(synthetic_relation_oid(
+                        &rel.database,
+                        &rel.schema,
+                        &index.name,
+                    ));
+                    relname.push(index.name.clone());
+                    relnamespace.push(synthetic_namespace_oid(&rel.database, &rel.schema));
+                    reltype.push(0_u32);
+                    reloftype.push(0_u32);
+                    relowner.push(10_u32);
+                    relam.push(0_u32);
+                    relfilenode.push(0_u32);
+                    reltablespace.push(0_u32);
+                    relpages.push(0_i32);
+                    reltuples.push(0.0_f32);
+                    relallvisible.push(0_i32);
+                    reltoastrelid.push(0_u32);
+                    relhasindex.push(false);
+                    relisshared.push(false);
+                    relpersistence.push("p".to_string());
+                    relkind.push("i".to_string());
+                    relnatts.push(index.columns.len() as i16);
+                    relchecks.push(0_i16);
+                    relhasrules.push(false);
+                    relhastriggers.push(false);
+                    relhassubclass.push(false);
+                    relrowsecurity.push(false);
+                    relforcerowsecurity.push(false);
+                    relispartition.push(false);
+                    relrewrite.push(0_u32);
+                    relfrozenxid.push(0_u32);
+                    relminmxid.push(0_u32);
+                    relacl.push(None::<String>);
+                    reloptions.push(None::<String>);
+                    relpartbound.push(None::<String>);
+                }
             }
         }
 
@@ -1284,6 +1344,90 @@ impl ExecutionPlan for SystemCatalogExec {
             self.schema(),
             None,
         )?))
+    }
+}
+
+#[derive(Debug)]
+struct PgIndexTable {
+    control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgIndexTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("indexrelid", DataType::UInt32, false),
+            Field::new("indrelid", DataType::UInt32, false),
+            Field::new("indnatts", DataType::Int16, false),
+            Field::new("indisunique", DataType::Boolean, false),
+            Field::new("indisprimary", DataType::Boolean, false),
+            Field::new("indisvalid", DataType::Boolean, false),
+        ]));
+        Self {
+            control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgIndexTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let session = postgres_session_from_state(state);
+        let cluster = self.control_plane.cluster_snapshot().await;
+
+        let mut indexrelid = Vec::new();
+        let mut indrelid = Vec::new();
+        let mut indnatts = Vec::new();
+        let mut indisunique = Vec::new();
+        let mut indisprimary = Vec::new();
+        let mut indisvalid = Vec::new();
+
+        for rel in &cluster.relations {
+            if rel.database == session.database {
+                let table_oid = synthetic_relation_oid(&rel.database, &rel.schema, &rel.name);
+                for index in &rel.indexes {
+                    indexrelid.push(synthetic_relation_oid(&rel.database, &rel.schema, &index.name));
+                    indrelid.push(table_oid);
+                    indnatts.push(index.columns.len() as i16);
+                    indisunique.push(index.is_unique);
+                    indisprimary.push(index.is_primary);
+                    indisvalid.push(true);
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                Arc::new(UInt32Array::from(indexrelid)),
+                Arc::new(UInt32Array::from(indrelid)),
+                Arc::new(Int16Array::from(indnatts)),
+                Arc::new(BooleanArray::from(indisunique)),
+                Arc::new(BooleanArray::from(indisprimary)),
+                Arc::new(BooleanArray::from(indisvalid)),
+            ],
+        )?;
+
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
     }
 }
 

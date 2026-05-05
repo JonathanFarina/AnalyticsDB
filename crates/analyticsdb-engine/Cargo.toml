@@ -13,6 +13,8 @@ analyticsdb-control = { path = "../analyticsdb-control" }
 chrono.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
+datafusion-execution.workspace = true
+datafusion-functions-aggregate.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-physical-plan.workspace = true
 futures.workspace = true
@@ -22,5 +24,7 @@ sqlparser.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+regex = "1.12.3"
+tokio-stream.workspace = true
 
 [dev-dependencies]

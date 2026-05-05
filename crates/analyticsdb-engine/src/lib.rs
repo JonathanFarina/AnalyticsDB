@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,23 +14,18 @@ use analyticsdb_control::{
 use analyticsdb_core::{QueryRequest, QueryResponse, SessionContext, StatementOutcome};
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, RecordBatchReader, StringArray, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, RecordBatch, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
-use datafusion::catalog::{CatalogProvider, MemorySchemaProvider};
+use datafusion::catalog::CatalogProvider;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::error::DataFusionError;
-use datafusion::execution::options::ParquetReadOptions;
-use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::parquet::arrow::ArrowWriter;
-use datafusion::parquet::basic::Compression;
-use datafusion::parquet::file::properties::WriterProperties;
-use datafusion::prelude::{SessionConfig, SessionContext as DfSessionContext};
-use datafusion_common::config::TableParquetOptions;
-use datafusion_common::TableReference;
+use datafusion::prelude::{col, lit, SessionConfig, SessionContext as DfSessionContext};
+use datafusion::logical_expr::ExprSchemable;
+use datafusion::scalar::ScalarValue;
+use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use futures::stream;
@@ -48,6 +42,7 @@ pub mod system_catalog;
 use functions::register_postgres_functions;
 use system_catalog::PgCatalogSchemaProvider;
 
+#[allow(dead_code)]
 const INSERT_SELECT_PARQUET_ROW_GROUP_SIZE: usize = 1_048_576;
 
 fn sanitize_error<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
@@ -192,7 +187,8 @@ struct IndexSnapshot {
     columns: Vec<String>,
     unique: bool,
     primary: bool,
-    entries: BTreeMap<String, Vec<String>>,
+    entries_object: String,
+    row_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +342,14 @@ fn metadata_statement_schema(statement: &MetadataStatement) -> Option<SchemaRef>
 }
 
 impl PrototypeEngine {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            control_plane: Arc::new(ControlPlane::new_bootstrap()),
+            session_context_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            relation_locks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        })
+    }
+
     pub async fn from_catalog_path(catalog_path: &str) -> Result<Self> {
         Ok(Self {
             control_plane: Arc::new(ControlPlane::from_catalog_path(catalog_path).await?),
@@ -384,16 +388,14 @@ impl PrototypeEngine {
         relation: &analyticsdb_control::CatalogRelation,
     ) -> Result<()> {
         self.invalidate_session_contexts().await;
-        let mut snapshots = Vec::with_capacity(relation.indexes.len());
         for index in &relation.indexes {
-            snapshots.push(
-                self
-                .build_index_snapshot_for_relation(session, relation, &index.name)
-                .await?,
-            );
-        }
-        for snapshot in snapshots {
-            write_index_snapshot(relation, &snapshot)?;
+            println!("rebuilding index snapshot for: {}", index.name);
+            let version = uuid::Uuid::now_v7().to_string();
+            let snapshot = self
+                .build_index_snapshot_for_relation(session, relation, &index.name, &version)
+                .await?;
+            println!("writing index snapshot for: {}", index.name);
+            write_index_snapshot(relation, &snapshot, &version)?;
         }
         Ok(())
     }
@@ -403,6 +405,7 @@ impl PrototypeEngine {
         session: &SessionContext,
         relation: &analyticsdb_control::CatalogRelation,
         index_name: &str,
+        version: &str,
     ) -> Result<IndexSnapshot> {
         let Some(index) = relation.indexes.iter().find(|idx| idx.name == index_name) else {
             bail!(
@@ -413,8 +416,103 @@ impl PrototypeEngine {
                 relation.name
             );
         };
-        let rows = self.collect_table_rows(session, relation).await?;
-        build_index_snapshot(relation, index, &rows)
+
+        let df_context = self.create_session_context(session).await?;
+        let table_name = format!(
+            "\"{}\".\"{}\".\"{}\"",
+            relation.database, relation.schema, relation.name
+        );
+        let index_cols = index
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {}, \"_row_id\" FROM {} ORDER BY {}",
+            index_cols, table_name, index_cols
+        );
+        let df = df_context.sql(&sql).await.map_err(sanitize_error)?;
+
+        // Validate uniqueness if needed
+        if index.is_unique || index.is_primary {
+            let check_sql = format!(
+                "SELECT COUNT(*) as count FROM (SELECT {} FROM {} GROUP BY {} HAVING COUNT(*) > 1)",
+                index_cols, table_name, index_cols
+            );
+            let check_df = df_context.sql(&check_sql).await.map_err(sanitize_error)?;
+            let results = check_df.collect().await.map_err(sanitize_error)?;
+            let count_val = results
+                .iter()
+                .map(|b| {
+                    if b.num_rows() > 0 {
+                        let col = b.column(0);
+                        let arr = col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+                        arr.value(0)
+                    } else {
+                        0
+                    }
+                })
+                .sum::<i64>();
+            if count_val > 0 {
+                anyhow::bail!(
+                    "Unique index '{}' on '{}.{}.{}' would contain duplicate keys",
+                    index.name,
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
+            }
+        }
+
+        let root = index_snapshot_root(relation, index_name)?;
+        let version_dir = root.join("versions").join(version);
+        fs::create_dir_all(&version_dir)?;
+        let data_path = version_dir.join("data.parquet");
+
+        let sort_exprs = index
+            .columns
+            .iter()
+            .map(|c| col(c).sort(true, true))
+            .collect::<Vec<_>>();
+
+        df.clone()
+            .sort(sort_exprs)
+            .map_err(|e| { println!("sort err: {}", e); sanitize_error(e) })?
+            .write_parquet(
+                data_path.to_str().unwrap(),
+                DataFrameWriteOptions::default().with_single_file_output(true),
+                None,
+            )
+            .await
+            .map_err(|e| { println!("write_parquet err: {}", e); sanitize_error(e) })?;
+
+        let row_count_df = df.aggregate(vec![], vec![count(col("_row_id")).alias("count")])?;
+        let row_count_results = row_count_df.collect().await.map_err(sanitize_error)?;
+        let row_count = row_count_results
+            .iter()
+            .map(|b| {
+                if b.num_rows() > 0 {
+                    let col = b.column(0);
+                    let arr = col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+                    arr.value(0) as usize
+                } else {
+                    0
+                }
+            })
+            .sum::<usize>();
+
+        Ok(IndexSnapshot {
+            database: relation.database.clone(),
+            schema: relation.schema.clone(),
+            table: relation.name.clone(),
+            index: index.name.clone(),
+            columns: index.columns.clone(),
+            unique: index.is_unique,
+            primary: index.is_primary,
+            entries_object: format!("versions/{version}/data.parquet"),
+            row_count,
+        })
     }
 
     async fn refresh_index_snapshots_after_mutation(
@@ -474,7 +572,7 @@ impl PrototypeEngine {
         let relation_lock = self.relation_lock(&relation).await;
         let _read_guard = relation_lock.read().await;
 
-        let Some((index, row_ids)) = best_index_match(&relation, &statement)? else {
+        let Some((index, row_ids)) = self.best_index_match(&request.session, &relation, &statement).await? else {
             return Ok(None);
         };
 
@@ -560,9 +658,9 @@ impl PrototypeEngine {
         }))
     }
 
-    async fn ensure_unique_indexes_after_batch_append(
+    async fn validate_batch_against_table_uniqueness(
         &self,
-        session: &SessionContext,
+        _session: &SessionContext,
         relation: &analyticsdb_control::CatalogRelation,
         batch: &RecordBatch,
     ) -> Result<()> {
@@ -574,12 +672,68 @@ impl PrototypeEngine {
             return Ok(());
         }
 
-        let mut rows = self.collect_table_rows(session, relation).await?;
-        rows.extend(record_batch_rows(batch)?);
-
         for index in &relation.indexes {
-            if index.is_unique || index.is_primary {
-                validate_unique_index_rows(relation, index, &rows)?;
+            if !index.is_unique && !index.is_primary {
+                continue;
+            }
+
+            let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
+                continue;
+            };
+
+            // Use a fresh context for internal validation to avoid catalog registration issues
+            let df_context = DfSessionContext::new();
+            let new_batch_df = df_context.read_batch(batch.clone())?;
+
+            let root = index_snapshot_root(relation, &index.name)?;
+            let snapshot_path = root.join(&snapshot.entries_object);
+            
+            if !snapshot_path.exists() {
+                continue;
+            }
+
+            let snapshot_df = df_context
+                .read_parquet(snapshot_path.to_str().unwrap(), Default::default())
+                .await
+                .map_err(sanitize_error)?;
+
+            let index_cols = index
+                .columns
+                .iter()
+                .map(|c| col(c))
+                .collect::<Vec<_>>();
+            
+            // 1. Check for duplicates within the new batch
+            let batch_dup_df = new_batch_df.clone()
+                .aggregate(index_cols.clone(), vec![count(lit(1)).alias("count")])?
+                .filter(col("count").gt(lit(1)))?;
+            let batch_dup_results = batch_dup_df.collect().await.map_err(sanitize_error)?;
+            if batch_dup_results.iter().any(|b| b.num_rows() > 0) {
+                anyhow::bail!(
+                    "Unique index '{}' on '{}.{}.{}' would contain duplicate keys within the new batch",
+                    index.name,
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
+            }
+
+            // 2. Check for duplicates against existing data (the index snapshot)
+            let join_on_cols = index.columns.iter().map(|c| c.as_str()).collect::<Vec<_>>();
+            let join_df = new_batch_df
+                .join(snapshot_df, datafusion::prelude::JoinType::LeftSemi, &join_on_cols, &join_on_cols, None)?;
+            
+            let join_results = join_df.collect().await.map_err(sanitize_error)?;
+            let count = join_results.iter().map(|b| b.num_rows()).sum::<usize>();
+            println!("validate uniqueness join count: {}", count);
+            if count > 0 {
+                anyhow::bail!(
+                    "Unique index '{}' on '{}.{}.{}' would contain duplicate keys (violation against existing data)",
+                    index.name,
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
             }
         }
 
@@ -669,10 +823,24 @@ impl PrototypeEngine {
         let started = Instant::now();
         let admission = self.control_plane.admit_query(&request.session).await?;
 
-        if parse_insert_select_statement(&request.sql)?.is_some() {
-            anyhow::bail!(
-                "statement query cannot execute SQL that does not return rows; execute it as a statement update"
-            );
+        if let Some(statement) = parse_insert_select_statement(&request.sql)? {
+            let execution = self
+                .execute_insert_select(request, statement, admission, started)
+                .await?;
+            let schema = Arc::new(Schema::empty());
+            let batch_stream =
+                stream::iter(vec![].into_iter().map(Ok::<RecordBatch, DataFusionError>));
+
+            return Ok(QueryExecutionStream {
+                query_id: execution.query_id,
+                coordinator_node_id: execution.coordinator_node_id,
+                session: execution.session,
+                schema: Arc::clone(&schema),
+                stream: Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
+                message: execution.message,
+                outcome: execution.outcome,
+                execution_time_ms: execution.execution_time_ms,
+            });
         }
 
         if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
@@ -702,15 +870,12 @@ impl PrototypeEngine {
         }
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
-            if metadata_statement_schema(&statement).is_none() {
-                anyhow::bail!(
-                    "statement query cannot execute SQL that does not return rows; execute it as a statement update"
-                );
-            }
-
             let execution = self
                 .execute_metadata_query(request, statement, admission, started)
                 .await?;
+            if matches!(execution.outcome, StatementOutcome::Command { .. }) {
+                self.invalidate_session_contexts().await;
+            }
             let schema = Arc::clone(&execution.schema);
             let batches = if execution.batches.is_empty() {
                 vec![RecordBatch::new_empty(Arc::clone(&schema))]
@@ -726,7 +891,7 @@ impl PrototypeEngine {
                 schema: Arc::clone(&schema),
                 stream: Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
                 message: execution.message,
-                outcome: StatementOutcome::Rows,
+                outcome: execution.outcome,
                 execution_time_ms: execution.execution_time_ms,
             });
         }
@@ -743,13 +908,16 @@ impl PrototypeEngine {
         let context = self.create_session_context(&session).await?;
         let dataframe = context.sql(&sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
-        if schema.fields().is_empty() {
-            anyhow::bail!(
-                "statement query cannot execute SQL that does not return rows; execute it as a statement update"
-            );
-        }
 
         let stream = dataframe.execute_stream().await.map_err(sanitize_error)?;
+        let outcome = if schema.fields().is_empty() {
+            StatementOutcome::Command {
+                tag: "OK".to_string(),
+                rows_affected: 0,
+            }
+        } else {
+            StatementOutcome::Rows
+        };
 
         Ok(QueryExecutionStream {
             query_id: admission.query_id,
@@ -758,7 +926,7 @@ impl PrototypeEngine {
             schema,
             stream,
             message: "Query stream opened successfully.".to_string(),
-            outcome: StatementOutcome::Rows,
+            outcome,
             execution_time_ms: started.elapsed().as_millis(),
         })
     }
@@ -768,8 +936,14 @@ impl PrototypeEngine {
             .validate_session(&request.session)
             .await?;
 
+        if parse_insert_select_statement(&request.sql)?.is_some() {
+            return Ok(Some(Arc::new(Schema::empty())));
+        }
+
         if let Some(statement) = parse_metadata_statement(&request.sql) {
-            return Ok(metadata_statement_schema(&statement));
+            return Ok(Some(
+                metadata_statement_schema(&statement).unwrap_or_else(|| Arc::new(Schema::empty())),
+            ));
         }
 
         let control_plane = Arc::clone(&self.control_plane);
@@ -829,32 +1003,69 @@ impl PrototypeEngine {
             .sql(&rewritten_query_sql)
             .await
             .map_err(sanitize_error)?;
-        let source_schema = Arc::new(source_dataframe.schema().as_arrow().clone());
-        let projected_sql = build_insert_select_projection_sql(
-            &rewritten_query_sql,
-            &source_schema,
-            &relation.columns,
-            statement.columns.as_deref(),
-        )?;
-        let projected_dataframe = context.sql(&projected_sql).await.map_err(sanitize_error)?;
-        let (inserted_row_count, prepared_batches) =
-            prepare_dataframe_batches_for_storage(projected_dataframe).await?;
-        let mut projected_rows = Vec::new();
-        for batch in &prepared_batches {
-            projected_rows.extend(record_batch_rows(batch)?);
-        }
-        if !relation.indexes.is_empty() {
-            let mut existing_rows = self.collect_table_rows(&request.session, &relation).await?;
-            existing_rows.extend(projected_rows.clone());
-            self.validate_unique_indexes_for_rows(&relation, &existing_rows)?;
-        }
+        
+        // Align columns with the table
+        let projected_dataframe = if let Some(target_cols) = statement.columns {
+            if source_dataframe.schema().fields().len() != target_cols.len() {
+                anyhow::bail!(
+                    "INSERT has {} target columns but SELECT has {} source columns",
+                    target_cols.len(),
+                    source_dataframe.schema().fields().len()
+                );
+            }
+
+            let mut projections = Vec::new();
+            for table_col in &relation.columns {
+                if table_col.name == "_row_id" {
+                    continue;
+                }
+
+                if let Some(pos) = target_cols.iter().position(|c| c == &table_col.name) {
+                    projections.push(datafusion::prelude::col(source_dataframe.schema().field(pos).name()).alias(table_col.name.clone()));
+                } else {
+                    // If not in target list, use NULL
+                    projections.push(datafusion::prelude::lit(ScalarValue::Null).cast_to(&catalog_data_type(&table_col.data_type), source_dataframe.schema())?.alias(table_col.name.clone()));
+                }
+            }
+            source_dataframe.select(projections)?
+        } else {
+            // No target columns specified, match by position (excluding _row_id)
+            let visible_table_columns: Vec<_> = relation.columns.iter().filter(|c| c.name != "_row_id").collect();
+            if source_dataframe.schema().fields().len() != visible_table_columns.len() {
+                anyhow::bail!(
+                    "INSERT into table with {} columns but SELECT has {} source columns",
+                    visible_table_columns.len(),
+                    source_dataframe.schema().fields().len()
+                );
+            }
+            
+            let mut projections = Vec::new();
+            for (i, table_col) in visible_table_columns.iter().enumerate() {
+                projections.push(datafusion::prelude::col(source_dataframe.schema().field(i).name()).alias(table_col.name.clone()));
+            }
+            source_dataframe.select(projections)?
+        };
+        
+        let mut stream = projected_dataframe.execute_stream().await.map_err(sanitize_error)?;
+        let mut inserted_row_count = 0;
 
         if !storage_path.exists() {
             fs::create_dir_all(&storage_path)?;
         }
-        for batch in prepared_batches {
-            append_record_batch_to_table_snapshot(batch, &storage_path).await?;
+
+        use futures::StreamExt;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(sanitize_error)?;
+            let (batch_row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
+            
+            if !relation.indexes.is_empty() {
+                self.validate_batch_against_table_uniqueness(&request.session, &relation, &prepared_batch).await?;
+            }
+
+            append_record_batch_to_table_snapshot(prepared_batch, &storage_path).await?;
+            inserted_row_count += batch_row_count;
         }
+
         self.refresh_index_snapshots_after_mutation(&request.session, &relation)
             .await;
 
@@ -1205,6 +1416,7 @@ impl PrototypeEngine {
                 ref name,
                 ref columns,
                 unique,
+                concurrently: _,
             } => {
                 let preview_relation = self
                     .control_plane
@@ -1220,10 +1432,11 @@ impl PrototypeEngine {
                     .await?;
                 let relation_lock = self.relation_lock(&preview_relation).await;
                 let _write_guard = relation_lock.write().await;
+                let version = uuid::Uuid::now_v7().to_string();
                 let snapshot = self
-                    .build_index_snapshot_for_relation(&request.session, &preview_relation, name)
+                    .build_index_snapshot_for_relation(&request.session, &preview_relation, name, &version)
                     .await?;
-                write_index_snapshot(&preview_relation, &snapshot)?;
+                write_index_snapshot(&preview_relation, &snapshot, &version)?;
 
                 let (message, _new_session) = match self
                     .control_plane
@@ -1276,14 +1489,16 @@ impl PrototypeEngine {
                     .find(|index| index.name == *name)
                     .ok_or_else(|| anyhow::anyhow!("Index '{}' not found", name))?;
                 index.name = new_name.clone();
+                let version = uuid::Uuid::now_v7().to_string();
                 let snapshot = self
                     .build_index_snapshot_for_relation(
                         &request.session,
                         &preview_relation,
                         &new_name,
+                        &version,
                     )
                     .await?;
-                write_index_snapshot(&preview_relation, &snapshot)?;
+                write_index_snapshot(&preview_relation, &snapshot, &version)?;
 
                 let (message, _new_session) = match self
                     .control_plane
@@ -1605,14 +1820,15 @@ impl PrototypeEngine {
                     columns,
                     &rows,
                 )?;
-                let row_count = batch.num_rows();
-                self.ensure_unique_indexes_after_batch_append(&request.session, &relation, &batch)
+                let (row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
+
+                self.validate_batch_against_table_uniqueness(&request.session, &relation, &prepared_batch)
                     .await?;
 
                 if !storage_path.exists() {
                     fs::create_dir_all(&storage_path)?;
                 }
-                append_record_batch_to_table_snapshot(batch.clone(), &storage_path).await?;
+                append_record_batch_to_table_snapshot(prepared_batch, &storage_path).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await;
 
@@ -1910,14 +2126,16 @@ impl PrototypeEngine {
                                 .collect::<Vec<_>>();
 
                             for index_name in &staged_index_names {
+                                let version = uuid::Uuid::now_v7().to_string();
                                 let snapshot = self
                                     .build_index_snapshot_for_relation(
                                         &request.session,
                                         &preview_relation,
                                         index_name,
+                                        &version,
                                     )
                                     .await?;
-                                write_index_snapshot(&preview_relation, &snapshot)?;
+                                write_index_snapshot(&preview_relation, &snapshot, &version)?;
                             }
 
                             message = match self
@@ -2671,6 +2889,7 @@ impl PrototypeEngine {
         self.execute_query(request).await
     }
 
+    #[allow(dead_code)]
     async fn collect_table_rows(
         &self,
         _session: &SessionContext,
@@ -2938,6 +3157,148 @@ impl PrototypeEngine {
         }
         Ok(rows)
     }
+
+    async fn best_index_match(
+        &self,
+        session: &SessionContext,
+        relation: &analyticsdb_control::CatalogRelation,
+        statement: &IndexedSelectStatement,
+    ) -> Result<Option<(analyticsdb_control::CatalogIndex, Vec<String>)>> {
+        let mut best_match: Option<(analyticsdb_control::CatalogIndex, Vec<String>, usize, bool)> = None;
+
+        for index in &relation.indexes {
+            let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
+                continue;
+            };
+            let Some((score, has_range, row_ids)) = self
+                .candidate_row_ids_from_snapshot(session, relation, index, &snapshot, &statement.predicates)
+                .await?
+            else {
+                continue;
+            };
+
+            let replace = match &best_match {
+                None => true,
+                Some((best_index, best_row_ids, best_score, best_has_range)) => {
+                    score > *best_score
+                        || (score == *best_score && !has_range && *best_has_range)
+                        || (score == *best_score
+                            && has_range == *best_has_range
+                            && index.is_unique
+                            && !best_index.is_unique)
+                        || (score == *best_score
+                            && has_range == *best_has_range
+                            && index.is_unique == best_index.is_unique
+                            && row_ids.len() < best_row_ids.len())
+                }
+            };
+
+            if replace {
+                best_match = Some((index.clone(), row_ids, score, has_range));
+            }
+        }
+
+        Ok(best_match.map(|(index, row_ids, _, _)| (index, row_ids)))
+    }
+
+    async fn candidate_row_ids_from_snapshot(
+        &self,
+        _session: &SessionContext,
+        relation: &analyticsdb_control::CatalogRelation,
+        index: &analyticsdb_control::CatalogIndex,
+        snapshot: &IndexSnapshot,
+        predicates: &BTreeMap<String, IndexPredicate>,
+    ) -> Result<Option<(usize, bool, Vec<String>)>> {
+        let mut matched_prefix_len = 0usize;
+        let mut has_range = false;
+        let mut covered_predicate_columns = 0usize;
+
+        for column in &index.columns {
+            let Some(predicate) = find_index_predicate(predicates, column) else {
+                break;
+            };
+            covered_predicate_columns += 1;
+            match predicate {
+                IndexPredicate::Eq(_) | IndexPredicate::In(_) => {
+                    matched_prefix_len += 1;
+                }
+                IndexPredicate::Range { .. } => {
+                    has_range = true;
+                    break;
+                }
+            }
+        }
+
+        if matched_prefix_len == 0 && !has_range {
+            return Ok(None);
+        }
+        if covered_predicate_columns != predicates.len() {
+            return Ok(None);
+        }
+
+        // Use a fresh context for internal index lookups to avoid catalog registration issues
+        let df_context = DfSessionContext::new();
+        let root = index_snapshot_root(relation, &index.name)?;
+        let snapshot_path = root.join(&snapshot.entries_object);
+
+        if !snapshot_path.exists() {
+            return Ok(None);
+        }
+
+        let mut df = df_context
+            .read_parquet(snapshot_path.to_str().unwrap(), Default::default())
+            .await
+            .map_err(sanitize_error)?;
+
+        for (col_name, predicate) in predicates {
+            let col_expr = col(col_name);
+            let filter_expr = match predicate {
+                IndexPredicate::Eq(val) => col_expr.eq(lit(val.clone())),
+                IndexPredicate::In(vals) => {
+                    col_expr.in_list(vals.iter().map(|v| lit(v.clone())).collect(), false)
+                }
+                IndexPredicate::Range { lower, upper } => {
+                    let mut expr = lit(true);
+                    if let Some((val, inclusive)) = lower {
+                        let lower_expr = if *inclusive {
+                            col_expr.clone().gt_eq(lit(val.clone()))
+                        } else {
+                            col_expr.clone().gt(lit(val.clone()))
+                        };
+                        expr = expr.and(lower_expr);
+                    }
+                    if let Some((val, inclusive)) = upper {
+                        let upper_expr = if *inclusive {
+                            col_expr.clone().lt_eq(lit(val.clone()))
+                        } else {
+                            col_expr.clone().lt(lit(val.clone()))
+                        };
+                        expr = expr.and(upper_expr);
+                    }
+                    expr
+                }
+            };
+            df = df.filter(filter_expr).map_err(sanitize_error)?;
+        }
+
+        let batches = df
+            .select(vec![col("_row_id")])
+            .map_err(sanitize_error)?
+            .collect()
+            .await
+            .map_err(sanitize_error)?;
+
+        let mut row_ids = Vec::new();
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                if let Some(val) = array_value_to_string(batch.column(0), row_idx).ok() {
+                    row_ids.push(val);
+                }
+            }
+        }
+
+        Ok(Some((matched_prefix_len, has_range, row_ids)))
+    }
 }
 
 fn build_arrow_schema_from_definitions(
@@ -3101,75 +3462,64 @@ async fn write_dataframe_to_table_snapshot(
         fs::create_dir_all(path)?;
     }
     clear_table_snapshot_files(path)?;
-    let (row_count, batches) = prepare_dataframe_batches_for_storage(df).await?;
-    for batch in batches {
-        append_record_batch_to_table_snapshot(batch, path).await?;
+
+    let mut stream = df.execute_stream().await.map_err(sanitize_error)?;
+    let mut row_count = 0;
+
+    use futures::StreamExt;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(sanitize_error)?;
+        let (batch_row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
+        append_record_batch_to_table_snapshot(prepared_batch, path).await?;
+        row_count += batch_row_count;
     }
     Ok(row_count)
 }
 
-async fn prepare_dataframe_batches_for_storage(
-    df: datafusion::dataframe::DataFrame,
-) -> Result<(usize, Vec<RecordBatch>)> {
-    let schema = df.schema();
-    let has_row_id = schema.fields().iter().any(|f| f.name() == "_row_id");
+fn prepare_batch_for_storage(batch: RecordBatch) -> Result<(usize, RecordBatch)> {
+    let num_rows = batch.num_rows();
+    let has_row_id = batch.schema().fields().iter().any(|f| f.name() == "_row_id");
 
     if has_row_id {
-        let batches = df.collect().await?;
-        let mut row_count = 0;
-        let mut new_batches = Vec::new();
+        let mut columns = batch.columns().to_vec();
+        let row_id_col_idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_row_id")
+            .unwrap();
+        let row_id_array = batch.column(row_id_col_idx);
 
-        for batch in batches {
-            let num_rows = batch.num_rows();
-            row_count += num_rows;
-            let mut columns = batch.columns().to_vec();
-
-            let row_id_col_idx = batch.schema().fields().iter().position(|f| f.name() == "_row_id").unwrap();
-            let row_id_array = batch.column(row_id_col_idx);
-
-            // Check if it's the AUTO_UUID placeholder
-            let mut needs_replace = false;
-            if let Some(strings) = row_id_array.as_any().downcast_ref::<StringArray>() {
-                if strings.len() > 0 && strings.value(0) == "AUTO_UUID" {
-                    needs_replace = true;
-                }
-            }
-
-            if needs_replace {
-                let row_ids: Vec<String> = (0..num_rows)
-                    .map(|_| uuid::Uuid::now_v7().to_string())
-                    .collect();
-                columns[row_id_col_idx] = Arc::new(StringArray::from(row_ids));
-                new_batches.push(RecordBatch::try_new(batch.schema(), columns)?);
-            } else {
-                new_batches.push(batch);
+        // Check if it's the AUTO_UUID placeholder
+        let mut needs_replace = false;
+        if let Some(strings) = row_id_array.as_any().downcast_ref::<StringArray>() {
+            if strings.len() > 0 && strings.value(0) == "AUTO_UUID" {
+                needs_replace = true;
             }
         }
 
-        Ok((row_count, new_batches))
-    } else {
-        // We need to inject _row_id
-        let batches = df.collect().await?;
-        let mut row_count = 0;
-        let mut new_batches = Vec::new();
-
-        for batch in batches {
-            let num_rows = batch.num_rows();
-            row_count += num_rows;
-            let mut columns = batch.columns().to_vec();
+        if needs_replace {
             let row_ids: Vec<String> = (0..num_rows)
                 .map(|_| uuid::Uuid::now_v7().to_string())
                 .collect();
-            columns.push(Arc::new(StringArray::from(row_ids)));
-
-            let mut fields = batch.schema().fields().to_vec();
-            fields.push(Arc::new(Field::new("_row_id", DataType::Utf8, false)));
-            let new_schema = Arc::new(Schema::new(fields));
-
-            new_batches.push(RecordBatch::try_new(new_schema, columns)?);
+            columns[row_id_col_idx] = Arc::new(StringArray::from(row_ids));
+            Ok((num_rows, RecordBatch::try_new(batch.schema(), columns)?))
+        } else {
+            Ok((num_rows, batch))
         }
+    } else {
+        // We need to inject _row_id
+        let mut columns = batch.columns().to_vec();
+        let row_ids: Vec<String> = (0..num_rows)
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect();
+        columns.push(Arc::new(StringArray::from(row_ids)));
 
-        Ok((row_count, new_batches))
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("_row_id", DataType::Utf8, false)));
+        let new_schema = Arc::new(Schema::new(fields));
+
+        Ok((num_rows, RecordBatch::try_new(new_schema, columns)?))
     }
 }
 
@@ -3497,293 +3847,31 @@ fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStateme
     if !upper.starts_with("INSERT INTO ") {
         return Ok(None);
     }
-    // Very naive parser for prototype
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 4 { return Ok(None); }
-    let name = parts[2].to_string();
-    let Some(select_idx) = upper.find("SELECT ") else {
-        return Ok(None);
-    };
-    let query_sql = trimmed[select_idx..].to_string();
     
-    Ok(Some(InsertSelectStatement {
-        database: None,
-        schema: None,
-        name,
-        columns: None,
-        query_sql,
-    }))
-}
+    // Use regex to find SELECT and extract table name. Use (?is) for case-insensitive and dot-matches-all.
+    let re = regex::Regex::new(r"(?is)INSERT\s+INTO\s+([^\s\(\)]+)\s*(\([^\)]+\))?\s*(SELECT\s+.*)")?;
+    if let Some(caps) = re.captures(trimmed) {
+        let name = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let columns = caps.get(2).map(|m| {
+            m.as_str()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        });
+        let query_sql = caps.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
 
-fn build_insert_select_projection_sql(
-    _query_sql: &str,
-    _source_schema: &SchemaRef,
-    _table_columns: &[CatalogColumn],
-    _target_columns: Option<&[String]>,
-) -> Result<String> {
-    // For prototype, we just return the query_sql if it matches. 
-    // This is handled by DataFusion.
-    Ok(_query_sql.to_string())
-}
-
-fn best_index_match(
-    relation: &analyticsdb_control::CatalogRelation,
-    statement: &IndexedSelectStatement,
-) -> Result<Option<(analyticsdb_control::CatalogIndex, Vec<String>)>> {
-    let mut best_match: Option<(analyticsdb_control::CatalogIndex, Vec<String>, usize, bool)> = None;
-
-    for index in &relation.indexes {
-        let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
-            continue;
-        };
-        let Some((score, has_range, row_ids)) =
-            candidate_row_ids_from_snapshot(relation, index, &snapshot, &statement.predicates)?
-        else {
-            continue;
-        };
-
-        let replace = match &best_match {
-            None => true,
-            Some((best_index, best_row_ids, best_score, best_has_range)) => {
-                score > *best_score
-                    || (score == *best_score && !has_range && *best_has_range)
-                    || (score == *best_score
-                        && has_range == *best_has_range
-                        && index.is_unique
-                        && !best_index.is_unique)
-                    || (score == *best_score
-                        && has_range == *best_has_range
-                        && index.is_unique == best_index.is_unique
-                        && row_ids.len() < best_row_ids.len())
-            }
-        };
-
-        if replace {
-            best_match = Some((index.clone(), row_ids, score, has_range));
-        }
+        return Ok(Some(InsertSelectStatement {
+            database: None,
+            schema: None,
+            name,
+            columns,
+            query_sql,
+        }));
     }
 
-    Ok(best_match.map(|(index, row_ids, _, _)| (index, row_ids)))
-}
-
-fn candidate_row_ids_from_snapshot(
-    relation: &analyticsdb_control::CatalogRelation,
-    index: &analyticsdb_control::CatalogIndex,
-    snapshot: &IndexSnapshot,
-    predicates: &BTreeMap<String, IndexPredicate>,
-) -> Result<Option<(usize, bool, Vec<String>)>> {
-    let mut matched_prefix_len = 0usize;
-    let mut has_range = false;
-    let mut covered_predicate_columns = 0usize;
-
-    for column in &index.columns {
-        let Some(predicate) = find_index_predicate(predicates, column) else {
-            break;
-        };
-        covered_predicate_columns += 1;
-        match predicate {
-            IndexPredicate::Eq(_) | IndexPredicate::In(_) => {
-                matched_prefix_len += 1;
-            }
-            IndexPredicate::Range { .. } => {
-                has_range = true;
-                break;
-            }
-        }
-    }
-
-    if matched_prefix_len == 0 && !has_range {
-        return Ok(None);
-    }
-    if covered_predicate_columns != predicates.len() {
-        return Ok(None);
-    }
-
-    let column_types = index
-        .columns
-        .iter()
-        .map(|column| {
-            relation
-                .columns
-                .iter()
-                .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
-                .map(|catalog_column| catalog_data_type(&catalog_column.data_type))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Column '{}' not found in relation '{}.{}.{}'",
-                        column,
-                        relation.database,
-                        relation.schema,
-                        relation.name
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut row_ids = Vec::new();
-    for (composite_key, entry_row_ids) in &snapshot.entries {
-        let values = composite_key.split('\u{1f}').collect::<Vec<_>>();
-        let mut matched = true;
-        for (position, index_column) in index.columns.iter().enumerate() {
-            let Some(predicate) = find_index_predicate(predicates, index_column) else {
-                break;
-            };
-            let value = values.get(position).copied().unwrap_or_default();
-            if !index_value_satisfies_predicate(value, predicate, &column_types[position])? {
-                matched = false;
-                break;
-            }
-            if matches!(predicate, IndexPredicate::Range { .. }) {
-                break;
-            }
-        }
-
-        if matched {
-            row_ids.extend(entry_row_ids.iter().cloned());
-        }
-    }
-
-    Ok(Some((matched_prefix_len, has_range, row_ids)))
-}
-
-fn find_index_predicate<'a>(
-    predicates: &'a BTreeMap<String, IndexPredicate>,
-    column: &str,
-) -> Option<&'a IndexPredicate> {
-    predicates
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
-        .map(|(_, predicate)| predicate)
-}
-
-fn index_value_satisfies_predicate(
-    candidate: &str,
-    predicate: &IndexPredicate,
-    data_type: &DataType,
-) -> Result<bool> {
-    match predicate {
-        IndexPredicate::Eq(value) => Ok(compare_index_values(candidate, value, data_type)? == Ordering::Equal),
-        IndexPredicate::In(values) => Ok(values.iter().any(|value| {
-            compare_index_values(candidate, value, data_type)
-                .map(|ordering| ordering == Ordering::Equal)
-                .unwrap_or(false)
-        })),
-        IndexPredicate::Range { lower, upper } => {
-            if let Some((lower_value, inclusive)) = lower {
-                let ordering = compare_index_values(candidate, lower_value, data_type)?;
-                if ordering == Ordering::Less || (!inclusive && ordering == Ordering::Equal) {
-                    return Ok(false);
-                }
-            }
-            if let Some((upper_value, inclusive)) = upper {
-                let ordering = compare_index_values(candidate, upper_value, data_type)?;
-                if ordering == Ordering::Greater || (!inclusive && ordering == Ordering::Equal) {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-    }
-}
-
-fn catalog_data_type(data_type: &str) -> DataType {
-    match data_type.to_ascii_uppercase().as_str() {
-        "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
-        "BIGINT" | "INT8" | "INT64" => DataType::Int64,
-        "TEXT" | "VARCHAR" | "STRING" | "UTF8" => DataType::Utf8,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
-        "FLOAT8" | "DOUBLE PRECISION" | "FLOAT64" => DataType::Float64,
-        _ => DataType::Utf8,
-    }
-}
-
-fn compare_index_values(left: &str, right: &str, data_type: &DataType) -> Result<Ordering> {
-    Ok(match data_type {
-        DataType::Int32 => left.parse::<i32>()?.cmp(&right.parse::<i32>()?),
-        DataType::Int64 => left.parse::<i64>()?.cmp(&right.parse::<i64>()?),
-        DataType::Float32 => left
-            .parse::<f32>()?
-            .partial_cmp(&right.parse::<f32>()?)
-            .ok_or_else(|| anyhow::anyhow!("cannot compare NaN float values"))?,
-        DataType::Float64 => left
-            .parse::<f64>()?
-            .partial_cmp(&right.parse::<f64>()?)
-            .ok_or_else(|| anyhow::anyhow!("cannot compare NaN float values"))?,
-        DataType::Boolean => left.parse::<bool>()?.cmp(&right.parse::<bool>()?),
-        _ => left.cmp(right),
-    })
-}
-
-fn build_index_snapshot(
-    relation: &analyticsdb_control::CatalogRelation,
-    index: &analyticsdb_control::CatalogIndex,
-    rows: &[Vec<String>],
-) -> Result<IndexSnapshot> {
-    validate_unique_index_rows(relation, index, rows)?;
-    let index_positions = index_column_positions(relation, &index.columns)?;
-    let row_id_pos = relation
-        .columns
-        .iter()
-        .position(|c| c.name == "_row_id")
-        .ok_or_else(|| anyhow::anyhow!("_row_id column missing from relation"))?;
-
-    let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in rows {
-        let key = index_positions
-            .iter()
-            .map(|pos| row.get(*pos).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\u{1f}");
-        let row_id = row
-            .get(row_id_pos)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        entries.entry(key).or_default().push(row_id);
-    }
-    Ok(IndexSnapshot {
-        database: relation.database.clone(),
-        schema: relation.schema.clone(),
-        table: relation.name.clone(),
-        index: index.name.clone(),
-        columns: index.columns.clone(),
-        unique: index.is_unique,
-        primary: index.is_primary,
-        entries,
-    })
-}
-
-fn validate_unique_index_rows(
-    relation: &analyticsdb_control::CatalogRelation,
-    index: &analyticsdb_control::CatalogIndex,
-    rows: &[Vec<String>],
-) -> Result<()> {
-    if !index.is_unique && !index.is_primary {
-        return Ok(());
-    }
-
-    let index_positions = index_column_positions(relation, &index.columns)?;
-    let mut seen = HashMap::new();
-    for row in rows {
-        let key = index_positions
-            .iter()
-            .map(|pos| row.get(*pos).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\u{1f}");
-        *seen.entry(key).or_insert(0) += 1;
-    }
-
-    if let Some((key, _)) = seen.into_iter().find(|(_, count)| *count > 1) {
-        anyhow::bail!(
-            "Unique index '{}' on '{}.{}.{}' would contain duplicate key '{}'",
-            index.name,
-            relation.database,
-            relation.schema,
-            relation.name,
-            key.replace('\u{1f}', ",")
-        );
-    }
-    Ok(())
+    Ok(None)
 }
 
 fn local_managed_storage_path(storage_location: &str) -> Result<PathBuf> {
@@ -3849,16 +3937,17 @@ fn read_index_snapshot(
     }
 
     let manifest: IndexSnapshotManifest = serde_json::from_str(&fs::read_to_string(manifest_path)?)?;
-    let snapshot_path = root.join(manifest.snapshot_object);
-    if !snapshot_path.exists() {
+    let version_dir = root.join("versions").join(&manifest.version);
+    let metadata_path = version_dir.join("metadata.json");
+    if !metadata_path.exists() {
         anyhow::bail!(
-            "Published index snapshot for '{}.{}.{}' is missing its data object",
+            "Published index snapshot for '{}.{}.{}' is missing its metadata object",
             relation.database,
             relation.schema,
             relation.name
         );
     }
-    Ok(Some(serde_json::from_str(&fs::read_to_string(snapshot_path)?)?))
+    Ok(Some(serde_json::from_str(&fs::read_to_string(metadata_path)?)?))
 }
 
 fn write_json_atomically(path: &Path, contents: &str) -> Result<()> {
@@ -3876,49 +3965,28 @@ fn write_json_atomically(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn prune_old_index_snapshot_versions(versions_dir: &Path, current_snapshot_object: &str) -> Result<()> {
-    let current_file_name = Path::new(current_snapshot_object)
-        .file_name()
-        .map(|value| value.to_owned());
-    for entry in fs::read_dir(versions_dir)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if entry_path.is_file()
-            && current_file_name
-                .as_ref()
-                .map(|name| entry_path.file_name() != Some(name.as_os_str()))
-                .unwrap_or(true)
-        {
-            fs::remove_file(entry_path)?;
-        }
-    }
-    Ok(())
-}
-
 fn write_index_snapshot(
     relation: &analyticsdb_control::CatalogRelation,
     snapshot: &IndexSnapshot,
+    version: &str,
 ) -> Result<()> {
     let root = index_snapshot_root(relation, &snapshot.index)?;
-    let versions_dir = root.join("versions");
-    fs::create_dir_all(&versions_dir)?;
+    let version_dir = root.join("versions").join(version);
+    fs::create_dir_all(&version_dir)?;
 
-    let version = uuid::Uuid::now_v7().to_string();
-    let snapshot_object = format!("versions/{version}.json");
-    let snapshot_path = root.join(&snapshot_object);
-    write_json_atomically(&snapshot_path, &serde_json::to_string_pretty(snapshot)?)?;
+    let metadata_path = version_dir.join("metadata.json");
+    write_json_atomically(&metadata_path, &serde_json::to_string_pretty(snapshot)?)?;
 
     let manifest = IndexSnapshotManifest {
-        version,
-        snapshot_object: snapshot_object.clone(),
-        row_count: snapshot.entries.values().map(Vec::len).sum(),
+        version: version.to_string(),
+        snapshot_object: snapshot.entries_object.clone(),
+        row_count: snapshot.row_count,
         published_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
     write_json_atomically(
         &index_snapshot_manifest_path(relation, &snapshot.index)?,
         &serde_json::to_string_pretty(&manifest)?,
     )?;
-    prune_old_index_snapshot_versions(&versions_dir, &snapshot_object)?;
     Ok(())
 }
 
@@ -3978,6 +4046,20 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("analyticsdb-engine-test-{}.json", uuid::Uuid::now_v7()));
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn test_regex_insert() {
+        let sql = "INSERT INTO orders (id, customer_name, order_value, date_of_purchase)
+SELECT
+  n,
+  'Customer ' || n,
+  ROUND((10 + random() * 990)::numeric, 2),
+  NOW() - (random() * INTERVAL '5 years')
+FROM generate_series(1, 1000000) AS s(n)
+";
+        let result = crate::parse_insert_select_statement(sql).unwrap();
+        assert!(result.is_some(), "Parser failed to match INSERT statement");
     }
 
     fn cleanup_catalog_artifacts(catalog_path: &str) {
@@ -4055,4 +4137,238 @@ mod tests {
 
         cleanup_catalog_artifacts(&catalog_path);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_unique_index_concurrently_works() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO customers VALUES (1, 'one'), (2, 'two')".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Test CREATE UNIQUE INDEX CONCURRENTLY
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE UNIQUE INDEX CONCURRENTLY customers_name_idx ON customers (name)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("CREATE UNIQUE INDEX CONCURRENTLY should succeed");
+
+        assert!(result.message.contains("Index 'customers_name_idx' created successfully"));
+
+        // Verify index is used
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT id, name FROM customers WHERE name = 'one'".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        let response = result.to_query_response();
+        assert_eq!(response.rows.len(), 1);
+        assert!(response.message.contains("using index 'customers_name_idx'"));
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_index_join_pg_class_works() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE test_idx (id INT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE INDEX test_idx_idx ON test_idx (id)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT relname, indisvalid FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid WHERE relname = 'test_idx_idx'".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+
+        let response = result.to_query_response();
+        assert_eq!(response.rows.len(), 1);
+        assert_eq!(response.rows[0][0], "test_idx_idx");
+        assert_eq!(response.rows[0][1], "true");
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repro_user_insert_error() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        let sql = "INSERT INTO orders (id, customer_name, order_value, date_of_purchase)
+SELECT
+  n,
+  'Customer ' || n,
+  ROUND((10 + random() * 990)::numeric, 2),
+  NOW() - (random() * INTERVAL '5 years')
+FROM generate_series(1, 1000000) AS s(n)";
+
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: sql.to_string(),
+                session: session.clone(),
+            })
+            .await;
+
+        if let Err(e) = result {
+            println!("Error: {}", e);
+        } else {
+            println!("Success");
+        }
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repro_datafusion_insert_error() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        let sql = "INSERT INTO orders (id, customer_name, order_value, date_of_purchase)
+SELECT n, 'Customer ' || n, ROUND((10 + random() * 990)::numeric, 2), NOW() - (random() * INTERVAL '5 years')
+FROM generate_series(1, 10) AS s(n)";
+
+        // Force execution through DataFusion
+        let context = engine.create_session_context(&session).await.unwrap();
+        let result = context.sql(sql).await;
+        
+        match result {
+            Ok(_) => println!("Success"),
+            Err(e) => println!("DataFusion error: {}", e),
+        }
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+}
+
+fn find_index_predicate<'a>(
+    predicates: &'a BTreeMap<String, IndexPredicate>,
+    column: &str,
+) -> Option<&'a IndexPredicate> {
+    predicates
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
+        .map(|(_, predicate)| predicate)
+}
+
+fn catalog_data_type(data_type: &str) -> DataType {
+    let upper = data_type.to_ascii_uppercase();
+    if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
+        // Default to Decimal128(38, 10) for prototype if no precision/scale specified
+        // or parse them if we want to be more precise
+        return DataType::Decimal128(38, 10);
+    }
+    match upper.as_str() {
+        "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
+        "BIGINT" | "INT8" | "INT64" => DataType::Int64,
+        "TEXT" | "VARCHAR" | "STRING" | "UTF8" => DataType::Utf8,
+        "BOOLEAN" | "BOOL" => DataType::Boolean,
+        "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
+        "FLOAT8" | "DOUBLE PRECISION" | "FLOAT64" => DataType::Float64,
+        "DATE" => DataType::Date32,
+        _ => DataType::Utf8,
+    }
+}
+
+fn validate_unique_index_rows(
+    relation: &analyticsdb_control::CatalogRelation,
+    index: &analyticsdb_control::CatalogIndex,
+    rows: &[Vec<String>],
+) -> Result<()> {
+    if !index.is_unique && !index.is_primary {
+        return Ok(());
+    }
+
+    let index_positions = index_column_positions(relation, &index.columns)?;
+    let mut seen = std::collections::HashMap::new();
+
+    for row in rows {
+        let key = index_positions
+            .iter()
+            .map(|pos| row.get(*pos).cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        *seen.entry(key).or_insert(0) += 1;
+    }
+
+    if let Some((key, _)) = seen.into_iter().find(|(_, count)| *count > 1) {
+        anyhow::bail!(
+            "Unique index '{}' on '{}.{}.{}' would contain duplicate key '{}'",
+            index.name,
+            relation.database,
+            relation.schema,
+            relation.name,
+            key.replace('\u{1f}', ",")
+        );
+    }
+    Ok(())
 }

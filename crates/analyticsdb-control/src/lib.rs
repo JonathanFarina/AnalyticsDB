@@ -377,6 +377,7 @@ pub enum MetadataStatement {
         name: String,
         columns: Vec<String>,
         unique: bool,
+        concurrently: bool,
     },
     AlterIndex {
         database: Option<String>,
@@ -785,12 +786,46 @@ impl ControlPlane {
                 new_session.transaction_status = analyticsdb_core::TransactionStatus::Idle;
                 "Command completed. 0 row(s) affected.".to_string()
             }
+            MetadataStatement::CreateIndex {
+                database,
+                schema,
+                table,
+                name,
+                columns,
+                unique,
+                concurrently: _,
+            } => {
+                self.create_index(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    table,
+                    name,
+                    columns.clone(),
+                    *unique,
+                )
+                .await?
+            }
+            MetadataStatement::DropIndex {
+                database,
+                schema,
+                name,
+                if_exists,
+                cascade: _,
+            } => {
+                self.drop_index(
+                    session,
+                    database.as_deref(),
+                    schema.as_deref(),
+                    name,
+                    *if_exists,
+                )
+                .await?
+            }
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
             | MetadataStatement::CreateTable { .. }
-            | MetadataStatement::CreateIndex { .. }
             | MetadataStatement::AlterIndex { .. }
-            | MetadataStatement::DropIndex { .. }
             | MetadataStatement::CreateExternalTable { .. }
             | MetadataStatement::InsertInto { .. }
             | MetadataStatement::Update { .. }
@@ -947,6 +982,84 @@ impl ControlPlane {
         }
         self.persist().await?;
         Ok(())
+    }
+
+    pub async fn create_index(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+        name: &str,
+        columns: Vec<String>,
+        unique: bool,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+        let key = relation_key(&database_name, &schema_name, table);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let relation = state
+                .relations
+                .get_mut(&key)
+                .ok_or_else(|| anyhow::anyhow!("Table '{}.{}.{}' not found", database_name, schema_name, table))?;
+
+            if relation.indexes.iter().any(|i| i.name == name) {
+                bail!("Index '{}' already exists on table '{}'", name, table);
+            }
+
+            relation.indexes.push(CatalogIndex {
+                name: name.to_string(),
+                columns,
+                is_unique: unique,
+                is_primary: false,
+            });
+        }
+
+        self.persist().await?;
+        Ok(format!("Index '{}' created successfully.", name))
+    }
+
+    pub async fn drop_index(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        let database_name = database.unwrap_or(&session.database).to_string();
+        let schema_name = schema.unwrap_or(&session.schema).to_string();
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let mut found = false;
+            for relation in state.relations.values_mut() {
+                if relation.database == database_name && relation.schema == schema_name {
+                    if let Some(pos) = relation.indexes.iter().position(|i| i.name == name) {
+                        relation.indexes.remove(pos);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                if if_exists {
+                    return Ok(format!("Index '{}.{}.{}' does not exist, skipping.", database_name, schema_name, name));
+                } else {
+                    bail!("Index '{}' not found", name);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("Index '{}' dropped successfully.", name))
     }
 
     async fn create_database(&self, session: &SessionContext, name: &str) -> Result<String> {
@@ -1740,6 +1853,8 @@ impl ControlPlane {
                 );
             }
 
+            let indexes = indexes_from_constraints(table_name, &constraints);
+
             state.relations.insert(
                 relation_key,
                 CatalogRelation {
@@ -1752,7 +1867,7 @@ impl ControlPlane {
                     external_format: None,
                     columns,
                     constraints,
-                    indexes: Vec::new(),
+                    indexes,
                 },
             );
         }
@@ -3080,6 +3195,35 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 rows,
             })
         }
+        sqlparser::ast::Statement::CreateIndex(create_index) => {
+            let idents: Vec<String> = create_index.table_name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, table) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            let index_name = if let Some(name) = &create_index.name {
+                name.0.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
+            } else {
+                return None;
+            };
+
+            Some(MetadataStatement::CreateIndex {
+                database,
+                schema,
+                table,
+                name: index_name,
+                columns: create_index
+                    .columns
+                    .iter()
+                    .map(|c| c.column.expr.to_string())
+                    .collect(),
+                unique: create_index.unique,
+                concurrently: create_index.concurrently,
+            })
+        }
         sqlparser::ast::Statement::Delete(delete) => {
             let table_name_obj = match &delete.from {
                 sqlparser::ast::FromTable::WithFromKeyword(v) => match &v[0].relation {
@@ -4334,6 +4478,7 @@ fn build_relation_with_catalog_constraint(
     Ok(preview)
 }
 
+#[allow(dead_code)]
 fn build_relation_with_added_constraint(
     state: &CatalogState,
     database_name: &str,
@@ -4536,6 +4681,7 @@ fn build_relation_with_dropped_constraint(
     Ok(preview)
 }
 
+#[allow(dead_code)]
 fn indexes_from_constraints(
     table_name: &str,
     constraints: &[CatalogTableConstraint],

@@ -38,7 +38,7 @@
       "role": "Control",
       "endpoint": "127.0.0.1:50051",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1777580167316
+      "last_heartbeat_at_epoch_ms": 1777923180077
     }
   },
   "relations": {
@@ -96,6 +96,70 @@
         }
       ],
       "indexes": []
+    },
+    "postgres.public.orders": {
+      "database": "postgres",
+      "schema": "public",
+      "name": "orders",
+      "kind": "Table",
+      "definition_sql": null,
+      "storage_path": "cluster-catalog.managed/postgres__public__orders.table.parquet",
+      "external_format": null,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "Int64",
+          "nullable": true,
+          "default_value": null
+        },
+        {
+          "name": "customer_name",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "order_value",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "date_of_purchase",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "_row_id",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "auto_constraint",
+          "kind": "PrimaryKey",
+          "columns": [
+            "id"
+          ],
+          "referenced_database": null,
+          "referenced_schema": null,
+          "referenced_table": null,
+          "referenced_columns": []
+        }
+      ],
+      "indexes": [
+        {
+          "name": "orders_id_idx",
+          "columns": [
+            "id"
+          ],
+          "is_unique": true,
+          "is_primary": false
+        }
+      ]
     }
   },
   "aggregates": {},
