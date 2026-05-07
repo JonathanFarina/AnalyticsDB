@@ -32,6 +32,23 @@ pub struct ExecutePartitionRequest {
     pub partition_files: Vec<String>,
 }
 
+/// Splits `files` into at most `num_workers` chunks using round-robin assignment.
+///
+/// Empty chunks are never emitted — if `files.len() < num_workers` the returned
+/// Vec will have fewer entries than `num_workers`.  Returns an empty Vec when
+/// `files` is empty.
+pub fn partition_files_for_workers(files: Vec<String>, num_workers: usize) -> Vec<Vec<String>> {
+    if files.is_empty() || num_workers == 0 {
+        return Vec::new();
+    }
+    let buckets = num_workers.min(files.len());
+    let mut chunks: Vec<Vec<String>> = (0..buckets).map(|_| Vec::new()).collect();
+    for (i, file) in files.into_iter().enumerate() {
+        chunks[i % buckets].push(file);
+    }
+    chunks
+}
+
 // ─── Arrow IPC encoding helpers ─────────────────────────────────────────────
 
 /// Encodes a slice of `RecordBatch`es as a single Arrow IPC stream.
@@ -163,5 +180,38 @@ mod tests {
         let decoded: ExecutePartitionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.query_id, "q1");
         assert_eq!(decoded.partition_files, vec!["/tmp/a.parquet"]);
+    }
+
+    #[test]
+    fn partition_files_round_robin_even() {
+        let files: Vec<String> = (0..6).map(|i| format!("f{i}.parquet")).collect();
+        let chunks = partition_files_for_workers(files, 3);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec!["f0.parquet", "f3.parquet"]);
+        assert_eq!(chunks[1], vec!["f1.parquet", "f4.parquet"]);
+        assert_eq!(chunks[2], vec!["f2.parquet", "f5.parquet"]);
+    }
+
+    #[test]
+    fn partition_files_fewer_files_than_workers() {
+        let files: Vec<String> = vec!["a.parquet".to_string(), "b.parquet".to_string()];
+        let chunks = partition_files_for_workers(files, 5);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], vec!["a.parquet"]);
+        assert_eq!(chunks[1], vec!["b.parquet"]);
+    }
+
+    #[test]
+    fn partition_files_empty() {
+        let chunks = partition_files_for_workers(vec![], 4);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn partition_files_single_worker() {
+        let files: Vec<String> = vec!["x.parquet".to_string(), "y.parquet".to_string()];
+        let chunks = partition_files_for_workers(files.clone(), 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], files);
     }
 }

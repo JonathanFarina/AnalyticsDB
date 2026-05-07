@@ -78,6 +78,37 @@ pub async fn write_parquet_batches(
     Ok(())
 }
 
+/// Returns the local filesystem paths of all `.parquet` files that are direct children
+/// of `prefix` (non-recursive). Paths are returned as absolute strings suitable for
+/// DataFusion's `read_parquet([...])` function.
+pub async fn list_parquet_files(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+) -> Result<Vec<String>> {
+    let prefix_str = prefix.as_ref().to_owned();
+    let mut list = store.list(Some(prefix));
+    let mut files = Vec::new();
+    loop {
+        match list.next().await {
+            None => break,
+            Some(Ok(meta)) => {
+                let loc = meta.location.as_ref();
+                let relative = loc
+                    .strip_prefix(&*prefix_str)
+                    .unwrap_or(loc)
+                    .trim_start_matches('/');
+                if !relative.contains('/') && relative.ends_with(".parquet") {
+                    // Prepend '/' so DataFusion sees an absolute path.
+                    files.push(format!("/{}", loc));
+                }
+            }
+            Some(Err(OsError::NotFound { .. })) => break,
+            Some(Err(e)) => return Err(e.into()),
+        }
+    }
+    Ok(files)
+}
+
 /// Deletes all `.parquet` files that are direct children of `prefix` (non-recursive).
 ///
 /// Objects in sub-prefixes (e.g. `.analyticsdb_indexes/`) are left untouched.

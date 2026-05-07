@@ -18,10 +18,10 @@ This document tracks the tasks required to transition the `analyticsdb` engine f
 
 ## Phase 3: Distributed Query Planning (Coordinator)
 **Goal:** The Coordinator splits the query and merges the results.
-- [ ] Enhance `execute_query` to identify if a query can be distributed.
-- [ ] Implement a partitioner that divides the target table's Parquet files into chunks.
-- [ ] Dispatch the chunks concurrently to the available Compute nodes via the Flight client.
-- [ ] Implement a stream merger on the Coordinator to combine the incoming Flight streams from workers and apply final aggregations/sorting.
+- [x] Enhance `execute_query` to identify if a query can be distributed.
+- [x] Implement a partitioner that divides the target table's Parquet files into chunks.
+- [x] Dispatch the chunks concurrently to the available Compute nodes via the Flight client.
+- [x] Implement a stream merger on the Coordinator to combine the incoming Flight streams from workers and apply final aggregations/sorting.
 
 ## Phase 4: Distributed Writes (Parallel Inserts)
 **Goal:** Distribute `INSERT INTO ... SELECT` execution.

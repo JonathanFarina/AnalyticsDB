@@ -872,6 +872,133 @@ impl PrototypeEngine {
             .await
     }
 
+    /// Attempts to execute `request.sql` as a distributed scatter-gather query.
+    ///
+    /// Returns `None` when:
+    /// - the SQL is not a plain `SELECT … FROM <table>` targeting a managed table, or
+    /// - there are no Ready Compute nodes available (falls through to local execution).
+    ///
+    /// When Compute nodes are available the query is rewritten to use
+    /// `read_parquet([…])` syntax so workers don't need catalog access, then
+    /// dispatched concurrently.  RecordBatches from all workers are concatenated.
+    async fn try_execute_distributed_select(
+        &self,
+        request: &QueryRequest,
+        admission: &QueryAdmission,
+        started: Instant,
+    ) -> Result<Option<QueryExecutionResult>> {
+        // Only attempt distribution for plain SELECT statements.
+        let Some((db, schema_name, table_name)) =
+            parse_plain_select_table(&request.sql)
+        else {
+            return Ok(None);
+        };
+
+        // Resolve the managed relation; fall through if not found.
+        let relation = match self
+            .control_plane
+            .table_relation(
+                &request.session,
+                db.as_deref(),
+                schema_name.as_deref(),
+                &table_name,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        let Some(storage_location) = relation.storage_path.as_deref() else {
+            return Ok(None);
+        };
+
+        // Discover available Compute nodes.
+        let partition_client = distributed::PartitionClient::new(Arc::clone(&self.control_plane));
+        let compute_nodes = partition_client.list_compute_nodes().await?;
+        if compute_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        // Enumerate the Parquet files backing the table.
+        let (store, prefix) = storage::store_for_location(storage_location)?;
+        let files = storage::list_parquet_files(&store, &prefix).await?;
+        if files.is_empty() {
+            // Table is empty — return zero rows without hitting workers.
+            let schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
+            return Ok(Some(QueryExecutionResult {
+                query_id: admission.query_id.clone(),
+                coordinator_node_id: admission.coordinator_node_id.clone(),
+                session: request.session.clone(),
+                schema,
+                batches: vec![],
+                message: "Distributed query: 0 row(s) returned (empty table).".to_string(),
+                outcome: StatementOutcome::Rows,
+                execution_time_ms: started.elapsed().as_millis(),
+            }));
+        }
+
+        // Partition files across available workers (round-robin).
+        let chunks = distributed::partition_files_for_workers(files, compute_nodes.len());
+
+        // Build one ExecutePartitionRequest per worker chunk.
+        let worker_tasks: Vec<_> = chunks
+            .into_iter()
+            .zip(compute_nodes.iter())
+            .map(|(chunk_files, node)| {
+                let file_list = chunk_files
+                    .iter()
+                    .map(|f| format!("'{}'", f.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let worker_sql = format!(
+                    "SELECT * FROM read_parquet([{}])",
+                    file_list
+                );
+                let req = distributed::ExecutePartitionRequest {
+                    query_id: admission.query_id.clone(),
+                    sql: worker_sql,
+                    session: request.session.clone(),
+                    partition_files: chunk_files,
+                };
+                let endpoint = node.endpoint.clone();
+                (endpoint, req)
+            })
+            .collect();
+
+        // Dispatch concurrently.
+        let dispatch_futures: Vec<_> = worker_tasks
+            .iter()
+            .map(|(endpoint, req)| partition_client.execute_on_node(endpoint, req))
+            .collect();
+
+        let results = futures::future::join_all(dispatch_futures).await;
+
+        // Collect and merge all RecordBatches.
+        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        for result in results {
+            all_batches.extend(result?);
+        }
+
+        let schema: SchemaRef = if let Some(first) = all_batches.first() {
+            first.schema()
+        } else {
+            build_arrow_schema_from_catalog_columns(&relation.columns)?
+        };
+
+        let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+        Ok(Some(QueryExecutionResult {
+            query_id: admission.query_id.clone(),
+            coordinator_node_id: admission.coordinator_node_id.clone(),
+            session: request.session.clone(),
+            schema,
+            batches: all_batches,
+            message: format!("Distributed query: {row_count} row(s) returned from {} node(s).", compute_nodes.len()),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: started.elapsed().as_millis(),
+        }))
+    }
+
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
         let started = Instant::now();
         self.control_plane
@@ -901,6 +1028,13 @@ impl PrototypeEngine {
             if matches!(result.outcome, StatementOutcome::Command { .. }) {
                 self.invalidate_session_contexts().await;
             }
+            return Ok(result);
+        }
+
+        if let Some(result) = self
+            .try_execute_distributed_select(request, &admission, started)
+            .await?
+        {
             return Ok(result);
         }
 
@@ -1015,6 +1149,29 @@ impl PrototypeEngine {
                 stream: Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
                 message: execution.message,
                 outcome: execution.outcome,
+                execution_time_ms: execution.execution_time_ms,
+            });
+        }
+
+        if let Some(execution) = self
+            .try_execute_distributed_select(request, &admission, started)
+            .await?
+        {
+            let schema = Arc::clone(&execution.schema);
+            let batches = if execution.batches.is_empty() {
+                vec![RecordBatch::new_empty(Arc::clone(&schema))]
+            } else {
+                execution.batches
+            };
+            let batch_stream = stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>));
+            return Ok(QueryExecutionStream {
+                query_id: execution.query_id,
+                coordinator_node_id: execution.coordinator_node_id,
+                session: execution.session,
+                schema: Arc::clone(&schema),
+                stream: Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
+                message: execution.message,
+                outcome: StatementOutcome::Rows,
                 execution_time_ms: execution.execution_time_ms,
             });
         }
@@ -4452,6 +4609,47 @@ fn store_range_binary_predicate(
     }
 }
 
+/// Returns `(database, schema, table)` if `sql` is a plain SELECT that reads
+/// exactly one managed table and has no sub-queries, CTEs, or JOINs.
+///
+/// The result is used by `try_execute_distributed_select` to decide whether the
+/// query can be fanned out to Compute nodes.  Conservative: returns `None` for
+/// anything that doesn't look like `SELECT … FROM [db.][ schema.]table [WHERE …]`.
+fn parse_plain_select_table(sql: &str) -> Option<(Option<String>, Option<String>, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.into_iter().next()?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    // Reject CTEs.
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    // Exactly one FROM item, no JOINs.
+    if select.from.len() != 1 {
+        return None;
+    }
+    let table_with_joins = &select.from[0];
+    if !table_with_joins.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &table_with_joins.relation else {
+        return None;
+    };
+    let parts: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
+    match parts.as_slice() {
+        [table] => Some((None, None, table.clone())),
+        [schema, table] => Some((None, Some(schema.clone()), table.clone())),
+        [db, schema, table] => Some((Some(db.clone()), Some(schema.clone()), table.clone())),
+        _ => None,
+    }
+}
+
 fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStatement>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
@@ -4931,6 +5129,98 @@ FROM generate_series(1, 10) AS s(n)";
 
         let result = engine.execute_partition(&req).await.expect("partition should execute");
         assert_eq!(result.query_id, "test-partition-q1");
+        assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[test]
+    fn parse_plain_select_table_simple() {
+        assert_eq!(
+            parse_plain_select_table("SELECT * FROM my_table"),
+            Some((None, None, "my_table".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_plain_select_table_qualified() {
+        assert_eq!(
+            parse_plain_select_table("SELECT id FROM public.users"),
+            Some((None, Some("public".to_string()), "users".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_plain_select_table_fully_qualified() {
+        assert_eq!(
+            parse_plain_select_table("SELECT * FROM mydb.public.orders"),
+            Some((
+                Some("mydb".to_string()),
+                Some("public".to_string()),
+                "orders".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_plain_select_table_rejects_join() {
+        assert_eq!(
+            parse_plain_select_table("SELECT * FROM a JOIN b ON a.id = b.id"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_plain_select_table_rejects_subquery() {
+        assert_eq!(
+            parse_plain_select_table("SELECT * FROM (SELECT 1) sub"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_plain_select_table_rejects_cte() {
+        assert_eq!(
+            parse_plain_select_table("WITH cte AS (SELECT 1) SELECT * FROM cte"),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_select_falls_through_to_local_when_no_compute_nodes() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE dist_test (id INT, val TEXT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO dist_test SELECT 1, 'hello'".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        // No compute nodes registered → falls through to local DataFusion execution.
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT * FROM dist_test".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("local fallback should succeed");
+
         assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         cleanup_catalog_artifacts(&catalog_path);
     }
