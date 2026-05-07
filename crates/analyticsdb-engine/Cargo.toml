@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 analyticsdb-core = { path = "../analyticsdb-core" }
 analyticsdb-control = { path = "../analyticsdb-control" }
 chrono.workspace = true
@@ -24,6 +25,7 @@ sqlparser.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+object_store.workspace = true
 regex = "1.12.3"
 tokio-stream.workspace = true
 
