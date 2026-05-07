@@ -11,10 +11,10 @@ This document tracks the tasks required to transition the `analyticsdb` engine f
 
 ## Phase 2: Inter-node Communication (Arrow Flight)
 **Goal:** Establish a mechanism for the Coordinator to dispatch sub-queries to Compute nodes.
-- [ ] Define a custom Flight `DoAction` (e.g., `ExecutePartition`) in the `analyticsdb-server` / `analyticsdb-protocol` crates.
-- [ ] Implement serialization/deserialization for task payloads (SQL/plan fragment + specific target Parquet files).
-- [ ] Implement the worker-side execution of `ExecutePartition` that reads the assigned files and streams results back.
-- [ ] Implement the Coordinator-side client logic to discover Compute nodes from Raft and establish Flight connections.
+- [x] Define a custom Flight `DoAction` (e.g., `ExecutePartition`) in the `analyticsdb-server` / `analyticsdb-protocol` crates.
+- [x] Implement serialization/deserialization for task payloads (SQL/plan fragment + specific target Parquet files).
+- [x] Implement the worker-side execution of `ExecutePartition` that reads the assigned files and streams results back.
+- [x] Implement the Coordinator-side client logic to discover Compute nodes from Raft and establish Flight connections.
 
 ## Phase 3: Distributed Query Planning (Coordinator)
 **Goal:** The Coordinator splits the query and merges the results.

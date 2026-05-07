@@ -1722,6 +1722,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
         let action = request.into_inner();
+
         if action.r#type == "JoinCluster" {
             let req: analyticsdb_control::raft::JoinRequest =
                 serde_json::from_slice(&action.body).map_err(status_from_error)?;
@@ -1733,6 +1734,28 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
                 .map_err(status_from_error)?;
             let body = serde_json::to_vec(&res).map_err(status_from_error)?;
             let response = FlightResult { body: body.into() };
+            return Ok(Response::new(Box::pin(stream::once(async {
+                Ok(response)
+            }))));
+        }
+
+        if action.r#type == "ExecutePartition" {
+            let req: analyticsdb_engine::ExecutePartitionRequest =
+                serde_json::from_slice(&action.body).map_err(status_from_error)?;
+
+            let result = self
+                .engine
+                .execute_partition(&req)
+                .await
+                .map_err(status_from_error)?;
+
+            let ipc_bytes = analyticsdb_engine::distributed::batches_to_ipc_bytes(
+                &result.schema,
+                &result.batches,
+            )
+            .map_err(status_from_error)?;
+
+            let response = FlightResult { body: ipc_bytes };
             return Ok(Response::new(Box::pin(stream::once(async {
                 Ok(response)
             }))));

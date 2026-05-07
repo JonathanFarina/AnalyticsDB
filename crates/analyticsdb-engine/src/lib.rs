@@ -33,9 +33,12 @@ use tracing::warn;
 
 pub mod functions;
 pub mod postgres_compatibility;
+pub mod distributed;
 pub mod sql_rewriter;
 pub mod storage;
 pub mod system_catalog;
+
+pub use distributed::{ExecutePartitionRequest, PartitionClient};
 
 use functions::register_postgres_functions;
 use system_catalog::PgCatalogSchemaProvider;
@@ -411,6 +414,38 @@ impl PrototypeEngine {
 
     pub fn control_plane(&self) -> Arc<ControlPlane> {
         Arc::clone(&self.control_plane)
+    }
+
+    /// Executes an `ExecutePartitionRequest` on behalf of a Coordinator.
+    ///
+    /// The worker runs `req.sql` in a fresh DataFusion session, bypassing
+    /// admission control (the Coordinator has already admitted the query).
+    /// The SQL must be fully self-contained — if it references specific Parquet
+    /// files it should use DataFusion's `read_parquet([…])` function directly.
+    pub async fn execute_partition(
+        &self,
+        req: &distributed::ExecutePartitionRequest,
+    ) -> Result<QueryExecutionResult> {
+        let started = std::time::Instant::now();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        register_postgres_functions(&ctx);
+
+        let df = ctx.sql(&req.sql).await.map_err(sanitize_error)?;
+        let schema = Arc::new(df.schema().as_arrow().as_ref().clone());
+        let batches = df.collect().await.map_err(sanitize_error)?;
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        Ok(QueryExecutionResult {
+            query_id: req.query_id.clone(),
+            coordinator_node_id: String::new(),
+            session: req.session.clone(),
+            schema,
+            batches,
+            message: format!("{row_count} row(s) from partition."),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: started.elapsed().as_millis(),
+        })
     }
 
     async fn relation_lock(
@@ -4874,6 +4909,29 @@ FROM generate_series(1, 10) AS s(n)";
             Ok(_) => println!("Success"),
             Err(e) => println!("DataFusion error: {}", e),
         }
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_partition_runs_scalar_sql() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+
+        let req = crate::distributed::ExecutePartitionRequest {
+            query_id: "test-partition-q1".to_string(),
+            sql: "SELECT 1 + 1 AS result".to_string(),
+            session: SessionContext {
+                protocol: Protocol::Embedded,
+                ..SessionContext::default()
+            },
+            partition_files: vec![],
+        };
+
+        let result = engine.execute_partition(&req).await.expect("partition should execute");
+        assert_eq!(result.query_id, "test-partition-q1");
+        assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         cleanup_catalog_artifacts(&catalog_path);
     }
 }

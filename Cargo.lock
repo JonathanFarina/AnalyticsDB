@@ -123,6 +123,7 @@ dependencies = [
  "analyticsdb-control",
  "analyticsdb-core",
  "anyhow",
+ "arrow-flight",
  "async-trait",
  "bytes",
  "chrono",
@@ -140,6 +141,7 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tokio-stream",
+ "tonic",
  "tracing",
  "uuid",
 ]
