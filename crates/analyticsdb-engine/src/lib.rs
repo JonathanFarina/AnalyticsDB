@@ -38,7 +38,9 @@ pub mod sql_rewriter;
 pub mod storage;
 pub mod system_catalog;
 
-pub use distributed::{ExecutePartitionRequest, PartitionClient};
+pub use distributed::{
+    ExecutePartitionRequest, ExecutePartitionWriteAck, ExecutePartitionWriteRequest, PartitionClient,
+};
 
 use functions::register_postgres_functions;
 use system_catalog::PgCatalogSchemaProvider;
@@ -431,7 +433,18 @@ impl PrototypeEngine {
         let ctx = datafusion::prelude::SessionContext::new();
         register_postgres_functions(&ctx);
 
-        let df = ctx.sql(&req.sql).await.map_err(sanitize_error)?;
+        // When partition files are provided, read them directly via the Rust API.
+        // DataFusion does not expose `read_parquet([...])` as a SQL table function.
+        let df = if !req.partition_files.is_empty() {
+            ctx.read_parquet(
+                req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
+                Default::default(),
+            )
+            .await
+            .map_err(sanitize_error)?
+        } else {
+            ctx.sql(&req.sql).await.map_err(sanitize_error)?
+        };
         let schema = Arc::new(df.schema().as_arrow().as_ref().clone());
         let batches = df.collect().await.map_err(sanitize_error)?;
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -445,6 +458,53 @@ impl PrototypeEngine {
             message: format!("{row_count} row(s) from partition."),
             outcome: StatementOutcome::Rows,
             execution_time_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    /// Executes an `ExecutePartitionWriteRequest` on behalf of a Coordinator.
+    ///
+    /// Runs `req.sql` in a fresh DataFusion session, writes each output batch
+    /// as a distinct UUID-named Parquet file under `req.write_prefix` in the
+    /// shared object store, and returns an acknowledgment with the written file
+    /// paths and total row count.
+    pub async fn execute_distributed_write_partition(
+        &self,
+        req: &distributed::ExecutePartitionWriteRequest,
+    ) -> Result<distributed::ExecutePartitionWriteAck> {
+        let (store, prefix) = storage::store_for_location(&req.write_prefix)?;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        register_postgres_functions(&ctx);
+
+        // Use the Rust API to read partition files directly — DataFusion does not
+        // expose `read_parquet([...])` as a SQL table function in this version.
+        let df = ctx
+            .read_parquet(
+                req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
+                Default::default(),
+            )
+            .await
+            .map_err(sanitize_error)?;
+        let batches = df.collect().await.map_err(sanitize_error)?;
+
+        let mut written_files = Vec::new();
+        let mut total_rows = 0usize;
+
+        for batch in batches {
+            let (row_count, prepared) = prepare_batch_for_storage(batch)?;
+            if row_count == 0 {
+                continue;
+            }
+            let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+            let key = prefix.clone().join(file_name.as_str());
+            storage::write_parquet_batches(&store, &key, prepared.schema(), &[prepared]).await?;
+            written_files.push(format!("/{}", key.as_ref()));
+            total_rows += row_count;
+        }
+
+        Ok(distributed::ExecutePartitionWriteAck {
+            written_files,
+            row_count: total_rows,
         })
     }
 
@@ -946,18 +1006,10 @@ impl PrototypeEngine {
             .into_iter()
             .zip(compute_nodes.iter())
             .map(|(chunk_files, node)| {
-                let file_list = chunk_files
-                    .iter()
-                    .map(|f| format!("'{}'", f.replace('\'', "''")))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let worker_sql = format!(
-                    "SELECT * FROM read_parquet([{}])",
-                    file_list
-                );
                 let req = distributed::ExecutePartitionRequest {
                     query_id: admission.query_id.clone(),
-                    sql: worker_sql,
+                    // sql is unused when partition_files is non-empty; kept for tracing.
+                    sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
                     session: request.session.clone(),
                     partition_files: chunk_files,
                 };
@@ -995,6 +1047,171 @@ impl PrototypeEngine {
             batches: all_batches,
             message: format!("Distributed query: {row_count} row(s) returned from {} node(s).", compute_nodes.len()),
             outcome: StatementOutcome::Rows,
+            execution_time_ms: started.elapsed().as_millis(),
+        }))
+    }
+
+    /// Attempts to execute `INSERT INTO target SELECT … FROM source` in a distributed fashion.
+    ///
+    /// Returns `None` (fall through to local single-node execution) when:
+    /// - the SELECT source is not a plain managed table, or
+    /// - the target table has unique/primary-key indexes (cross-partition duplicate
+    ///   checking is not yet implemented), or
+    /// - there are no Ready Compute nodes.
+    ///
+    /// When distribution is possible, each worker receives a subset of the source
+    /// Parquet files and writes its output directly to the target table's shared
+    /// object store prefix.  The Coordinator then updates index sidecars.
+    async fn try_execute_distributed_insert_select(
+        &self,
+        request: &QueryRequest,
+        statement: &InsertSelectStatement,
+        admission: &QueryAdmission,
+        started: Instant,
+    ) -> Result<Option<QueryExecutionResult>> {
+        // Only distribute when the SELECT source is a plain table reference.
+        let Some((src_db, src_schema, src_table)) =
+            parse_plain_select_table(&statement.query_sql)
+        else {
+            return Ok(None);
+        };
+
+        // Resolve the target relation.
+        let target_relation = match self
+            .control_plane
+            .table_relation(
+                &request.session,
+                statement.database.as_deref(),
+                statement.schema.as_deref(),
+                &statement.name,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        // Skip distribution when uniqueness constraints exist — cross-partition
+        // duplicate validation requires a separate merge step not yet implemented.
+        if target_relation
+            .indexes
+            .iter()
+            .any(|idx| idx.is_unique || idx.is_primary)
+        {
+            return Ok(None);
+        }
+
+        let Some(target_storage) = target_relation.storage_path.as_deref() else {
+            return Ok(None);
+        };
+
+        // Discover Ready Compute nodes.
+        let partition_client = distributed::PartitionClient::new(Arc::clone(&self.control_plane));
+        let compute_nodes = partition_client.list_compute_nodes().await?;
+        if compute_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        // Resolve the source relation and its Parquet files.
+        let source_relation = match self
+            .control_plane
+            .table_relation(
+                &request.session,
+                src_db.as_deref(),
+                src_schema.as_deref(),
+                &src_table,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        let Some(source_storage) = source_relation.storage_path.as_deref() else {
+            return Ok(None);
+        };
+
+        let (src_store, src_prefix) = storage::store_for_location(source_storage)?;
+        let source_files = storage::list_parquet_files(&src_store, &src_prefix).await?;
+        if source_files.is_empty() {
+            // Nothing to insert.
+            return Ok(Some(QueryExecutionResult {
+                query_id: admission.query_id.clone(),
+                coordinator_node_id: admission.coordinator_node_id.clone(),
+                session: request.session.clone(),
+                schema: Arc::new(Schema::empty()),
+                batches: vec![],
+                message: format!(
+                    "Inserted 0 row(s) into '{}.{}.{}' (source table is empty).",
+                    target_relation.database, target_relation.schema, target_relation.name
+                ),
+                outcome: StatementOutcome::Command {
+                    tag: "INSERT".to_string(),
+                    rows_affected: 0,
+                },
+                execution_time_ms: started.elapsed().as_millis(),
+            }));
+        }
+
+        // Partition source files across workers.
+        let chunks = distributed::partition_files_for_workers(source_files, compute_nodes.len());
+
+        // Acquire the write lock on the target relation.
+        let relation_lock = self.relation_lock(&target_relation).await;
+        let _write_guard = relation_lock.write().await;
+
+        // Build one ExecutePartitionWriteRequest per worker chunk.
+        let worker_tasks: Vec<_> = chunks
+            .into_iter()
+            .zip(compute_nodes.iter())
+            .map(|(chunk_files, node)| {
+                let req = distributed::ExecutePartitionWriteRequest {
+                    query_id: admission.query_id.clone(),
+                    // sql is unused when partition_files is non-empty; kept for tracing.
+                    sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
+                    session: request.session.clone(),
+                    partition_files: chunk_files,
+                    write_prefix: target_storage.to_string(),
+                };
+                (node.endpoint.clone(), req)
+            })
+            .collect();
+
+        // Dispatch all workers concurrently.
+        let dispatch_futures: Vec<_> = worker_tasks
+            .iter()
+            .map(|(endpoint, req)| partition_client.write_on_node(endpoint, req))
+            .collect();
+
+        let results = futures::future::join_all(dispatch_futures).await;
+
+        let mut total_rows = 0usize;
+        for result in results {
+            let ack = result?;
+            total_rows += ack.row_count;
+        }
+
+        // Commit: refresh index sidecars now that new Parquet files are visible.
+        self.refresh_index_snapshots_after_mutation(&request.session, &target_relation)
+            .await;
+
+        Ok(Some(QueryExecutionResult {
+            query_id: admission.query_id.clone(),
+            coordinator_node_id: admission.coordinator_node_id.clone(),
+            session: request.session.clone(),
+            schema: Arc::new(Schema::empty()),
+            batches: vec![],
+            message: format!(
+                "Distributed insert: {total_rows} row(s) inserted into '{}.{}.{}' via {} node(s).",
+                target_relation.database,
+                target_relation.schema,
+                target_relation.name,
+                compute_nodes.len(),
+            ),
+            outcome: StatementOutcome::Command {
+                tag: "INSERT".to_string(),
+                rows_affected: total_rows as u64,
+            },
             execution_time_ms: started.elapsed().as_millis(),
         }))
     }
@@ -1254,6 +1471,14 @@ impl PrototypeEngine {
         admission: QueryAdmission,
         started: Instant,
     ) -> Result<QueryExecutionResult> {
+        // Attempt distributed execution first; fall through on None.
+        if let Some(result) = self
+            .try_execute_distributed_insert_select(request, &statement, &admission, started)
+            .await?
+        {
+            return Ok(result);
+        }
+
         let relation = self
             .control_plane
             .table_relation(
@@ -5222,6 +5447,125 @@ FROM generate_series(1, 10) AS s(n)";
             .expect("local fallback should succeed");
 
         assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_distributed_write_partition_writes_parquet() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        // Create a source table and populate it.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE write_src (n INT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO write_src SELECT * FROM generate_series(1, 5) AS s(n)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Find where the source table's parquet files live.
+        let src_relation = engine
+            .control_plane()
+            .table_relation(&session, None, None, "write_src")
+            .await
+            .unwrap();
+        let src_path = src_relation.storage_path.clone().unwrap();
+        let (src_store, src_prefix) =
+            crate::storage::store_for_location(&src_path).unwrap();
+        let src_files = crate::storage::list_parquet_files(&src_store, &src_prefix)
+            .await
+            .unwrap();
+        assert!(!src_files.is_empty(), "source table must have parquet files");
+
+        // Create a target directory for the worker to write into.
+        let write_dir = std::env::temp_dir().join(format!(
+            "analyticsdb-write-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&write_dir).unwrap();
+        let write_prefix = format!("file://{}", write_dir.display());
+
+        let req = crate::distributed::ExecutePartitionWriteRequest {
+            query_id: "write-test-1".to_string(),
+            sql: format!("SELECT * FROM partition ({} files)", src_files.len()),
+            session: session.clone(),
+            partition_files: src_files,
+            write_prefix,
+        };
+
+        let ack = engine
+            .execute_distributed_write_partition(&req)
+            .await
+            .expect("write partition should succeed");
+
+        assert_eq!(ack.row_count, 5);
+        assert!(!ack.written_files.is_empty());
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_insert_falls_through_to_local_when_no_compute_nodes() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE ins_src (x INT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO ins_src SELECT * FROM generate_series(1, 3) AS s(x)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE ins_dst (x INT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        // No compute nodes → falls through to local single-node execution.
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO ins_dst SELECT * FROM ins_src".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("local insert fallback should succeed");
+
+        assert!(matches!(
+            result.outcome,
+            analyticsdb_core::StatementOutcome::Command { ref tag, rows_affected: 3 }
+            if tag == "INSERT"
+        ));
+
         cleanup_catalog_artifacts(&catalog_path);
     }
 }

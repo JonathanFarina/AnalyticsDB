@@ -25,6 +25,6 @@ This document tracks the tasks required to transition the `analyticsdb` engine f
 
 ## Phase 4: Distributed Writes (Parallel Inserts)
 **Goal:** Distribute `INSERT INTO ... SELECT` execution.
-- [ ] Modify the distributed planner to instruct workers to write their output directly to the shared object store as distinct Parquet files.
-- [ ] Collect success acknowledgments from all workers.
-- [ ] Have the Coordinator commit the new files to the table's manifest/metadata in Raft and update index sidecars.
+- [x] Modify the distributed planner to instruct workers to write their output directly to the shared object store as distinct Parquet files.
+- [x] Collect success acknowledgments from all workers.
+- [x] Have the Coordinator commit the new files to the table's manifest/metadata in Raft and update index sidecars.

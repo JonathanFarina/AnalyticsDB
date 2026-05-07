@@ -68,6 +68,29 @@ pub fn ipc_bytes_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     reader.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Payload sent from a Coordinator to a Compute node via `ExecutePartitionWrite`.
+///
+/// The worker runs `sql` (a self-contained SELECT, typically using `read_parquet([…])`),
+/// writes every output batch directly to `write_prefix` in the shared object store as
+/// a distinct UUID-named Parquet file, then responds with an acknowledgment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutePartitionWriteRequest {
+    pub query_id: String,
+    pub sql: String,
+    pub session: SessionContext,
+    pub partition_files: Vec<String>,
+    /// Absolute filesystem path prefix under which the worker writes its output files.
+    pub write_prefix: String,
+}
+
+/// Acknowledgment returned by a worker after completing an `ExecutePartitionWrite`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutePartitionWriteAck {
+    /// Paths of Parquet files written by this worker (absolute, relative to store root).
+    pub written_files: Vec<String>,
+    pub row_count: usize,
+}
+
 // ─── Coordinator-side client ─────────────────────────────────────────────────
 
 /// Used by a Coordinator to discover Compute nodes and dispatch partition tasks
@@ -90,6 +113,32 @@ impl PartitionClient {
             .into_iter()
             .filter(|n| n.role == NodeRole::Compute && n.status == NodeStatus::Ready)
             .collect())
+    }
+
+    /// Sends an `ExecutePartitionWrite` DoAction to a Compute node, instructing
+    /// the worker to run `req.sql` and write its output directly to the shared
+    /// object store under `req.write_prefix`.  Returns the acknowledgment
+    /// containing the written file paths and row count.
+    pub async fn write_on_node(
+        &self,
+        node_endpoint: &str,
+        req: &ExecutePartitionWriteRequest,
+    ) -> Result<ExecutePartitionWriteAck> {
+        let channel = build_channel(node_endpoint).await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+
+        let action = Action {
+            r#type: "ExecutePartitionWrite".to_string(),
+            body: serde_json::to_vec(req)?.into(),
+        };
+
+        let mut stream = client.do_action(action).await?;
+        let flight_result = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Worker returned no acknowledgment"))??;
+        let ack: ExecutePartitionWriteAck = serde_json::from_slice(&flight_result.body)?;
+        Ok(ack)
     }
 
     /// Sends an `ExecutePartition` DoAction to a Compute node and collects the

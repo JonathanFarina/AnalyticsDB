@@ -1761,6 +1761,23 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             }))));
         }
 
+        if action.r#type == "ExecutePartitionWrite" {
+            let req: analyticsdb_engine::ExecutePartitionWriteRequest =
+                serde_json::from_slice(&action.body).map_err(status_from_error)?;
+
+            let ack = self
+                .engine
+                .execute_distributed_write_partition(&req)
+                .await
+                .map_err(status_from_error)?;
+
+            let body = serde_json::to_vec(&ack).map_err(status_from_error)?.into();
+            let response = FlightResult { body };
+            return Ok(Response::new(Box::pin(stream::once(async {
+                Ok(response)
+            }))));
+        }
+
         Err(Status::unimplemented(format!(
             "Unknown action type: {}",
             action.r#type
