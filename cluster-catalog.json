@@ -38,7 +38,7 @@
       "role": "Control",
       "endpoint": "127.0.0.1:50051",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1777923180077
+      "last_heartbeat_at_epoch_ms": 1778140633889
     }
   },
   "relations": {

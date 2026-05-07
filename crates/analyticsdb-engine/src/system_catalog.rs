@@ -189,7 +189,10 @@ fn catalog_relation_to_schema(relation: &analyticsdb_control::CatalogRelation) -
                     "date" => DataType::Date32,
                     _ => {
                         if lower.starts_with("timestamp") {
-                            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None)
+                            DataType::Timestamp(
+                                datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                                None,
+                            )
                         } else {
                             DataType::Utf8 // Default to text for prototype
                         }
@@ -201,7 +204,7 @@ fn catalog_relation_to_schema(relation: &analyticsdb_control::CatalogRelation) -
         .collect();
 
     if !fields.iter().any(|f| f.name() == "_row_id") {
-        fields.push(Field::new("_row_id", DataType::Utf8, false));
+        fields.push(Field::new("_row_id", DataType::Utf8, true));
     }
 
     Arc::new(Schema::new(fields))
@@ -1405,7 +1408,11 @@ impl TableProvider for PgIndexTable {
             if rel.database == session.database {
                 let table_oid = synthetic_relation_oid(&rel.database, &rel.schema, &rel.name);
                 for index in &rel.indexes {
-                    indexrelid.push(synthetic_relation_oid(&rel.database, &rel.schema, &index.name));
+                    indexrelid.push(synthetic_relation_oid(
+                        &rel.database,
+                        &rel.schema,
+                        &index.name,
+                    ));
                     indrelid.push(table_oid);
                     indnatts.push(index.columns.len() as i16);
                     indisunique.push(index.is_unique);

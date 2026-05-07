@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::PathBuf;
 use std::{collections::BTreeSet, fmt};
 
 use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
@@ -17,6 +18,7 @@ enum SqlCapability {
     CreateSchemaQualified,
     CreateTableAs,
     CreateTableQualifiedAs,
+    SelectInto,
     CreateTableDefined,
     CreateTableQualifiedDefined,
     CreateView,
@@ -86,6 +88,8 @@ fn documented_sql_capabilities_from_readme() -> BTreeSet<SqlCapability> {
             SqlCapability::CreateTableAs
         } else if line.starts_with("- `CREATE TABLE <schema>.<name> AS") {
             SqlCapability::CreateTableQualifiedAs
+        } else if line.starts_with("- `SELECT <select-list> INTO <name>") {
+            SqlCapability::SelectInto
         } else if line.starts_with("- `CREATE TABLE <name> (") {
             SqlCapability::CreateTableDefined
         } else if line.starts_with("- `CREATE TABLE <schema>.<name> (") {
@@ -161,6 +165,7 @@ fn parity_matrix_sql_capabilities() -> BTreeSet<SqlCapability> {
         SqlCapability::CreateSchemaQualified,
         SqlCapability::CreateTableAs,
         SqlCapability::CreateTableQualifiedAs,
+        SqlCapability::SelectInto,
         SqlCapability::CreateTableDefined,
         SqlCapability::CreateTableQualifiedDefined,
         SqlCapability::CreateView,
@@ -209,6 +214,34 @@ fn cleanup_catalog_artifacts(catalog_path: &str) {
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
     let _ = std::fs::remove_dir_all(managed_dir);
+}
+
+fn managed_table_storage_dir(
+    catalog_path: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> PathBuf {
+    let mut managed_dir = PathBuf::from(catalog_path);
+    let stem = managed_dir
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("catalog path should have a file stem")
+        .to_string();
+    managed_dir.set_file_name(format!("{stem}.managed"));
+    managed_dir.join(format!("{database}__{schema}__{table}.table.parquet"))
+}
+
+fn index_snapshot_root(
+    catalog_path: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    index_name: &str,
+) -> PathBuf {
+    managed_table_storage_dir(catalog_path, database, schema, table)
+        .join(".analyticsdb_indexes")
+        .join(index_name)
 }
 
 struct BackgroundServer {
@@ -1292,6 +1325,257 @@ async fn cli_creates_defined_table_inserts_rows_and_queries_them_across_invocati
     assert!(describe_stdout.contains("status"));
     assert!(describe_stdout.contains("is_hot"));
     assert!(describe_stdout.contains("Boolean"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_select_into_managed_table() {
+    let catalog_path = temp_catalog_path();
+
+    let select_into_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT 11 AS metric, 'ok' AS status INTO fact_select_into",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let select_into_stdout =
+        String::from_utf8(select_into_output).expect("stdout should be valid utf-8");
+    assert!(select_into_stdout.contains("1 row(s) materialized by SELECT INTO"));
+
+    let query_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT metric, status FROM fact_select_into",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let query_stdout = String::from_utf8(query_output).expect("stdout should be valid utf-8");
+    assert!(query_stdout.contains("metric"));
+    assert!(query_stdout.contains("status"));
+    assert!(query_stdout.contains("11"));
+    assert!(query_stdout.contains("ok"));
+
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "CREATE SCHEMA reporting",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT metric, status INTO reporting.fact_select_into_copy FROM fact_select_into",
+        ])
+        .assert()
+        .success();
+
+    let show_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SHOW TABLES FROM reporting",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let show_stdout = String::from_utf8(show_output).expect("stdout should be valid utf-8");
+    assert!(show_stdout.contains("fact_select_into_copy"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_reindex_index_and_table_statements() {
+    let catalog_path = temp_catalog_path();
+
+    for sql in [
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, email TEXT, city TEXT)",
+        "INSERT INTO customers VALUES (1, 'one@example.test', 'london'), (2, 'two@example.test', 'paris')",
+        "CREATE INDEX customers_email_idx ON customers (email)",
+        "CREATE INDEX customers_city_idx ON customers (city)",
+    ] {
+        Command::cargo_bin("analyticsdb")
+            .expect("binary should build")
+            .args(["query", "--catalog-path", &catalog_path, "--sql", sql])
+            .assert()
+            .success();
+    }
+
+    let email_lookup = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM customers WHERE email = 'two@example.test'",
+        ]);
+        command
+    });
+    assert_eq!(email_lookup.rows, vec![vec!["2".to_string()]]);
+    assert!(email_lookup.message.contains("customers_email_idx"));
+
+    let email_index_root =
+        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_email_idx");
+    std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
+    assert!(
+        !email_index_root.join("manifest.json").exists(),
+        "email index manifest should be removed before REINDEX INDEX"
+    );
+
+    let email_without_index = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM customers WHERE email = 'two@example.test'",
+        ]);
+        command
+    });
+    assert_eq!(email_without_index.rows, vec![vec!["2".to_string()]]);
+    assert!(!email_without_index.message.contains("using index"));
+
+    let reindex_index_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "REINDEX INDEX customers_email_idx",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let reindex_index_stdout =
+        String::from_utf8(reindex_index_output).expect("stdout should be valid utf-8");
+    assert!(reindex_index_stdout.contains("reindexed successfully"));
+    assert!(
+        email_index_root.join("manifest.json").exists(),
+        "REINDEX INDEX should recreate the missing manifest"
+    );
+
+    let email_with_index_again = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM customers WHERE email = 'two@example.test'",
+        ]);
+        command
+    });
+    assert_eq!(email_with_index_again.rows, vec![vec!["2".to_string()]]);
+    assert!(email_with_index_again
+        .message
+        .contains("using index 'customers_email_idx'"));
+
+    let city_index_root =
+        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_city_idx");
+    std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
+    std::fs::remove_dir_all(&city_index_root).expect("city index snapshot root should exist");
+
+    let city_without_index = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM customers WHERE city = 'paris'",
+        ]);
+        command
+    });
+    assert_eq!(city_without_index.rows, vec![vec!["2".to_string()]]);
+    assert!(!city_without_index.message.contains("using index"));
+
+    let reindex_table_output = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "REINDEX TABLE customers",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let reindex_table_stdout =
+        String::from_utf8(reindex_table_output).expect("stdout should be valid utf-8");
+    assert!(reindex_table_stdout.contains("Reindexed 3 index(es)"));
+    assert!(
+        email_index_root.join("manifest.json").exists(),
+        "REINDEX TABLE should recreate the email index manifest"
+    );
+    assert!(
+        city_index_root.join("manifest.json").exists(),
+        "REINDEX TABLE should recreate the city index manifest"
+    );
+
+    let city_with_index_again = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM customers WHERE city = 'paris'",
+        ]);
+        command
+    });
+    assert_eq!(city_with_index_again.rows, vec![vec!["2".to_string()]]);
+    assert!(city_with_index_again
+        .message
+        .contains("using index 'customers_city_idx'"));
 
     cleanup_catalog_artifacts(&catalog_path);
 }
@@ -3274,6 +3558,13 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             sql: "CREATE TABLE reporting.fact_ctas_reporting AS SELECT 31 AS metric, 'schema' AS status",
         },
         SuccessCase {
+            name: "select into managed table",
+            capability: SqlCapability::SelectInto,
+            database: None,
+            schema: None,
+            sql: "SELECT 41 AS metric, 'select-into' AS status INTO fact_select_into",
+        },
+        SuccessCase {
             name: "show tables default schema",
             capability: SqlCapability::ShowTables,
             database: None,
@@ -3534,6 +3825,13 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             database: None,
             schema: None,
             sql: "DROP TABLE reporting.fact_ctas_reporting",
+        },
+        SuccessCase {
+            name: "drop select-into table",
+            capability: SqlCapability::DropTable,
+            database: None,
+            schema: None,
+            sql: "DROP TABLE fact_select_into",
         },
         SuccessCase {
             name: "drop table",
@@ -4182,6 +4480,162 @@ async fn cli_wire_protocols_keep_customers_sql_shapes_in_parity() {
     }
 
     cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_protocols_support_reindex_index_and_table() {
+    let postgres_catalog_path = temp_catalog_path();
+    let flight_catalog_path = temp_catalog_path();
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&postgres_catalog_path).await;
+    let (_flight_server, flight_endpoint) = start_flight_sql_server(&flight_catalog_path).await;
+
+    for sql in [
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, email TEXT, city TEXT)",
+        "INSERT INTO customers VALUES (1, 'one@example.test', 'london'), (2, 'two@example.test', 'paris')",
+        "CREATE INDEX customers_email_idx ON customers (email)",
+        "CREATE INDEX customers_city_idx ON customers (city)",
+    ] {
+        let _ = protocol_json_response("postgres", &postgres_endpoint, Some("public"), sql);
+        let _ = protocol_json_response("flight-sql", &flight_endpoint, Some("public"), sql);
+    }
+
+    let pg_email_index_root = index_snapshot_root(
+        &postgres_catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_email_idx",
+    );
+    let fl_email_index_root = index_snapshot_root(
+        &flight_catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_email_idx",
+    );
+    std::fs::remove_dir_all(&pg_email_index_root).expect("postgres email index snapshot root");
+    std::fs::remove_dir_all(&fl_email_index_root).expect("flight email index snapshot root");
+
+    let pg_email_without_index = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
+    let fl_email_without_index = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
+    assert_supported_protocol_equivalence(
+        "reindex precheck without email index snapshot",
+        &pg_email_without_index,
+        &fl_email_without_index,
+    );
+    assert!(!pg_email_without_index.message.contains("using index"));
+
+    let pg_reindex_index = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "REINDEX INDEX customers_email_idx",
+    );
+    let fl_reindex_index = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "REINDEX INDEX customers_email_idx",
+    );
+    assert_supported_protocol_equivalence(
+        "reindex index command",
+        &pg_reindex_index,
+        &fl_reindex_index,
+    );
+    assert!(pg_email_index_root.join("manifest.json").exists());
+    assert!(fl_email_index_root.join("manifest.json").exists());
+
+    let pg_email_with_index = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
+    let fl_email_with_index = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
+    assert_supported_protocol_equivalence(
+        "reindex index lookup parity",
+        &pg_email_with_index,
+        &fl_email_with_index,
+    );
+    assert_eq!(pg_email_with_index.rows, vec![vec!["2".to_string()]]);
+
+    let pg_city_index_root = index_snapshot_root(
+        &postgres_catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_city_idx",
+    );
+    let fl_city_index_root = index_snapshot_root(
+        &flight_catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_city_idx",
+    );
+    std::fs::remove_dir_all(&pg_email_index_root).expect("postgres email index snapshot root");
+    std::fs::remove_dir_all(&pg_city_index_root).expect("postgres city index snapshot root");
+    std::fs::remove_dir_all(&fl_email_index_root).expect("flight email index snapshot root");
+    std::fs::remove_dir_all(&fl_city_index_root).expect("flight city index snapshot root");
+
+    let pg_reindex_table = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "REINDEX TABLE customers",
+    );
+    let fl_reindex_table = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "REINDEX TABLE customers",
+    );
+    assert_supported_protocol_equivalence(
+        "reindex table command",
+        &pg_reindex_table,
+        &fl_reindex_table,
+    );
+    assert!(pg_email_index_root.join("manifest.json").exists());
+    assert!(pg_city_index_root.join("manifest.json").exists());
+    assert!(fl_email_index_root.join("manifest.json").exists());
+    assert!(fl_city_index_root.join("manifest.json").exists());
+
+    let pg_city_with_index = protocol_json_response(
+        "postgres",
+        &postgres_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE city = 'paris'",
+    );
+    let fl_city_with_index = protocol_json_response(
+        "flight-sql",
+        &flight_endpoint,
+        Some("public"),
+        "SELECT id FROM customers WHERE city = 'paris'",
+    );
+    assert_supported_protocol_equivalence(
+        "reindex table lookup parity",
+        &pg_city_with_index,
+        &fl_city_with_index,
+    );
+    assert_eq!(pg_city_with_index.rows, vec![vec!["2".to_string()]]);
+
+    cleanup_catalog_artifacts(&postgres_catalog_path);
+    cleanup_catalog_artifacts(&flight_catalog_path);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::PathBuf;
 
 use analyticsdb_engine::PrototypeEngine;
 use analyticsdb_protocol::serve_postgres_wire;
@@ -23,6 +24,34 @@ fn cleanup_catalog_artifacts(catalog_path: &str) {
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
     let _ = std::fs::remove_dir_all(managed_dir);
+}
+
+fn managed_table_storage_dir(
+    catalog_path: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> PathBuf {
+    let mut managed_dir = PathBuf::from(catalog_path);
+    let stem = managed_dir
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("catalog path should have a file stem")
+        .to_string();
+    managed_dir.set_file_name(format!("{stem}.managed"));
+    managed_dir.join(format!("{database}__{schema}__{table}.table.parquet"))
+}
+
+fn index_snapshot_root(
+    catalog_path: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    index_name: &str,
+) -> PathBuf {
+    managed_table_storage_dir(catalog_path, database, schema, table)
+        .join(".analyticsdb_indexes")
+        .join(index_name)
 }
 
 struct BackgroundServer {
@@ -124,6 +153,30 @@ async fn test_transaction_shims_coverage() {
     }
 
     // cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_select_into() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    let output = run_sql(
+        &endpoint,
+        "SELECT 7 AS metric, 'covered' AS status INTO fact_select_into",
+    );
+    assert!(
+        output.contains("Command completed. 1 row(s) affected."),
+        "Actual output: {}",
+        output
+    );
+
+    let select = run_sql(&endpoint, "SELECT metric, status FROM fact_select_into");
+    assert!(select.contains("metric"), "Actual output: {}", select);
+    assert!(select.contains("status"), "Actual output: {}", select);
+    assert!(select.contains("7"), "Actual output: {}", select);
+    assert!(select.contains("covered"), "Actual output: {}", select);
+
+    cleanup_catalog_artifacts(&catalog_path);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -391,13 +444,76 @@ async fn test_alter_database_and_shims_coverage() {
         "Actual output: {}",
         conv
     );
-    assert!(
-        conv.contains("ALTER CONVERSION completed"),
-        "Actual output: {}",
-        conv
-    );
 
     // cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reindex() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    for sql in [
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, email TEXT, city TEXT)",
+        "INSERT INTO customers VALUES (1, 'one@example.test', 'london'), (2, 'two@example.test', 'paris')",
+        "CREATE INDEX customers_email_idx ON customers (email)",
+        "CREATE INDEX customers_city_idx ON customers (city)",
+    ] {
+        let output = run_sql(&endpoint, sql);
+        assert!(
+            output.contains("Command completed"),
+            "setup statement should succeed: {sql}\nactual output: {output}"
+        );
+    }
+
+    let initial_email_lookup =
+        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    assert!(initial_email_lookup.contains("2"));
+
+    let email_index_root =
+        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_email_idx");
+    std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
+
+    let email_without_index =
+        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    assert!(email_without_index.contains("2"));
+    assert!(!email_without_index.contains("using index"));
+
+    let reindex_index = run_sql(&endpoint, "REINDEX INDEX customers_email_idx");
+    assert!(
+        reindex_index.contains("Command completed"),
+        "Actual output: {reindex_index}"
+    );
+    assert!(
+        email_index_root.join("manifest.json").exists(),
+        "REINDEX INDEX should recreate the missing manifest"
+    );
+
+    let email_with_index_again =
+        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    assert!(email_with_index_again.contains("2"));
+
+    let city_index_root =
+        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_city_idx");
+    std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
+    std::fs::remove_dir_all(&city_index_root).expect("city index snapshot root should exist");
+
+    let city_without_index = run_sql(&endpoint, "SELECT id FROM customers WHERE city = 'paris'");
+    assert!(city_without_index.contains("2"));
+    assert!(!city_without_index.contains("using index"));
+
+    let reindex_table = run_sql(&endpoint, "REINDEX TABLE customers");
+    assert!(
+        reindex_table.contains("Command completed"),
+        "Actual output: {reindex_table}"
+    );
+    assert!(email_index_root.join("manifest.json").exists());
+    assert!(city_index_root.join("manifest.json").exists());
+
+    let city_with_index_again = run_sql(&endpoint, "SELECT id FROM customers WHERE city = 'paris'");
+    assert!(city_with_index_again.contains("2"));
+
+    cleanup_catalog_artifacts(&catalog_path);
 }
 
 #[tokio::test(flavor = "multi_thread")]

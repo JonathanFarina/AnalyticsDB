@@ -680,11 +680,96 @@ fn sql_returns_rows(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     let upper = trimmed.to_ascii_uppercase();
 
+    if select_into_is_command(&upper) {
+        return false;
+    }
+
     upper.starts_with("SELECT")
         || upper.starts_with("SHOW")
         || upper.starts_with("DESCRIBE")
         || upper.starts_with("EXPLAIN")
         || upper.starts_with("WITH")
+}
+
+fn select_into_is_command(upper_sql: &str) -> bool {
+    if !upper_sql.starts_with("SELECT") {
+        return false;
+    }
+
+    let keywords = top_level_keywords(upper_sql);
+    let into_position = keywords
+        .iter()
+        .position(|keyword| keyword.as_str() == "INTO");
+    let from_position = keywords
+        .iter()
+        .position(|keyword| keyword.as_str() == "FROM");
+
+    match (into_position, from_position) {
+        (Some(into), Some(from)) => into < from,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn top_level_keywords(sql: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_single_quote {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            if ch == '"' {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                flush_top_level_keyword(&mut keywords, &mut current, paren_depth);
+                in_single_quote = true;
+            }
+            '"' => {
+                flush_top_level_keyword(&mut keywords, &mut current, paren_depth);
+                in_double_quote = true;
+            }
+            '(' => {
+                flush_top_level_keyword(&mut keywords, &mut current, paren_depth);
+                paren_depth += 1;
+            }
+            ')' => {
+                flush_top_level_keyword(&mut keywords, &mut current, paren_depth);
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => current.push(c),
+            _ => flush_top_level_keyword(&mut keywords, &mut current, paren_depth),
+        }
+    }
+
+    flush_top_level_keyword(&mut keywords, &mut current, paren_depth);
+    keywords
+}
+
+fn flush_top_level_keyword(keywords: &mut Vec<String>, current: &mut String, paren_depth: usize) {
+    if paren_depth == 0 && !current.is_empty() {
+        keywords.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
 }
 
 fn render_response(response: &QueryResponse, format: OutputFormat) {

@@ -4,17 +4,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
-
 [dependencies]
 analyticsdb-core = { path = "../analyticsdb-core" }
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
-openraft.workspace = true
+openraft = { workspace = true, features = ["serde"] }
+openraft-rocksstore = "0.9.21"
 prost.workspace = true
+rocksdb = "0.22.0"
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
+thiserror = "2.0.18"
 tokio = { workspace = true, features = ["sync", "fs", "rt"] }
 tonic.workspace = true
 uuid.workspace = true
+

@@ -1,36 +1,34 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use serde::{Serialize, Deserialize};
 
 use analyticsdb_control::{
     parse_metadata_statement, AlterDatabaseOperation, AlterObjectOperation, AlterTableOperation,
     CatalogColumn, CatalogRelationKind, CatalogTableConstraint, CatalogTableConstraintKind,
-    ControlPlane, MetadataStatement, QueryAdmission, TableColumnDefinition,
+    ControlPlane, MetadataStatement, QueryAdmission, ReindexTarget, TableColumnDefinition,
     TableConstraintDefinition,
 };
 use analyticsdb_core::{QueryRequest, QueryResponse, SessionContext, StatementOutcome};
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{
-    Array, ArrayRef, RecordBatch, StringArray,
-};
+use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::ExprSchemable;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext as DfSessionContext};
-use datafusion::logical_expr::ExprSchemable;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use futures::stream;
-use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tracing::warn;
 
@@ -75,8 +73,7 @@ fn session_context_cache_key(session: &SessionContext) -> String {
 pub struct PrototypeEngine {
     control_plane: Arc<ControlPlane>,
     session_context_cache: Arc<tokio::sync::RwLock<HashMap<String, DfSessionContext>>>,
-    relation_locks:
-        Arc<tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    relation_locks: Arc<tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
 }
 
 impl std::fmt::Debug for PrototypeEngine {
@@ -224,16 +221,17 @@ fn metadata_statement_schema(statement: &MetadataStatement) -> Option<SchemaRef>
     match statement {
         MetadataStatement::ShowDatabases => Some(utf8_schema(&["database_name"])),
         MetadataStatement::ShowSchemas { .. } => Some(utf8_schema(&["schema_name"])),
-        MetadataStatement::ShowNodes => {
-            Some(utf8_schema(&["node_id", "kind", "status", "last_heartbeat_ms"]))
-        }
+        MetadataStatement::ShowNodes => Some(utf8_schema(&[
+            "node_id",
+            "kind",
+            "status",
+            "last_heartbeat_ms",
+        ])),
         MetadataStatement::ShowTables { .. } => Some(utf8_schema(&["table_name"])),
         MetadataStatement::ShowViews { .. } => Some(utf8_schema(&["view_name"])),
-        MetadataStatement::ShowColumns { .. } => Some(utf8_schema(&[
-            "column_name",
-            "data_type",
-            "is_nullable",
-        ])),
+        MetadataStatement::ShowColumns { .. } => {
+            Some(utf8_schema(&["column_name", "data_type", "is_nullable"]))
+        }
         MetadataStatement::InformationSchemaSchemata { .. } => Some(utf8_schema(&[
             "catalog_name",
             "schema_name",
@@ -341,6 +339,59 @@ fn metadata_statement_schema(statement: &MetadataStatement) -> Option<SchemaRef>
     }
 }
 
+fn metadata_statement_sql(statement: &MetadataStatement) -> Option<&str> {
+    match statement {
+        MetadataStatement::InformationSchemaSchemata { sql }
+        | MetadataStatement::InformationSchemaTables { sql }
+        | MetadataStatement::InformationSchemaColumns { sql }
+        | MetadataStatement::InformationSchemaViews { sql }
+        | MetadataStatement::InformationSchemaTableConstraints { sql }
+        | MetadataStatement::InformationSchemaKeyColumnUsage { sql }
+        | MetadataStatement::InformationSchemaConstraintColumnUsage { sql }
+        | MetadataStatement::InformationSchemaConstraintTableUsage { sql }
+        | MetadataStatement::InformationSchemaReferentialConstraints { sql } => Some(sql),
+        _ => None,
+    }
+}
+
+fn projected_metadata_schema(sql: &str, base_schema: &SchemaRef) -> Result<SchemaRef> {
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)?;
+    let Some(Statement::Query(query)) = statements.first() else {
+        return Ok(Arc::clone(base_schema));
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(Arc::clone(base_schema));
+    };
+
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)))
+    {
+        return Ok(Arc::clone(base_schema));
+    }
+
+    let mut fields = Vec::new();
+    for item in &select.projection {
+        let name = match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident.to_string(),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents
+                .last()
+                .map(|ident| ident.to_string())
+                .unwrap_or_else(|| item.to_string()),
+            SelectItem::ExprWithAlias { alias, .. } => alias.to_string(),
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+                return Ok(Arc::clone(base_schema));
+            }
+            _ => item.to_string(),
+        };
+        fields.push(Field::new(name, DataType::Utf8, false));
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 impl PrototypeEngine {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -366,7 +417,10 @@ impl PrototypeEngine {
         &self,
         relation: &analyticsdb_control::CatalogRelation,
     ) -> Arc<tokio::sync::RwLock<()>> {
-        let key = format!("{}.{}.{}", relation.database, relation.schema, relation.name);
+        let key = format!(
+            "{}.{}.{}",
+            relation.database, relation.schema, relation.name
+        );
         {
             let locks = self.relation_locks.read().await;
             if let Some(lock) = locks.get(&key) {
@@ -447,7 +501,10 @@ impl PrototypeEngine {
                 .map(|b| {
                     if b.num_rows() > 0 {
                         let col = b.column(0);
-                        let arr = col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+                        let arr = col
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                            .unwrap();
                         arr.value(0)
                     } else {
                         0
@@ -478,14 +535,20 @@ impl PrototypeEngine {
 
         df.clone()
             .sort(sort_exprs)
-            .map_err(|e| { println!("sort err: {}", e); sanitize_error(e) })?
+            .map_err(|e| {
+                println!("sort err: {}", e);
+                sanitize_error(e)
+            })?
             .write_parquet(
                 data_path.to_str().unwrap(),
                 DataFrameWriteOptions::default().with_single_file_output(true),
                 None,
             )
             .await
-            .map_err(|e| { println!("write_parquet err: {}", e); sanitize_error(e) })?;
+            .map_err(|e| {
+                println!("write_parquet err: {}", e);
+                sanitize_error(e)
+            })?;
 
         let row_count_df = df.aggregate(vec![], vec![count(col("_row_id")).alias("count")])?;
         let row_count_results = row_count_df.collect().await.map_err(sanitize_error)?;
@@ -494,7 +557,10 @@ impl PrototypeEngine {
             .map(|b| {
                 if b.num_rows() > 0 {
                     let col = b.column(0);
-                    let arr = col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        .unwrap();
                     arr.value(0) as usize
                 } else {
                     0
@@ -572,7 +638,10 @@ impl PrototypeEngine {
         let relation_lock = self.relation_lock(&relation).await;
         let _read_guard = relation_lock.read().await;
 
-        let Some((index, row_ids)) = self.best_index_match(&request.session, &relation, &statement).await? else {
+        let Some((index, row_ids)) = self
+            .best_index_match(&request.session, &relation, &statement)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -604,11 +673,16 @@ impl PrototypeEngine {
         // Use a clean DataFusion SessionContext to filter by _row_id
         let context = DfSessionContext::new();
 
-        let storage_path = relation.storage_path.as_ref().ok_or_else(|| anyhow::anyhow!("Missing storage path"))?;
+        let storage_path = relation
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing storage path"))?;
         let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
         let table_path = listing_table_url_for_storage_location(storage_path)?;
         let config = datafusion::datasource::listing::ListingTableConfig::new(table_path)
-            .with_listing_options(datafusion::datasource::listing::ListingOptions::new(Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())))
+            .with_listing_options(datafusion::datasource::listing::ListingOptions::new(
+                Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default()),
+            ))
             .with_schema(full_schema);
         let table = datafusion::datasource::listing::ListingTable::try_new(config)?;
         context.register_table("indexed_table", Arc::new(table))?;
@@ -687,7 +761,7 @@ impl PrototypeEngine {
 
             let root = index_snapshot_root(relation, &index.name)?;
             let snapshot_path = root.join(&snapshot.entries_object);
-            
+
             if !snapshot_path.exists() {
                 continue;
             }
@@ -697,14 +771,11 @@ impl PrototypeEngine {
                 .await
                 .map_err(sanitize_error)?;
 
-            let index_cols = index
-                .columns
-                .iter()
-                .map(|c| col(c))
-                .collect::<Vec<_>>();
-            
+            let index_cols = index.columns.iter().map(|c| col(c)).collect::<Vec<_>>();
+
             // 1. Check for duplicates within the new batch
-            let batch_dup_df = new_batch_df.clone()
+            let batch_dup_df = new_batch_df
+                .clone()
                 .aggregate(index_cols.clone(), vec![count(lit(1)).alias("count")])?
                 .filter(col("count").gt(lit(1)))?;
             let batch_dup_results = batch_dup_df.collect().await.map_err(sanitize_error)?;
@@ -720,9 +791,14 @@ impl PrototypeEngine {
 
             // 2. Check for duplicates against existing data (the index snapshot)
             let join_on_cols = index.columns.iter().map(|c| c.as_str()).collect::<Vec<_>>();
-            let join_df = new_batch_df
-                .join(snapshot_df, datafusion::prelude::JoinType::LeftSemi, &join_on_cols, &join_on_cols, None)?;
-            
+            let join_df = new_batch_df.join(
+                snapshot_df,
+                datafusion::prelude::JoinType::LeftSemi,
+                &join_on_cols,
+                &join_on_cols,
+                None,
+            )?;
+
             let join_results = join_df.collect().await.map_err(sanitize_error)?;
             let count = join_results.iter().map(|b| b.num_rows()).sum::<usize>();
             println!("validate uniqueness join count: {}", count);
@@ -744,12 +820,24 @@ impl PrototypeEngine {
         self.control_plane.list_databases(session).await
     }
 
-    pub async fn list_schemas(&self, session: &SessionContext, database: Option<&str>) -> Result<Vec<String>> {
+    pub async fn list_schemas(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+    ) -> Result<Vec<String>> {
         self.control_plane.list_schemas(session, database).await
     }
 
-    pub async fn list_relations(&self, session: &SessionContext, database: Option<&str>, schema: Option<&str>, kind: CatalogRelationKind) -> Result<Vec<analyticsdb_control::CatalogRelation>> {
-        self.control_plane.list_relations(session, database, schema, kind).await
+    pub async fn list_relations(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        kind: CatalogRelationKind,
+    ) -> Result<Vec<analyticsdb_control::CatalogRelation>> {
+        self.control_plane
+            .list_relations(session, database, schema, kind)
+            .await
     }
 
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
@@ -819,7 +907,10 @@ impl PrototypeEngine {
         })
     }
 
-    pub async fn execute_query_stream(&self, request: &QueryRequest) -> Result<QueryExecutionStream> {
+    pub async fn execute_query_stream(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryExecutionStream> {
         let started = Instant::now();
         let admission = self.control_plane.admit_query(&request.session).await?;
 
@@ -941,9 +1032,12 @@ impl PrototypeEngine {
         }
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
-            return Ok(Some(
-                metadata_statement_schema(&statement).unwrap_or_else(|| Arc::new(Schema::empty())),
-            ));
+            let base_schema =
+                metadata_statement_schema(&statement).unwrap_or_else(|| Arc::new(Schema::empty()));
+            if let Some(sql) = metadata_statement_sql(&statement) {
+                return Ok(Some(projected_metadata_schema(sql, &base_schema)?));
+            }
+            return Ok(Some(base_schema));
         }
 
         let control_plane = Arc::clone(&self.control_plane);
@@ -1003,7 +1097,7 @@ impl PrototypeEngine {
             .sql(&rewritten_query_sql)
             .await
             .map_err(sanitize_error)?;
-        
+
         // Align columns with the table
         let projected_dataframe = if let Some(target_cols) = statement.columns {
             if source_dataframe.schema().fields().len() != target_cols.len() {
@@ -1021,16 +1115,30 @@ impl PrototypeEngine {
                 }
 
                 if let Some(pos) = target_cols.iter().position(|c| c == &table_col.name) {
-                    projections.push(datafusion::prelude::col(source_dataframe.schema().field(pos).name()).alias(table_col.name.clone()));
+                    projections.push(
+                        datafusion::prelude::col(source_dataframe.schema().field(pos).name())
+                            .alias(table_col.name.clone()),
+                    );
                 } else {
                     // If not in target list, use NULL
-                    projections.push(datafusion::prelude::lit(ScalarValue::Null).cast_to(&catalog_data_type(&table_col.data_type), source_dataframe.schema())?.alias(table_col.name.clone()));
+                    projections.push(
+                        datafusion::prelude::lit(ScalarValue::Null)
+                            .cast_to(
+                                &catalog_data_type(&table_col.data_type),
+                                source_dataframe.schema(),
+                            )?
+                            .alias(table_col.name.clone()),
+                    );
                 }
             }
             source_dataframe.select(projections)?
         } else {
             // No target columns specified, match by position (excluding _row_id)
-            let visible_table_columns: Vec<_> = relation.columns.iter().filter(|c| c.name != "_row_id").collect();
+            let visible_table_columns: Vec<_> = relation
+                .columns
+                .iter()
+                .filter(|c| c.name != "_row_id")
+                .collect();
             if source_dataframe.schema().fields().len() != visible_table_columns.len() {
                 anyhow::bail!(
                     "INSERT into table with {} columns but SELECT has {} source columns",
@@ -1038,15 +1146,21 @@ impl PrototypeEngine {
                     source_dataframe.schema().fields().len()
                 );
             }
-            
+
             let mut projections = Vec::new();
             for (i, table_col) in visible_table_columns.iter().enumerate() {
-                projections.push(datafusion::prelude::col(source_dataframe.schema().field(i).name()).alias(table_col.name.clone()));
+                projections.push(
+                    datafusion::prelude::col(source_dataframe.schema().field(i).name())
+                        .alias(table_col.name.clone()),
+                );
             }
             source_dataframe.select(projections)?
         };
-        
-        let mut stream = projected_dataframe.execute_stream().await.map_err(sanitize_error)?;
+
+        let mut stream = projected_dataframe
+            .execute_stream()
+            .await
+            .map_err(sanitize_error)?;
         let mut inserted_row_count = 0;
 
         if !storage_path.exists() {
@@ -1057,9 +1171,14 @@ impl PrototypeEngine {
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(sanitize_error)?;
             let (batch_row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
-            
+
             if !relation.indexes.is_empty() {
-                self.validate_batch_against_table_uniqueness(&request.session, &relation, &prepared_batch).await?;
+                self.validate_batch_against_table_uniqueness(
+                    &request.session,
+                    &relation,
+                    &prepared_batch,
+                )
+                .await?;
             }
 
             append_record_batch_to_table_snapshot(prepared_batch, &storage_path).await?;
@@ -1434,7 +1553,12 @@ impl PrototypeEngine {
                 let _write_guard = relation_lock.write().await;
                 let version = uuid::Uuid::now_v7().to_string();
                 let snapshot = self
-                    .build_index_snapshot_for_relation(&request.session, &preview_relation, name, &version)
+                    .build_index_snapshot_for_relation(
+                        &request.session,
+                        &preview_relation,
+                        name,
+                        &version,
+                    )
                     .await?;
                 write_index_snapshot(&preview_relation, &snapshot, &version)?;
 
@@ -1477,9 +1601,7 @@ impl PrototypeEngine {
                 let _write_guard = relation_lock.write().await;
 
                 let new_name = match operation {
-                    AlterObjectOperation::Rename { new_name } => {
-                        new_name.clone()
-                    }
+                    AlterObjectOperation::Rename { new_name } => new_name.clone(),
                     _ => anyhow::bail!("Unsupported index operation"),
                 };
                 let mut preview_relation = relation.clone();
@@ -1574,6 +1696,81 @@ impl PrototypeEngine {
                     )
                 }
             }
+            MetadataStatement::Reindex { ref target } => match target {
+                ReindexTarget::Index {
+                    database,
+                    schema,
+                    name,
+                    concurrently: _,
+                } => {
+                    let relation = self
+                        .control_plane
+                        .index_relation(
+                            &request.session,
+                            database.as_deref(),
+                            schema.as_deref(),
+                            name,
+                        )
+                        .await?;
+                    let relation_lock = self.relation_lock(&relation).await;
+                    let _write_guard = relation_lock.write().await;
+
+                    self.invalidate_session_contexts().await;
+                    let version = uuid::Uuid::now_v7().to_string();
+                    let snapshot = self
+                        .build_index_snapshot_for_relation(
+                            &request.session,
+                            &relation,
+                            name,
+                            &version,
+                        )
+                        .await?;
+                    write_index_snapshot(&relation, &snapshot, &version)?;
+
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        format!("Index '{}' reindexed successfully.", name),
+                        command_outcome("REINDEX", 0),
+                        request.session.clone(),
+                    )
+                }
+                ReindexTarget::Table {
+                    database,
+                    schema,
+                    name,
+                    concurrently: _,
+                } => {
+                    let relation = self
+                        .control_plane
+                        .table_relation(
+                            &request.session,
+                            database.as_deref(),
+                            schema.as_deref(),
+                            name,
+                        )
+                        .await?;
+                    let relation_lock = self.relation_lock(&relation).await;
+                    let _write_guard = relation_lock.write().await;
+
+                    self.rebuild_all_index_snapshots(&request.session, &relation)
+                        .await?;
+
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        format!(
+                            "Reindexed {} index(es) on '{}.{}.{}'.",
+                            relation.indexes.len(),
+                            relation.database,
+                            relation.schema,
+                            relation.name
+                        ),
+                        command_outcome("REINDEX", 0),
+                        request.session.clone(),
+                    )
+                }
+            },
             MetadataStatement::CreateView {
                 database,
                 schema,
@@ -1635,11 +1832,20 @@ impl PrototypeEngine {
                 location,
             } => {
                 let context = DfSessionContext::new();
-                let table_path = datafusion::datasource::listing::ListingTableUrl::parse(&location)?;
+                let table_path =
+                    datafusion::datasource::listing::ListingTableUrl::parse(&location)?;
                 let config = datafusion::datasource::listing::ListingTableConfig::new(table_path)
-                    .with_listing_options(datafusion::datasource::listing::ListingOptions::new(Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())))
-                    .infer_schema(&context.state()).await?;
-                let arrow_schema = config.file_schema.clone().ok_or_else(|| anyhow::anyhow!("Failed to infer schema for external table"))?;
+                    .with_listing_options(datafusion::datasource::listing::ListingOptions::new(
+                        Arc::new(
+                            datafusion::datasource::file_format::parquet::ParquetFormat::default(),
+                        ),
+                    ))
+                    .infer_schema(&context.state())
+                    .await?;
+                let arrow_schema = config
+                    .file_schema
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to infer schema for external table"))?;
                 let columns = catalog_columns_from_schema(&arrow_schema);
 
                 let message = self
@@ -1713,6 +1919,59 @@ impl PrototypeEngine {
                     Vec::new(),
                     format!("{created_message} {row_count} row(s) materialized."),
                     command_outcome("CREATE TABLE", 0),
+                    request.session.clone(),
+                )
+            }
+            MetadataStatement::SelectInto {
+                database,
+                schema,
+                name,
+                query_sql,
+            } => {
+                let storage_location = self
+                    .control_plane
+                    .managed_table_storage_location(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+                let storage_path = local_managed_storage_path(&storage_location.to_string_lossy())?;
+
+                let context = self.create_session_context(&request.session).await?;
+                let rewritten_query_sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
+                    &query_sql,
+                    &self.control_plane,
+                    &request.session,
+                )
+                .await?;
+                let dataframe = context
+                    .sql(&rewritten_query_sql)
+                    .await
+                    .map_err(sanitize_error)?;
+                let arrow_schema = Arc::new(dataframe.schema().as_arrow().clone());
+                let columns_metadata = catalog_columns_from_schema(&arrow_schema);
+                let row_count = write_dataframe_to_table_snapshot(dataframe, &storage_path).await?;
+
+                let created_message = self
+                    .control_plane
+                    .register_managed_table(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                        &storage_location,
+                        columns_metadata,
+                        Vec::new(),
+                    )
+                    .await?;
+
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!("{created_message} {row_count} row(s) materialized by SELECT INTO."),
+                    command_outcome("SELECT INTO", row_count as u64),
                     request.session.clone(),
                 )
             }
@@ -1814,16 +2073,34 @@ impl PrototypeEngine {
                     })
                     .collect();
                 let arrow_schema = build_arrow_schema_from_definitions(&column_definitions, false)?;
-                let batch = build_record_batch_from_rows(
-                    &arrow_schema,
-                    &relation.columns,
-                    columns,
-                    &rows,
-                )?;
+                let expected_values = columns.as_ref().map_or_else(
+                    || {
+                        relation
+                            .columns
+                            .iter()
+                            .filter(|c| c.name != "_row_id")
+                            .count()
+                    },
+                    Vec::len,
+                );
+                for row in &rows {
+                    if row.len() != expected_values {
+                        bail!(
+                            "Expected {expected_values} value(s) per row, found {}",
+                            row.len()
+                        );
+                    }
+                }
+                let batch =
+                    build_record_batch_from_rows(&arrow_schema, &relation.columns, columns, &rows)?;
                 let (row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
 
-                self.validate_batch_against_table_uniqueness(&request.session, &relation, &prepared_batch)
-                    .await?;
+                self.validate_batch_against_table_uniqueness(
+                    &request.session,
+                    &relation,
+                    &prepared_batch,
+                )
+                .await?;
 
                 if !storage_path.exists() {
                     fs::create_dir_all(&storage_path)?;
@@ -2152,7 +2429,8 @@ impl PrototypeEngine {
                                 Ok(message) => message,
                                 Err(error) => {
                                     for index_name in &staged_index_names {
-                                        let _ = remove_index_snapshot(&preview_relation, index_name);
+                                        let _ =
+                                            remove_index_snapshot(&preview_relation, index_name);
                                     }
                                     return Err(error);
                                 }
@@ -2438,7 +2716,11 @@ impl PrototypeEngine {
                     // 1. Get all tables in this database to update their physical paths
                     let relations = self
                         .control_plane
-                        .list_relations_for_database(&request.session, &name, CatalogRelationKind::Table)
+                        .list_relations_for_database(
+                            &request.session,
+                            &name,
+                            CatalogRelationKind::Table,
+                        )
                         .await?;
 
                     // 2. Rename database in catalog
@@ -2640,10 +2922,8 @@ impl PrototypeEngine {
                     })
                     .collect::<Vec<_>>();
                 let row_count = rows.len();
-                let batch = utf8_record_batch(
-                    &["node_id", "kind", "status", "last_heartbeat_ms"],
-                    &rows,
-                )?;
+                let batch =
+                    utf8_record_batch(&["node_id", "kind", "status", "last_heartbeat_ms"], &rows)?;
                 (
                     batch.schema(),
                     vec![batch],
@@ -2722,15 +3002,16 @@ impl PrototypeEngine {
                         vec![
                             col.name,
                             col.data_type,
-                            if col.nullable { "YES".to_string() } else { "NO".to_string() },
+                            if col.nullable {
+                                "YES".to_string()
+                            } else {
+                                "NO".to_string()
+                            },
                         ]
                     })
                     .collect::<Vec<_>>();
                 let row_count = rows.len();
-                let batch = utf8_record_batch(
-                    &["column_name", "data_type", "is_nullable"],
-                    &rows,
-                )?;
+                let batch = utf8_record_batch(&["column_name", "data_type", "is_nullable"], &rows)?;
                 (
                     batch.schema(),
                     vec![batch],
@@ -2885,7 +3166,10 @@ impl PrototypeEngine {
         })
     }
 
-    pub async fn execute_query_batches(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
+    pub async fn execute_query_batches(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryExecutionResult> {
         self.execute_query(request).await
     }
 
@@ -2896,11 +3180,16 @@ impl PrototypeEngine {
         relation: &analyticsdb_control::CatalogRelation,
     ) -> Result<Vec<Vec<String>>> {
         let context = DfSessionContext::new();
-        let storage_path = relation.storage_path.as_ref().ok_or_else(|| anyhow::anyhow!("Missing storage path"))?;
+        let storage_path = relation
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing storage path"))?;
         let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
         let table_path = listing_table_url_for_storage_location(storage_path)?;
         let config = datafusion::datasource::listing::ListingTableConfig::new(table_path)
-            .with_listing_options(datafusion::datasource::listing::ListingOptions::new(Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())))
+            .with_listing_options(datafusion::datasource::listing::ListingOptions::new(
+                Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default()),
+            ))
             .with_schema(full_schema);
         let table = datafusion::datasource::listing::ListingTable::try_new(config)?;
         context.register_table("target_table", Arc::new(table))?;
@@ -2941,17 +3230,31 @@ impl PrototypeEngine {
             .with_target_partitions(1);
 
         let ctx = DfSessionContext::new_with_config(config);
-        
-        let provider = Arc::new(system_catalog::AnalyticsCatalogProvider::new(
-            Arc::clone(&self.control_plane),
-            session.clone(),
-        ));
-        ctx.register_catalog(&session.database, provider.clone());
 
-        let pg_catalog = Arc::new(PgCatalogSchemaProvider::new(
-            Arc::clone(&self.control_plane),
-        ));
-        provider.register_schema("pg_catalog", pg_catalog)?;
+        let databases = self
+            .control_plane
+            .list_databases(session)
+            .await
+            .unwrap_or_else(|_| vec![session.database.clone()]);
+        for database in databases {
+            let provider_session = SessionContext {
+                database: database.clone(),
+                ..session.clone()
+            };
+            let provider = Arc::new(system_catalog::AnalyticsCatalogProvider::new(
+                Arc::clone(&self.control_plane),
+                provider_session,
+            ));
+
+            if database == session.database {
+                let pg_catalog = Arc::new(PgCatalogSchemaProvider::new(Arc::clone(
+                    &self.control_plane,
+                )));
+                provider.register_schema("pg_catalog", pg_catalog)?;
+            }
+
+            ctx.register_catalog(&database, provider);
+        }
 
         register_postgres_functions(&ctx);
 
@@ -2960,7 +3263,10 @@ impl PrototypeEngine {
         Ok(ctx)
     }
 
-    async fn information_schema_schemata_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_schemata_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let schemas = self.control_plane.list_schemas(session, None).await?;
         Ok(schemas
             .into_iter()
@@ -2978,39 +3284,49 @@ impl PrototypeEngine {
             .collect())
     }
 
-    async fn information_schema_tables_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
-        let relations = self.control_plane.list_relations(session, None, None, CatalogRelationKind::Table).await?;
-        let views = self.control_plane.list_relations(session, None, None, CatalogRelationKind::View).await?;
-        
+    async fn information_schema_tables_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
+        let relations = self.control_plane.list_all_relations(session).await?;
+
         let mut rows = Vec::new();
         for rel in relations {
+            let (table_type, is_insertable) = match rel.kind {
+                CatalogRelationKind::Table => ("BASE TABLE", "YES"),
+                CatalogRelationKind::View => ("VIEW", "NO"),
+            };
             rows.push(vec![
                 rel.database,
                 rel.schema,
                 rel.name,
-                "BASE TABLE".to_string(),
-                String::new(), String::new(), String::new(), String::new(), String::new(),
-                "YES".to_string(), "NO".to_string(), String::new(),
-            ]);
-        }
-        for rel in views {
-            rows.push(vec![
-                rel.database,
-                rel.schema,
-                rel.name,
-                "VIEW".to_string(),
-                String::new(), String::new(), String::new(), String::new(), String::new(),
-                "NO".to_string(), "NO".to_string(), String::new(),
+                table_type.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                is_insertable.to_string(),
+                "NO".to_string(),
+                String::new(),
             ]);
         }
         Ok(rows)
     }
 
-    async fn information_schema_columns_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_columns_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
         for rel in relations {
-            for (i, col) in rel.columns.into_iter().enumerate() {
+            for (i, col) in rel
+                .columns
+                .into_iter()
+                .filter(|column| column.name != "_row_id")
+                .enumerate()
+            {
                 rows.push(vec![
                     rel.database.clone(),
                     rel.schema.clone(),
@@ -3018,37 +3334,74 @@ impl PrototypeEngine {
                     col.name,
                     (i + 1).to_string(),
                     col.default_value.unwrap_or_default(),
-                    if col.nullable { "YES".to_string() } else { "NO".to_string() },
-                    col.data_type,
-                    String::new(), String::new(), String::new(), String::new(), String::new(), String::new(),
+                    if col.nullable {
+                        "YES".to_string()
+                    } else {
+                        "NO".to_string()
+                    },
+                    col.data_type.to_ascii_lowercase(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
                 ]);
             }
         }
         Ok(rows)
     }
 
-    async fn information_schema_views_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
-        let views = self.control_plane.list_relations(session, None, None, CatalogRelationKind::View).await?;
-        Ok(views.into_iter().map(|v| {
-            vec![
-                v.database, v.schema, v.name,
-                v.definition_sql.unwrap_or_default(),
-                "NONE".to_string(), "NO".to_string(), "NO".to_string(),
-                "NO".to_string(), "NO".to_string(), "NO".to_string(),
-            ]
-        }).collect())
+    async fn information_schema_views_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
+        let views = self
+            .control_plane
+            .list_all_relations(session)
+            .await?
+            .into_iter()
+            .filter(|relation| relation.kind == CatalogRelationKind::View)
+            .collect::<Vec<_>>();
+        Ok(views
+            .into_iter()
+            .map(|v| {
+                vec![
+                    v.database,
+                    v.schema,
+                    v.name,
+                    v.definition_sql.unwrap_or_default(),
+                    "NONE".to_string(),
+                    "NO".to_string(),
+                    "NO".to_string(),
+                    "NO".to_string(),
+                    "NO".to_string(),
+                    "NO".to_string(),
+                ]
+            })
+            .collect())
     }
 
-    async fn information_schema_table_constraints_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_table_constraints_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
         for rel in relations {
             for constraint in rel.constraints {
                 rows.push(vec![
-                    rel.database.clone(), rel.schema.clone(), constraint.name.clone(),
-                    rel.database.clone(), rel.schema.clone(), rel.name.clone(),
+                    rel.database.clone(),
+                    rel.schema.clone(),
+                    constraint.name.clone(),
+                    rel.database.clone(),
+                    rel.schema.clone(),
+                    rel.name.clone(),
                     format!("{:?}", constraint.kind).to_ascii_uppercase(),
-                    "NO".to_string(), "NO".to_string(), "YES".to_string(), String::new(),
+                    "NO".to_string(),
+                    "NO".to_string(),
+                    "YES".to_string(),
+                    String::new(),
                 ]);
             }
             // Add NOT NULL constraints
@@ -3056,9 +3409,17 @@ impl PrototypeEngine {
                 if !col.nullable {
                     let cname = format!("{}_{}_not_null", rel.name, col.name);
                     rows.push(vec![
-                        rel.database.clone(), rel.schema.clone(), cname,
-                        rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                        "CHECK".to_string(), "NO".to_string(), "NO".to_string(), "YES".to_string(), String::new(),
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        cname,
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        rel.name.clone(),
+                        "CHECK".to_string(),
+                        "NO".to_string(),
+                        "NO".to_string(),
+                        "YES".to_string(),
+                        String::new(),
                     ]);
                 }
             }
@@ -3066,17 +3427,31 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    async fn information_schema_key_column_usage_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_key_column_usage_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
         for rel in relations {
             for constraint in rel.constraints {
-                if matches!(constraint.kind, CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::ForeignKey | CatalogTableConstraintKind::Unique) {
+                if matches!(
+                    constraint.kind,
+                    CatalogTableConstraintKind::PrimaryKey
+                        | CatalogTableConstraintKind::ForeignKey
+                        | CatalogTableConstraintKind::Unique
+                ) {
                     for (i, col) in constraint.columns.into_iter().enumerate() {
                         rows.push(vec![
-                            rel.database.clone(), rel.schema.clone(), constraint.name.clone(),
-                            rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                            col, (i + 1).to_string(), String::new(),
+                            rel.database.clone(),
+                            rel.schema.clone(),
+                            constraint.name.clone(),
+                            rel.database.clone(),
+                            rel.schema.clone(),
+                            rel.name.clone(),
+                            col,
+                            (i + 1).to_string(),
+                            String::new(),
                         ]);
                     }
                 }
@@ -3085,7 +3460,10 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    async fn information_schema_constraint_column_usage_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_constraint_column_usage_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
         for rel in relations {
@@ -3094,8 +3472,13 @@ impl PrototypeEngine {
                 if !col.nullable {
                     let cname = format!("{}_{}_not_null", rel.name, col.name);
                     rows.push(vec![
-                        rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                        col.name.clone(), rel.database.clone(), rel.schema.clone(), cname,
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        rel.name.clone(),
+                        col.name.clone(),
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        cname,
                     ]);
                 }
             }
@@ -3103,8 +3486,13 @@ impl PrototypeEngine {
             for constraint in rel.constraints {
                 for col in constraint.columns {
                     rows.push(vec![
-                        rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                        col, rel.database.clone(), rel.schema.clone(), constraint.name.clone(),
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        rel.name.clone(),
+                        col,
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        constraint.name.clone(),
                     ]);
                 }
             }
@@ -3112,45 +3500,87 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
-    async fn information_schema_constraint_table_usage_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_constraint_table_usage_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
         for rel in relations {
-             // NOT NULLs
-             for col in &rel.columns {
+            // NOT NULLs
+            for col in &rel.columns {
                 if !col.nullable {
                     let cname = format!("{}_{}_not_null", rel.name, col.name);
                     rows.push(vec![
-                        rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                        rel.database.clone(), rel.schema.clone(), cname,
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        rel.name.clone(),
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        cname,
                     ]);
                 }
             }
             for constraint in rel.constraints {
                 rows.push(vec![
-                    rel.database.clone(), rel.schema.clone(), rel.name.clone(),
-                    rel.database.clone(), rel.schema.clone(), constraint.name.clone(),
+                    rel.database.clone(),
+                    rel.schema.clone(),
+                    rel.name.clone(),
+                    rel.database.clone(),
+                    rel.schema.clone(),
+                    constraint.name.clone(),
                 ]);
             }
         }
         Ok(rows)
     }
 
-    async fn information_schema_referential_constraints_rows(&self, session: &SessionContext) -> Result<Vec<Vec<String>>> {
+    async fn information_schema_referential_constraints_rows(
+        &self,
+        session: &SessionContext,
+    ) -> Result<Vec<Vec<String>>> {
         let relations = self.control_plane.list_all_relations(session).await?;
         let mut rows = Vec::new();
-        for rel in relations {
-            for constraint in rel.constraints {
+        for rel in &relations {
+            for constraint in &rel.constraints {
                 if let CatalogTableConstraintKind::ForeignKey = constraint.kind {
-                    let referenced_database = constraint.referenced_database.as_ref();
-                    let referenced_schema = constraint.referenced_schema.as_ref();
-                    let referenced_table = constraint.referenced_table.as_ref();
+                    let referenced_database = constraint
+                        .referenced_database
+                        .clone()
+                        .unwrap_or_else(|| session.database.clone());
+                    let referenced_schema = constraint
+                        .referenced_schema
+                        .clone()
+                        .unwrap_or_else(|| session.schema.clone());
+                    let referenced_table = constraint.referenced_table.clone().unwrap_or_default();
+                    let unique_constraint_name = relations
+                        .iter()
+                        .find(|candidate| {
+                            candidate.database == referenced_database
+                                && candidate.schema == referenced_schema
+                                && candidate.name == referenced_table
+                        })
+                        .and_then(|candidate| {
+                            candidate.constraints.iter().find(|candidate_constraint| {
+                                matches!(
+                                    candidate_constraint.kind,
+                                    CatalogTableConstraintKind::PrimaryKey
+                                        | CatalogTableConstraintKind::Unique
+                                )
+                            })
+                        })
+                        .map(|constraint| constraint.name.clone())
+                        .unwrap_or_else(|| referenced_table.clone());
                     rows.push(vec![
-                        rel.database.clone(), rel.schema.clone(), constraint.name.clone(),
-                        referenced_database.cloned().unwrap_or_else(|| session.database.clone()),
-                        referenced_schema.cloned().unwrap_or_else(|| session.schema.clone()),
-                        referenced_table.cloned().unwrap_or_default(),
-                        "MATCH SIMPLE".to_string(), "NO ACTION".to_string(), "NO ACTION".to_string(),
+                        rel.database.clone(),
+                        rel.schema.clone(),
+                        constraint.name.clone(),
+                        referenced_database,
+                        referenced_schema,
+                        unique_constraint_name,
+                        "MATCH SIMPLE".to_string(),
+                        "NO ACTION".to_string(),
+                        "NO ACTION".to_string(),
                     ]);
                 }
             }
@@ -3164,14 +3594,21 @@ impl PrototypeEngine {
         relation: &analyticsdb_control::CatalogRelation,
         statement: &IndexedSelectStatement,
     ) -> Result<Option<(analyticsdb_control::CatalogIndex, Vec<String>)>> {
-        let mut best_match: Option<(analyticsdb_control::CatalogIndex, Vec<String>, usize, bool)> = None;
+        let mut best_match: Option<(analyticsdb_control::CatalogIndex, Vec<String>, usize, bool)> =
+            None;
 
         for index in &relation.indexes {
             let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
                 continue;
             };
             let Some((score, has_range, row_ids)) = self
-                .candidate_row_ids_from_snapshot(session, relation, index, &snapshot, &statement.predicates)
+                .candidate_row_ids_from_snapshot(
+                    session,
+                    relation,
+                    index,
+                    &snapshot,
+                    &statement.predicates,
+                )
                 .await?
             else {
                 continue;
@@ -3312,7 +3749,7 @@ fn build_arrow_schema_from_definitions(
     }
 
     if !fields.iter().any(|f| f.name() == "_row_id") {
-        fields.push(Field::new("_row_id", DataType::Utf8, false));
+        fields.push(Field::new("_row_id", DataType::Utf8, true));
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -3354,9 +3791,13 @@ fn catalog_constraints_from_definitions(
     let mut out = Vec::new();
     for def in defs {
         let (kind, ref_db, ref_sch, ref_tab, ref_cols) = match def {
-            TableConstraintDefinition::PrimaryKey { .. } => {
-                (CatalogTableConstraintKind::PrimaryKey, None, None, None, Vec::new())
-            }
+            TableConstraintDefinition::PrimaryKey { .. } => (
+                CatalogTableConstraintKind::PrimaryKey,
+                None,
+                None,
+                None,
+                Vec::new(),
+            ),
             TableConstraintDefinition::ForeignKey {
                 referenced_database,
                 referenced_schema,
@@ -3370,9 +3811,13 @@ fn catalog_constraints_from_definitions(
                 Some(referenced_table.clone()),
                 referenced_columns.clone(),
             ),
-            TableConstraintDefinition::Unique { .. } => {
-                (CatalogTableConstraintKind::Unique, None, None, None, Vec::new())
-            }
+            TableConstraintDefinition::Unique { .. } => (
+                CatalogTableConstraintKind::Unique,
+                None,
+                None,
+                None,
+                Vec::new(),
+            ),
         };
         let name_opt = match def {
             TableConstraintDefinition::PrimaryKey { name, .. } => name.clone(),
@@ -3399,7 +3844,7 @@ fn catalog_constraints_from_definitions(
 
 fn build_record_batch_from_rows(
     schema: &SchemaRef,
-    _catalog_columns: &[CatalogColumn],
+    catalog_columns: &[CatalogColumn],
     target_columns: Option<Vec<String>>,
     rows: &[Vec<String>],
 ) -> Result<RecordBatch> {
@@ -3422,16 +3867,37 @@ fn build_record_batch_from_rows(
                 if let Some(idx) = target_idx {
                     if idx < row.len() {
                         if row[idx].trim().eq_ignore_ascii_case("NULL") {
+                            if !field.is_nullable() {
+                                bail!(
+                                    "Column '{}' must be provided because it is NOT NULL",
+                                    field.name()
+                                );
+                            }
                             values.push(None);
                         } else {
-                            values.push(Some(normalize_insert_value(
-                                &row[idx],
-                                field.data_type(),
-                            )));
+                            values.push(Some(normalize_insert_value(&row[idx], field.data_type())));
                         }
+                    } else if let Some(default_value) =
+                        default_value_for_column(catalog_columns, field.name(), field.data_type())
+                    {
+                        values.push(Some(default_value));
+                    } else if !field.is_nullable() {
+                        bail!(
+                            "Column '{}' must be provided because it is NOT NULL",
+                            field.name()
+                        );
                     } else {
                         values.push(None);
                     }
+                } else if let Some(default_value) =
+                    default_value_for_column(catalog_columns, field.name(), field.data_type())
+                {
+                    values.push(Some(default_value));
+                } else if !field.is_nullable() {
+                    bail!(
+                        "Column '{}' must be provided because it is NOT NULL",
+                        field.name()
+                    );
                 } else {
                     values.push(None);
                 }
@@ -3446,6 +3912,38 @@ fn build_record_batch_from_rows(
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
+fn default_value_for_column(
+    catalog_columns: &[CatalogColumn],
+    column_name: &str,
+    data_type: &DataType,
+) -> Option<String> {
+    let raw = catalog_columns
+        .iter()
+        .find(|column| column.name == column_name)?
+        .default_value
+        .as_deref()
+        .unwrap_or_else(|| {
+            if column_name.eq_ignore_ascii_case("created_at") {
+                "CURRENT_TIMESTAMP"
+            } else {
+                ""
+            }
+        })
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.eq_ignore_ascii_case("CURRENT_TIMESTAMP()")
+        || raw.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        || raw.eq_ignore_ascii_case("NOW()")
+    {
+        return Some(chrono::Utc::now().to_rfc3339());
+    }
+
+    Some(normalize_insert_value(raw, data_type))
+}
+
 fn normalize_insert_value(raw: &str, _data_type: &DataType) -> String {
     let trimmed = raw.trim();
     if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
@@ -3458,27 +3956,36 @@ async fn write_dataframe_to_table_snapshot(
     df: datafusion::dataframe::DataFrame,
     path: &Path,
 ) -> Result<usize> {
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-    }
-    clear_table_snapshot_files(path)?;
-
     let mut stream = df.execute_stream().await.map_err(sanitize_error)?;
     let mut row_count = 0;
+    let mut prepared_batches = Vec::new();
 
     use futures::StreamExt;
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(sanitize_error)?;
         let (batch_row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
-        append_record_batch_to_table_snapshot(prepared_batch, path).await?;
         row_count += batch_row_count;
+        prepared_batches.push(prepared_batch);
+    }
+
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+    clear_table_snapshot_files(path)?;
+
+    for prepared_batch in prepared_batches {
+        append_record_batch_to_table_snapshot(prepared_batch, path).await?;
     }
     Ok(row_count)
 }
 
 fn prepare_batch_for_storage(batch: RecordBatch) -> Result<(usize, RecordBatch)> {
     let num_rows = batch.num_rows();
-    let has_row_id = batch.schema().fields().iter().any(|f| f.name() == "_row_id");
+    let has_row_id = batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| f.name() == "_row_id");
 
     if has_row_id {
         let mut columns = batch.columns().to_vec();
@@ -3516,7 +4023,7 @@ fn prepare_batch_for_storage(batch: RecordBatch) -> Result<(usize, RecordBatch)>
         columns.push(Arc::new(StringArray::from(row_ids)));
 
         let mut fields = batch.schema().fields().to_vec();
-        fields.push(Arc::new(Field::new("_row_id", DataType::Utf8, false)));
+        fields.push(Arc::new(Field::new("_row_id", DataType::Utf8, true)));
         let new_schema = Arc::new(Schema::new(fields));
 
         Ok((num_rows, RecordBatch::try_new(new_schema, columns)?))
@@ -3543,7 +4050,9 @@ fn clear_table_snapshot_files(path: &Path) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let entry_path = entry.path();
-        if entry_path.is_file() && entry_path.extension().and_then(|value| value.to_str()) == Some("parquet") {
+        if entry_path.is_file()
+            && entry_path.extension().and_then(|value| value.to_str()) == Some("parquet")
+        {
             fs::remove_file(entry_path)?;
         }
     }
@@ -3570,14 +4079,141 @@ fn utf8_record_batch(columns: &[&str], rows: &[Vec<String>]) -> Result<RecordBat
 }
 
 fn execute_pg_catalog_select(
-    _sql: &str,
+    sql: &str,
     _table: &str,
     columns: &[&str],
     rows: &[Vec<String>],
 ) -> Result<(RecordBatch, usize)> {
-    let batch = utf8_record_batch(columns, rows)?;
-    let count = rows.len();
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)?;
+    let Some(Statement::Query(query)) = statements.first() else {
+        let batch = utf8_record_batch(columns, rows)?;
+        return Ok((batch, rows.len()));
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        let batch = utf8_record_batch(columns, rows)?;
+        return Ok((batch, rows.len()));
+    };
+
+    let mut filtered_rows = rows.to_vec();
+    if let Some(selection) = &select.selection {
+        filtered_rows.retain(|row| metadata_row_matches(selection, columns, row));
+    }
+
+    if let Some(order_by) = &query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            filtered_rows.sort_by(|left, right| {
+                for order_expr in exprs {
+                    let Some(column_name) = metadata_expr_column_name(&order_expr.expr) else {
+                        continue;
+                    };
+                    let Some(idx) = columns.iter().position(|c| *c == column_name) else {
+                        continue;
+                    };
+                    let ord = left[idx].cmp(&right[idx]);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if order_expr.options.asc == Some(false) {
+                            ord.reverse()
+                        } else {
+                            ord
+                        };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+    }
+
+    let projected = metadata_projection_indices(select, columns)?;
+    let projected_columns = projected.iter().map(|idx| columns[*idx]).collect::<Vec<_>>();
+    let projected_rows = filtered_rows
+        .iter()
+        .map(|row| projected.iter().map(|idx| row[*idx].clone()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    let batch = utf8_record_batch(&projected_columns, &projected_rows)?;
+    let count = projected_rows.len();
     Ok((batch, count))
+}
+
+fn metadata_projection_indices(select: &sqlparser::ast::Select, columns: &[&str]) -> Result<Vec<usize>> {
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)))
+    {
+        return Ok((0..columns.len()).collect());
+    }
+
+    let mut indices = Vec::new();
+    for item in &select.projection {
+        let Some(column_name) = (match item {
+            SelectItem::UnnamedExpr(expr) => metadata_expr_column_name(expr),
+            SelectItem::ExprWithAlias { expr, .. } => metadata_expr_column_name(expr),
+            _ => None,
+        }) else {
+            bail!("Unsupported metadata projection '{}'", item);
+        };
+        let Some(index) = columns.iter().position(|c| *c == column_name) else {
+            bail!("Unknown metadata projection column '{}'", column_name);
+        };
+        indices.push(index);
+    }
+    Ok(indices)
+}
+
+fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::Eq) => {
+            let Some(column_name) = metadata_expr_column_name(left) else {
+                return true;
+            };
+            let Some(idx) = columns.iter().position(|c| *c == column_name) else {
+                return true;
+            };
+            metadata_literal_value(right)
+                .map(|value| row[idx] == value)
+                .unwrap_or(true)
+        }
+        Expr::InList { expr, list, negated } => {
+            let Some(column_name) = metadata_expr_column_name(expr) else {
+                return true;
+            };
+            let Some(idx) = columns.iter().position(|c| *c == column_name) else {
+                return true;
+            };
+            let matched = list
+                .iter()
+                .filter_map(metadata_literal_value)
+                .any(|value| row[idx] == value);
+            if *negated { !matched } else { matched }
+        }
+        Expr::Nested(expr) => metadata_row_matches(expr, columns, row),
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
+            metadata_row_matches(left, columns, row) && metadata_row_matches(right, columns, row)
+        }
+        _ => true,
+    }
+}
+
+fn metadata_expr_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.as_str()),
+        Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.as_str()),
+        _ => None,
+    }
+}
+
+fn metadata_literal_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::SingleQuotedString(value)
+            | sqlparser::ast::Value::DoubleQuotedString(value)
+            | sqlparser::ast::Value::Number(value, _) => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn parse_indexed_select_statement(sql: &str) -> Result<Option<IndexedSelectStatement>> {
@@ -3693,25 +4329,19 @@ fn extract_index_predicates(
 ) -> Result<bool> {
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => Ok(
-                extract_index_predicates(left, predicates)?
-                    && extract_index_predicates(right, predicates)?,
-            ),
-            BinaryOperator::Eq => Ok(
-                store_eq_predicate(predicates, left, right)
-                    .or_else(|| store_eq_predicate(predicates, right, left))
-                    .is_some(),
-            ),
+            BinaryOperator::And => Ok(extract_index_predicates(left, predicates)?
+                && extract_index_predicates(right, predicates)?),
+            BinaryOperator::Eq => Ok(store_eq_predicate(predicates, left, right)
+                .or_else(|| store_eq_predicate(predicates, right, left))
+                .is_some()),
             BinaryOperator::Gt
             | BinaryOperator::GtEq
             | BinaryOperator::Lt
-            | BinaryOperator::LtEq => Ok(
-                store_range_binary_predicate(predicates, left, op, right, true)
-                    .or_else(|| {
-                        store_range_binary_predicate(predicates, right, op, left, false)
-                    })
-                    .is_some(),
-            ),
+            | BinaryOperator::LtEq => Ok(store_range_binary_predicate(
+                predicates, left, op, right, true,
+            )
+            .or_else(|| store_range_binary_predicate(predicates, right, op, left, false))
+            .is_some()),
             _ => Ok(false),
         },
         Expr::InList {
@@ -3799,18 +4429,10 @@ fn store_range_binary_predicate(
     let mut lower = None;
     let mut upper = None;
     match (operator, column_on_left) {
-        (BinaryOperator::Gt, true) | (BinaryOperator::Lt, false) => {
-            lower = Some((value, false))
-        }
-        (BinaryOperator::GtEq, true) | (BinaryOperator::LtEq, false) => {
-            lower = Some((value, true))
-        }
-        (BinaryOperator::Lt, true) | (BinaryOperator::Gt, false) => {
-            upper = Some((value, false))
-        }
-        (BinaryOperator::LtEq, true) | (BinaryOperator::GtEq, false) => {
-            upper = Some((value, true))
-        }
+        (BinaryOperator::Gt, true) | (BinaryOperator::Lt, false) => lower = Some((value, false)),
+        (BinaryOperator::GtEq, true) | (BinaryOperator::LtEq, false) => lower = Some((value, true)),
+        (BinaryOperator::Lt, true) | (BinaryOperator::Gt, false) => upper = Some((value, false)),
+        (BinaryOperator::LtEq, true) | (BinaryOperator::GtEq, false) => upper = Some((value, true)),
         _ => return None,
     }
 
@@ -3847,11 +4469,15 @@ fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStateme
     if !upper.starts_with("INSERT INTO ") {
         return Ok(None);
     }
-    
+
     // Use regex to find SELECT and extract table name. Use (?is) for case-insensitive and dot-matches-all.
-    let re = regex::Regex::new(r"(?is)INSERT\s+INTO\s+([^\s\(\)]+)\s*(\([^\)]+\))?\s*(SELECT\s+.*)")?;
+    let re =
+        regex::Regex::new(r"(?is)INSERT\s+INTO\s+([^\s\(\)]+)\s*(\([^\)]+\))?\s*(SELECT\s+.*)")?;
     if let Some(caps) = re.captures(trimmed) {
-        let name = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let name = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         let columns = caps.get(2).map(|m| {
             m.as_str()
                 .trim_start_matches('(')
@@ -3860,7 +4486,10 @@ fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStateme
                 .map(|s| s.trim().to_string())
                 .collect::<Vec<_>>()
         });
-        let query_sql = caps.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let query_sql = caps
+            .get(3)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
 
         return Ok(Some(InsertSelectStatement {
             database: None,
@@ -3898,8 +4527,7 @@ fn storage_location_from_local_path(path: &Path, original_location: Option<&str>
 fn listing_table_url_for_storage_location(
     storage_location: &str,
 ) -> Result<datafusion::datasource::listing::ListingTableUrl> {
-    datafusion::datasource::listing::ListingTableUrl::parse(storage_location)
-        .map_err(Into::into)
+    datafusion::datasource::listing::ListingTableUrl::parse(storage_location).map_err(Into::into)
 }
 
 fn index_snapshot_root(
@@ -3936,7 +4564,8 @@ fn read_index_snapshot(
         return Ok(None);
     }
 
-    let manifest: IndexSnapshotManifest = serde_json::from_str(&fs::read_to_string(manifest_path)?)?;
+    let manifest: IndexSnapshotManifest =
+        serde_json::from_str(&fs::read_to_string(manifest_path)?)?;
     let version_dir = root.join("versions").join(&manifest.version);
     let metadata_path = version_dir.join("metadata.json");
     if !metadata_path.exists() {
@@ -3947,11 +4576,15 @@ fn read_index_snapshot(
             relation.name
         );
     }
-    Ok(Some(serde_json::from_str(&fs::read_to_string(metadata_path)?)?))
+    Ok(Some(serde_json::from_str(&fs::read_to_string(
+        metadata_path,
+    )?)?))
 }
 
 fn write_json_atomically(path: &Path, contents: &str) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("path '{}' has no parent", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path '{}' has no parent", path.display()))?;
     fs::create_dir_all(parent)?;
     let temp_path = parent.join(format!(
         ".{}.{}.tmp",
@@ -4044,7 +4677,10 @@ mod tests {
 
     fn temp_catalog_path() -> String {
         let mut path = std::env::temp_dir();
-        path.push(format!("analyticsdb-engine-test-{}.json", uuid::Uuid::now_v7()));
+        path.push(format!(
+            "analyticsdb-engine-test-{}.json",
+            uuid::Uuid::now_v7()
+        ));
         path.to_string_lossy().into_owned()
     }
 
@@ -4168,13 +4804,16 @@ FROM generate_series(1, 1000000) AS s(n)
         // Test CREATE UNIQUE INDEX CONCURRENTLY
         let result = engine
             .execute_query(&QueryRequest {
-                sql: "CREATE UNIQUE INDEX CONCURRENTLY customers_name_idx ON customers (name)".to_string(),
+                sql: "CREATE UNIQUE INDEX CONCURRENTLY customers_name_idx ON customers (name)"
+                    .to_string(),
                 session: session.clone(),
             })
             .await
             .expect("CREATE UNIQUE INDEX CONCURRENTLY should succeed");
 
-        assert!(result.message.contains("Index 'customers_name_idx' created successfully"));
+        assert!(result
+            .message
+            .contains("Index 'customers_name_idx' created successfully"));
 
         // Verify index is used
         let result = engine
@@ -4186,7 +4825,9 @@ FROM generate_series(1, 1000000) AS s(n)
             .expect("Query should succeed");
         let response = result.to_query_response();
         assert_eq!(response.rows.len(), 1);
-        assert!(response.message.contains("using index 'customers_name_idx'"));
+        assert!(response
+            .message
+            .contains("using index 'customers_name_idx'"));
 
         cleanup_catalog_artifacts(&catalog_path);
     }
@@ -4301,7 +4942,7 @@ FROM generate_series(1, 10) AS s(n)";
         // Force execution through DataFusion
         let context = engine.create_session_context(&session).await.unwrap();
         let result = context.sql(sql).await;
-        
+
         match result {
             Ok(_) => println!("Success"),
             Err(e) => println!("DataFusion error: {}", e),

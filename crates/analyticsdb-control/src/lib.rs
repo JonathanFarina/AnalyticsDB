@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub mod raft;
+pub mod raft_store;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 pub enum NodeRole {
@@ -264,14 +265,10 @@ pub enum AlterTableOperation {
 
 #[derive(Debug, Clone)]
 pub enum AlterColumnOperation {
-    SetDataType {
-        data_type: String,
-    },
+    SetDataType { data_type: String },
     SetNotNull,
     DropNotNull,
-    SetDefault {
-        value: String,
-    },
+    SetDefault { value: String },
     DropDefault,
 }
 
@@ -287,6 +284,22 @@ pub enum AlterObjectOperation {
     Rename { new_name: String },
     OwnerTo { new_owner: String },
     SetSchema { new_schema: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum ReindexTarget {
+    Index {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        concurrently: bool,
+    },
+    Table {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        concurrently: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +333,12 @@ pub enum MetadataStatement {
         definition_sql: String,
     },
     CreateTableAs {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+        query_sql: String,
+    },
+    SelectInto {
         database: Option<String>,
         schema: Option<String>,
         name: String,
@@ -391,6 +410,9 @@ pub enum MetadataStatement {
         name: String,
         if_exists: bool,
         cascade: bool,
+    },
+    Reindex {
+        target: ReindexTarget,
     },
     AlterSchema {
         database: Option<String>,
@@ -824,8 +846,10 @@ impl ControlPlane {
             }
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
+            | MetadataStatement::SelectInto { .. }
             | MetadataStatement::CreateTable { .. }
             | MetadataStatement::AlterIndex { .. }
+            | MetadataStatement::Reindex { .. }
             | MetadataStatement::CreateExternalTable { .. }
             | MetadataStatement::InsertInto { .. }
             | MetadataStatement::Update { .. }
@@ -1002,10 +1026,14 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            let relation = state
-                .relations
-                .get_mut(&key)
-                .ok_or_else(|| anyhow::anyhow!("Table '{}.{}.{}' not found", database_name, schema_name, table))?;
+            let relation = state.relations.get_mut(&key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table '{}.{}.{}' not found",
+                    database_name,
+                    schema_name,
+                    table
+                )
+            })?;
 
             if relation.indexes.iter().any(|i| i.name == name) {
                 bail!("Index '{}' already exists on table '{}'", name, table);
@@ -1051,7 +1079,10 @@ impl ControlPlane {
 
             if !found {
                 if if_exists {
-                    return Ok(format!("Index '{}.{}.{}' does not exist, skipping.", database_name, schema_name, name));
+                    return Ok(format!(
+                        "Index '{}.{}.{}' does not exist, skipping.",
+                        database_name, schema_name, name
+                    ));
                 } else {
                     bail!("Index '{}' not found", name);
                 }
@@ -3012,6 +3043,12 @@ fn parse_column_def(
 }
 
 pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
+    let trimmed = sql.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.") {
+        return parse_metadata_statement_fallback(sql);
+    }
+
     let dialect = PostgreSqlDialect {};
     let statements = match Parser::parse_sql(&dialect, sql) {
         Ok(s) => s,
@@ -3133,6 +3170,27 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 constraints,
             })
         }
+        sqlparser::ast::Statement::Query(query) => {
+            let mut query = query.clone();
+            let select = match query.body.as_mut() {
+                sqlparser::ast::SetExpr::Select(select) => select,
+                _ => return None,
+            };
+            let select_into = select.into.take()?;
+            let idents: Vec<String> = select_into.name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, table_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+            Some(MetadataStatement::SelectInto {
+                database,
+                schema,
+                name: table_name,
+                query_sql: query.to_string(),
+            })
+        }
         sqlparser::ast::Statement::CreateFunction(create_func) => {
             let idents: Vec<String> = create_func.name.0.iter().map(|i| i.to_string()).collect();
             let (database, schema, func_name) = match idents.as_slice() {
@@ -3196,7 +3254,12 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
             })
         }
         sqlparser::ast::Statement::CreateIndex(create_index) => {
-            let idents: Vec<String> = create_index.table_name.0.iter().map(|i| i.to_string()).collect();
+            let idents: Vec<String> = create_index
+                .table_name
+                .0
+                .iter()
+                .map(|i| i.to_string())
+                .collect();
             let (database, schema, table) = match idents.as_slice() {
                 [n] => (None, None, n.clone()),
                 [s, n] => (None, Some(s.clone()), n.clone()),
@@ -3205,7 +3268,11 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
             };
 
             let index_name = if let Some(name) = &create_index.name {
-                name.0.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
+                name.0
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(".")
             } else {
                 return None;
             };
@@ -3324,14 +3391,18 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 }
                 sqlparser::ast::AlterTableOperation::RenameTable {
                     table_name: new_table_name,
-                } => Some(MetadataStatement::AlterTable {
-                    database,
-                    schema,
-                    name: table_name,
-                    operation: AlterTableOperation::RenameTable {
-                        new_name: new_table_name.to_string(),
-                    },
-                }),
+                } => {
+                    let mut new_name = new_table_name.to_string();
+                    if let Some(stripped) = new_name.strip_prefix("TO ") {
+                        new_name = stripped.to_string();
+                    }
+                    Some(MetadataStatement::AlterTable {
+                        database,
+                        schema,
+                        name: table_name,
+                        operation: AlterTableOperation::RenameTable { new_name },
+                    })
+                }
                 sqlparser::ast::AlterTableOperation::AddConstraint { constraint, .. } => {
                     let constraint_def = match constraint {
                         sqlparser::ast::TableConstraint::PrimaryKey(p) => {
@@ -4106,7 +4177,63 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         });
     }
 
+    if upper.starts_with("REINDEX ") {
+        return parse_reindex_statement(trimmed);
+    }
+
     None
+}
+
+fn parse_reindex_statement(sql: &str) -> Option<MetadataStatement> {
+    let remainder = sql["REINDEX".len()..].trim();
+    if remainder.is_empty() {
+        return None;
+    }
+
+    let first = remainder.split_whitespace().next()?;
+    let (target_kind, after_kind) = if first.eq_ignore_ascii_case("INDEX") {
+        ("INDEX", remainder["INDEX".len()..].trim())
+    } else if first.eq_ignore_ascii_case("TABLE") {
+        ("TABLE", remainder["TABLE".len()..].trim())
+    } else {
+        ("TABLE", remainder)
+    };
+
+    if after_kind.is_empty() {
+        return None;
+    }
+
+    let (concurrently, raw_name) = if after_kind
+        .to_ascii_uppercase()
+        .starts_with("CONCURRENTLY ")
+    {
+        (true, after_kind["CONCURRENTLY ".len()..].trim())
+    } else {
+        (false, after_kind)
+    };
+
+    if raw_name.is_empty() || raw_name.split_whitespace().count() != 1 {
+        return None;
+    }
+
+    let (database, schema, name) = parse_qualified_name(raw_name, None, None).ok()?;
+    let target = match target_kind {
+        "INDEX" => ReindexTarget::Index {
+            database,
+            schema,
+            name,
+            concurrently,
+        },
+        "TABLE" => ReindexTarget::Table {
+            database,
+            schema,
+            name,
+            concurrently,
+        },
+        _ => return None,
+    };
+
+    Some(MetadataStatement::Reindex { target })
 }
 
 fn parse_table_columns(
@@ -4428,7 +4555,11 @@ fn build_relation_with_catalog_constraint(
         );
     }
 
-    if relation.constraints.iter().any(|c| c.name == constraint.name) {
+    if relation
+        .constraints
+        .iter()
+        .any(|c| c.name == constraint.name)
+    {
         bail!(
             "Constraint '{}' already exists on table '{}.{}.{}'",
             constraint.name,
@@ -4628,7 +4759,11 @@ fn build_relation_with_dropped_constraint(
 
     // Check for dependencies if it's a PK or Unique constraint
     let mut is_referenced = false;
-    if let Some(target_con) = relation.constraints.iter().find(|c| c.name == constraint_name) {
+    if let Some(target_con) = relation
+        .constraints
+        .iter()
+        .find(|c| c.name == constraint_name)
+    {
         if matches!(
             target_con.kind,
             CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::Unique
@@ -4639,11 +4774,19 @@ fn build_relation_with_dropped_constraint(
                 }
                 for con in &other_rel.constraints {
                     if let CatalogTableConstraintKind::ForeignKey = con.kind {
-                        let ref_db = con.referenced_database.as_deref().unwrap_or(&other_rel.database);
-                        let ref_sch = con.referenced_schema.as_deref().unwrap_or(&other_rel.schema);
+                        let ref_db = con
+                            .referenced_database
+                            .as_deref()
+                            .unwrap_or(&other_rel.database);
+                        let ref_sch = con
+                            .referenced_schema
+                            .as_deref()
+                            .unwrap_or(&other_rel.schema);
                         let ref_tab = con.referenced_table.as_deref().unwrap_or("");
 
-                        if ref_db == database_name && ref_sch == schema_name && ref_tab == table_name
+                        if ref_db == database_name
+                            && ref_sch == schema_name
+                            && ref_tab == table_name
                         {
                             is_referenced = true;
                             break;

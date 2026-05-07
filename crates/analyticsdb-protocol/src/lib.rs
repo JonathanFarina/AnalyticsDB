@@ -2228,9 +2228,10 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
     ) -> Result<Response<FlightInfo>, Status> {
         let payload = decode_statement_ticket(query.prepared_statement_handle)?;
         debug!("flight_sql_prepared_statement: {}", payload.sql);
-        let schema_ipc = payload.row_schema_ipc.clone().unwrap_or_else(|| {
-            schema_to_ipc_bytes(&Schema::empty()).unwrap_or_default()
-        });
+        let schema_ipc = payload
+            .row_schema_ipc
+            .clone()
+            .unwrap_or_else(|| schema_to_ipc_bytes(&Schema::empty()).unwrap_or_default());
 
         let descriptor = request.into_inner();
         let ticket = statement_ticket(payload.sql, payload.session, Some(schema_ipc.clone()))?;

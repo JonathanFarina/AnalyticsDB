@@ -3,7 +3,10 @@ use uuid::Uuid;
 
 fn temp_catalog_path() -> String {
     let mut path = std::env::temp_dir();
-    path.push(format!("analyticsdb-drop-constraint-cascade-{}.json", Uuid::now_v7()));
+    path.push(format!(
+        "analyticsdb-drop-constraint-cascade-{}.json",
+        Uuid::now_v7()
+    ));
     path.to_string_lossy().into_owned()
 }
 
@@ -36,13 +39,13 @@ async fn test_drop_constraint_cascade() {
     }
 
     // 2. Attempt to drop PK without CASCADE (should fail)
-    // The PK name is auto-generated as "authors_id_idx" if not specified, 
+    // The PK name is auto-generated as "authors_id_idx" if not specified,
     // but in build_relation_with_added_constraint it defaults to "auto_constraint" if None,
     // and then renamed in indexes_from_constraints.
     // Wait, let's see what the PK name actually is.
     // In our implementation of build_relation_with_added_constraint:
     // name.unwrap_or_else(|| "auto_constraint".to_string())
-    
+
     // Let's use an explicit name for the constraint to be sure.
     Command::cargo_bin("analyticsdb")
         .expect("binary should build")
@@ -55,7 +58,7 @@ async fn test_drop_constraint_cascade() {
         ])
         .assert()
         .success();
-    
+
     Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args([
@@ -96,6 +99,6 @@ async fn test_drop_constraint_cascade() {
 
     // Verify books2 foreign key is also gone (optional, but good)
     // We can verify by looking at the catalog or attempting to drop it again (should fail)
-    
+
     cleanup_catalog_artifacts(&catalog_path);
 }

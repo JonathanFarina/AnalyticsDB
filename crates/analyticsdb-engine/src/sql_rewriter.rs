@@ -195,9 +195,12 @@ fn rewrite_select_recursive<'a>(
                     if let Some(columns) = table_schemas.get(&alias) {
                         for col in columns {
                             if col != "_row_id" {
-                                new_projection.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(
-                                    vec![Ident::new(alias.clone()), Ident::new(col.clone())],
-                                )));
+                                new_projection.push(SelectItem::UnnamedExpr(
+                                    Expr::CompoundIdentifier(vec![
+                                        Ident::new(alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ]),
+                                ));
                             }
                         }
                     } else {
@@ -559,12 +562,45 @@ fn resolve_table_schemas_recursive<'a>(
                 };
                 let table_name = idents.last().unwrap();
 
-                if let Ok(columns) = control_plane
-                    .relation_columns(session, db_name, schema_name, table_name)
+                if let Ok(relation) = control_plane
+                    .find_relation(session, db_name, schema_name, table_name)
                     .await
                 {
-                    let col_names = columns.into_iter().map(|c| c.name).collect::<Vec<_>>();
-                    schemas.insert(effective_alias, col_names);
+                    let col_names = relation
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>();
+                    schemas.insert(effective_alias.clone(), col_names);
+
+                    if relation.kind == analyticsdb_control::CatalogRelationKind::View {
+                        let Some(definition_sql) = relation.definition_sql else {
+                            return Ok(());
+                        };
+                        let dialect = PostgreSqlDialect {};
+                        let mut statements = Parser::parse_sql(&dialect, &definition_sql)?;
+                        if statements.len() != 1 {
+                            return Ok(());
+                        }
+                        let Statement::Query(mut subquery) = statements.remove(0) else {
+                            return Ok(());
+                        };
+                        rewrite_query_recursive(&mut subquery, control_plane, session).await?;
+
+                        let derived_alias = alias.clone().or_else(|| {
+                            Some(sqlparser::ast::TableAlias {
+                                explicit: false,
+                                name: Ident::new(table_name.clone()),
+                                columns: Vec::new(),
+                            })
+                        });
+                        *tf = TableFactor::Derived {
+                            lateral: false,
+                            subquery,
+                            alias: derived_alias,
+                            sample: None,
+                        };
+                    }
                 }
             }
             TableFactor::Derived { subquery, .. } => {
