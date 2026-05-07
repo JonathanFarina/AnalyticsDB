@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+use object_store::path::Path as OPath;
+use object_store::ObjectStore;
 
 use analyticsdb_control::{
     parse_metadata_statement, AlterDatabaseOperation, AlterObjectOperation, AlterTableOperation,
@@ -17,10 +18,8 @@ use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
-use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext as DfSessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
@@ -35,6 +34,7 @@ use tracing::warn;
 pub mod functions;
 pub mod postgres_compatibility;
 pub mod sql_rewriter;
+pub mod storage;
 pub mod system_catalog;
 
 use functions::register_postgres_functions;
@@ -442,6 +442,7 @@ impl PrototypeEngine {
         relation: &analyticsdb_control::CatalogRelation,
     ) -> Result<()> {
         self.invalidate_session_contexts().await;
+        let (store, table_prefix) = table_store_prefix(relation)?;
         for index in &relation.indexes {
             println!("rebuilding index snapshot for: {}", index.name);
             let version = uuid::Uuid::now_v7().to_string();
@@ -449,7 +450,7 @@ impl PrototypeEngine {
                 .build_index_snapshot_for_relation(session, relation, &index.name, &version)
                 .await?;
             println!("writing index snapshot for: {}", index.name);
-            write_index_snapshot(relation, &snapshot, &version)?;
+            write_index_snapshot(&store, &table_prefix, &snapshot, &version).await?;
         }
         Ok(())
     }
@@ -522,10 +523,8 @@ impl PrototypeEngine {
             }
         }
 
-        let root = index_snapshot_root(relation, index_name)?;
-        let version_dir = root.join("versions").join(version);
-        fs::create_dir_all(&version_dir)?;
-        let data_path = version_dir.join("data.parquet");
+        let (store, table_prefix) = table_store_prefix(relation)?;
+        let data_key = index_data_key(&table_prefix, index_name, version);
 
         let sort_exprs = index
             .columns
@@ -533,22 +532,20 @@ impl PrototypeEngine {
             .map(|c| col(c).sort(true, true))
             .collect::<Vec<_>>();
 
-        df.clone()
+        let sorted_batches = df
+            .clone()
             .sort(sort_exprs)
-            .map_err(|e| {
-                println!("sort err: {}", e);
-                sanitize_error(e)
-            })?
-            .write_parquet(
-                data_path.to_str().unwrap(),
-                DataFrameWriteOptions::default().with_single_file_output(true),
-                None,
-            )
+            .map_err(sanitize_error)?
+            .collect()
             .await
-            .map_err(|e| {
-                println!("write_parquet err: {}", e);
-                sanitize_error(e)
-            })?;
+            .map_err(sanitize_error)?;
+
+        let schema = if let Some(first) = sorted_batches.first() {
+            first.schema()
+        } else {
+            Arc::new(df.schema().as_arrow().clone())
+        };
+        storage::write_parquet_batches(&store, &data_key, schema, &sorted_batches).await?;
 
         let row_count_df = df.aggregate(vec![], vec![count(col("_row_id")).alias("count")])?;
         let row_count_results = row_count_df.collect().await.map_err(sanitize_error)?;
@@ -576,7 +573,7 @@ impl PrototypeEngine {
             columns: index.columns.clone(),
             unique: index.is_unique,
             primary: index.is_primary,
-            entries_object: format!("versions/{version}/data.parquet"),
+            entries_object: version.to_string(),
             row_count,
         })
     }
@@ -751,7 +748,8 @@ impl PrototypeEngine {
                 continue;
             }
 
-            let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
+            let (store, table_prefix) = table_store_prefix(relation)?;
+            let Some(snapshot) = read_index_snapshot(&store, &table_prefix, &index.name).await? else {
                 continue;
             };
 
@@ -759,15 +757,14 @@ impl PrototypeEngine {
             let df_context = DfSessionContext::new();
             let new_batch_df = df_context.read_batch(batch.clone())?;
 
-            let root = index_snapshot_root(relation, &index.name)?;
-            let snapshot_path = root.join(&snapshot.entries_object);
-
-            if !snapshot_path.exists() {
+            let data_key = index_data_key(&table_prefix, &index.name, &snapshot.entries_object);
+            if !storage::object_exists(&store, &data_key).await? {
                 continue;
             }
 
+            let data_local_path = format!("/{}", data_key.as_ref());
             let snapshot_df = df_context
-                .read_parquet(snapshot_path.to_str().unwrap(), Default::default())
+                .read_parquet(&data_local_path, Default::default())
                 .await
                 .map_err(sanitize_error)?;
 
@@ -1074,7 +1071,7 @@ impl PrototypeEngine {
                 &statement.name,
             )
             .await?;
-        let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
+        let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Managed table '{}.{}.{}' is missing a storage path",
                 relation.database,
@@ -1082,7 +1079,7 @@ impl PrototypeEngine {
                 relation.name
             )
         })?;
-        let storage_path = local_managed_storage_path(storage_path)?;
+        let (store, prefix) = storage::store_for_location(storage_location)?;
         let relation_lock = self.relation_lock(&relation).await;
         let _write_guard = relation_lock.write().await;
 
@@ -1163,10 +1160,6 @@ impl PrototypeEngine {
             .map_err(sanitize_error)?;
         let mut inserted_row_count = 0;
 
-        if !storage_path.exists() {
-            fs::create_dir_all(&storage_path)?;
-        }
-
         use futures::StreamExt;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(sanitize_error)?;
@@ -1181,7 +1174,7 @@ impl PrototypeEngine {
                 .await?;
             }
 
-            append_record_batch_to_table_snapshot(prepared_batch, &storage_path).await?;
+            storage::append_parquet_batch(&store, &prefix, prepared_batch).await?;
             inserted_row_count += batch_row_count;
         }
 
@@ -1551,6 +1544,7 @@ impl PrototypeEngine {
                     .await?;
                 let relation_lock = self.relation_lock(&preview_relation).await;
                 let _write_guard = relation_lock.write().await;
+                let (idx_store, idx_prefix) = table_store_prefix(&preview_relation)?;
                 let version = uuid::Uuid::now_v7().to_string();
                 let snapshot = self
                     .build_index_snapshot_for_relation(
@@ -1560,7 +1554,7 @@ impl PrototypeEngine {
                         &version,
                     )
                     .await?;
-                write_index_snapshot(&preview_relation, &snapshot, &version)?;
+                write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
 
                 let (message, _new_session) = match self
                     .control_plane
@@ -1569,7 +1563,7 @@ impl PrototypeEngine {
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        let _ = remove_index_snapshot(&preview_relation, name);
+                        let _ = remove_index_snapshot(&idx_store, &idx_prefix, name).await;
                         return Err(error);
                     }
                 };
@@ -1611,6 +1605,7 @@ impl PrototypeEngine {
                     .find(|index| index.name == *name)
                     .ok_or_else(|| anyhow::anyhow!("Index '{}' not found", name))?;
                 index.name = new_name.clone();
+                let (idx_store, idx_prefix) = table_store_prefix(&preview_relation)?;
                 let version = uuid::Uuid::now_v7().to_string();
                 let snapshot = self
                     .build_index_snapshot_for_relation(
@@ -1620,7 +1615,7 @@ impl PrototypeEngine {
                         &version,
                     )
                     .await?;
-                write_index_snapshot(&preview_relation, &snapshot, &version)?;
+                write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
 
                 let (message, _new_session) = match self
                     .control_plane
@@ -1629,11 +1624,11 @@ impl PrototypeEngine {
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        let _ = remove_index_snapshot(&preview_relation, &new_name);
+                        let _ = remove_index_snapshot(&idx_store, &idx_prefix, &new_name).await;
                         return Err(error);
                     }
                 };
-                let _ = remove_index_snapshot(&relation, name);
+                let _ = remove_index_snapshot(&idx_store, &idx_prefix, name).await;
 
                 (
                     Arc::new(Schema::empty()),
@@ -1673,7 +1668,9 @@ impl PrototypeEngine {
                         .execute_metadata_statement(&request.session, &statement)
                         .await?;
 
-                    let _ = remove_index_snapshot(relation, name);
+                    if let Ok((idx_store, idx_prefix)) = table_store_prefix(relation) {
+                        let _ = remove_index_snapshot(&idx_store, &idx_prefix, name).await;
+                    }
 
                     (
                         Arc::new(Schema::empty()),
@@ -1716,6 +1713,7 @@ impl PrototypeEngine {
                     let _write_guard = relation_lock.write().await;
 
                     self.invalidate_session_contexts().await;
+                    let (idx_store, idx_prefix) = table_store_prefix(&relation)?;
                     let version = uuid::Uuid::now_v7().to_string();
                     let snapshot = self
                         .build_index_snapshot_for_relation(
@@ -1725,7 +1723,7 @@ impl PrototypeEngine {
                             &version,
                         )
                         .await?;
-                    write_index_snapshot(&relation, &snapshot, &version)?;
+                    write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
 
                     (
                         Arc::new(Schema::empty()),
@@ -1884,7 +1882,8 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = local_managed_storage_path(&storage_location.to_string_lossy())?;
+                let location_str = storage_location.to_string_lossy().into_owned();
+                let (store, prefix) = storage::store_for_location(&location_str)?;
 
                 let context = self.create_session_context(&request.session).await?;
                 let rewritten_query_sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
@@ -1899,7 +1898,7 @@ impl PrototypeEngine {
                     .map_err(sanitize_error)?;
                 let arrow_schema = Arc::new(dataframe.schema().as_arrow().clone());
                 let columns_metadata = catalog_columns_from_schema(&arrow_schema);
-                let row_count = write_dataframe_to_table_snapshot(dataframe, &storage_path).await?;
+                let row_count = write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
 
                 let created_message = self
                     .control_plane
@@ -1937,7 +1936,8 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = local_managed_storage_path(&storage_location.to_string_lossy())?;
+                let location_str = storage_location.to_string_lossy().into_owned();
+                let (store, prefix) = storage::store_for_location(&location_str)?;
 
                 let context = self.create_session_context(&request.session).await?;
                 let rewritten_query_sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
@@ -1952,7 +1952,7 @@ impl PrototypeEngine {
                     .map_err(sanitize_error)?;
                 let arrow_schema = Arc::new(dataframe.schema().as_arrow().clone());
                 let columns_metadata = catalog_columns_from_schema(&arrow_schema);
-                let row_count = write_dataframe_to_table_snapshot(dataframe, &storage_path).await?;
+                let row_count = write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
 
                 let created_message = self
                     .control_plane
@@ -1991,10 +1991,11 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = local_managed_storage_path(&storage_location.to_string_lossy())?;
+                let location_str = storage_location.to_string_lossy().into_owned();
+                let (store, prefix) = storage::store_for_location(&location_str)?;
                 let arrow_schema = build_arrow_schema_from_definitions(&columns, false)?;
 
-                persist_empty_table_snapshot(&storage_path, &arrow_schema)?;
+                persist_empty_table_snapshot(&store, &prefix, &arrow_schema).await?;
 
                 let created_message = self
                     .control_plane
@@ -2050,7 +2051,7 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
+                let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Managed table '{}.{}.{}' is missing a storage path",
                         relation.database,
@@ -2058,7 +2059,7 @@ impl PrototypeEngine {
                         relation.name
                     )
                 })?;
-                let storage_path = local_managed_storage_path(storage_path)?;
+                let (store, prefix) = storage::store_for_location(storage_location)?;
                 let relation_lock = self.relation_lock(&relation).await;
                 let _write_guard = relation_lock.write().await;
 
@@ -2102,10 +2103,7 @@ impl PrototypeEngine {
                 )
                 .await?;
 
-                if !storage_path.exists() {
-                    fs::create_dir_all(&storage_path)?;
-                }
-                append_record_batch_to_table_snapshot(prepared_batch, &storage_path).await?;
+                storage::append_parquet_batch(&store, &prefix, prepared_batch).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await;
 
@@ -2136,7 +2134,7 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
+                let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Managed table '{}.{}.{}' is missing a storage path",
                         relation.database,
@@ -2144,7 +2142,7 @@ impl PrototypeEngine {
                         relation.name
                     )
                 })?;
-                let storage_path = local_managed_storage_path(storage_path)?;
+                let (store, prefix) = storage::store_for_location(storage_location)?;
                 let relation_lock = self.relation_lock(&relation).await;
                 let _write_guard = relation_lock.write().await;
 
@@ -2191,7 +2189,7 @@ impl PrototypeEngine {
                 self.validate_unique_indexes_for_rows(&relation, &updated_rows)?;
 
                 let row_count =
-                    write_dataframe_to_table_snapshot(updated_dataframe, &storage_path).await?;
+                    write_dataframe_to_table_snapshot(updated_dataframe, &store, &prefix).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await;
 
@@ -2221,7 +2219,7 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
+                let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Managed table '{}.{}.{}' is missing a storage path",
                         relation.database,
@@ -2229,7 +2227,7 @@ impl PrototypeEngine {
                         relation.name
                     )
                 })?;
-                let storage_path = local_managed_storage_path(storage_path)?;
+                let (store, prefix) = storage::store_for_location(storage_location)?;
                 let relation_lock = self.relation_lock(&relation).await;
                 let _write_guard = relation_lock.write().await;
 
@@ -2255,7 +2253,7 @@ impl PrototypeEngine {
                     .await
                     .map_err(sanitize_error)?;
                 let row_count =
-                    write_dataframe_to_table_snapshot(remaining_dataframe, &storage_path).await?;
+                    write_dataframe_to_table_snapshot(remaining_dataframe, &store, &prefix).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await;
 
@@ -2284,7 +2282,7 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let storage_path = relation.storage_path.as_deref().ok_or_else(|| {
+                let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Managed table '{}.{}.{}' is missing a storage path",
                         relation.database,
@@ -2292,7 +2290,7 @@ impl PrototypeEngine {
                         relation.name
                     )
                 })?;
-                let storage_path = local_managed_storage_path(storage_path)?;
+                let (store, prefix) = storage::store_for_location(storage_location)?;
                 let relation_lock = self.relation_lock(&relation).await;
                 let _write_guard = relation_lock.write().await;
 
@@ -2308,7 +2306,7 @@ impl PrototypeEngine {
                     .collect();
                 let arrow_schema = build_arrow_schema_from_definitions(&column_definitions, false)?;
 
-                persist_empty_table_snapshot(&storage_path, &arrow_schema)?;
+                persist_empty_table_snapshot(&store, &prefix, &arrow_schema).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await;
 
@@ -2402,6 +2400,7 @@ impl PrototypeEngine {
                                 .map(|index| index.name.clone())
                                 .collect::<Vec<_>>();
 
+                            let (idx_store, idx_prefix) = table_store_prefix(&preview_relation)?;
                             for index_name in &staged_index_names {
                                 let version = uuid::Uuid::now_v7().to_string();
                                 let snapshot = self
@@ -2412,7 +2411,7 @@ impl PrototypeEngine {
                                         &version,
                                     )
                                     .await?;
-                                write_index_snapshot(&preview_relation, &snapshot, &version)?;
+                                write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
                             }
 
                             message = match self
@@ -2430,7 +2429,7 @@ impl PrototypeEngine {
                                 Err(error) => {
                                     for index_name in &staged_index_names {
                                         let _ =
-                                            remove_index_snapshot(&preview_relation, index_name);
+                                            remove_index_snapshot(&idx_store, &idx_prefix, index_name).await;
                                     }
                                     return Err(error);
                                 }
@@ -2461,32 +2460,28 @@ impl PrototypeEngine {
 
                         // 2. Physically rename managed directory if it exists
                         if let Some(storage_path_str) = &relation.storage_path {
-                            let old_path = local_managed_storage_path(storage_path_str)?;
-                            if old_path.exists() {
-                                // Calculate new path by replacing the table name part
-                                // Managed tables use names like <db>__<schema>__<table>.table.parquet
-                                let file_name = old_path.file_name().unwrap().to_str().unwrap();
-                                let old_suffix = format!("{}.table.parquet", name);
-                                let new_suffix = format!("{}.table.parquet", new_name);
-                                let new_file_name = file_name.replace(&old_suffix, &new_suffix);
-                                let new_path = old_path.with_file_name(new_file_name);
+                            let (store, old_prefix) =
+                                storage::store_for_location(storage_path_str)?;
+                            // Calculate new storage location by replacing the table name part.
+                            // Managed tables use names like <db>__<schema>__<table>.table.parquet
+                            let old_suffix = format!("{}.table.parquet", name);
+                            let new_suffix = format!("{}.table.parquet", new_name);
+                            let new_location_str =
+                                storage_path_str.replace(&old_suffix, &new_suffix);
+                            let (_, new_prefix) =
+                                storage::store_for_location(&new_location_str)?;
+                            storage::rename_prefix(&store, &old_prefix, &new_prefix).await?;
 
-                                fs::rename(old_path, &new_path)?;
-
-                                // 3. Update the storage path in catalog after physical rename
-                                self.control_plane
-                                    .update_relation_storage_path(
-                                        &request.session,
-                                        database.as_deref(),
-                                        schema.as_deref(),
-                                        &new_name,
-                                        &storage_location_from_local_path(
-                                            &new_path,
-                                            Some(storage_path_str),
-                                        ),
-                                    )
-                                    .await?;
-                            }
+                            // 3. Update the storage path in catalog after physical rename
+                            self.control_plane
+                                .update_relation_storage_path(
+                                    &request.session,
+                                    database.as_deref(),
+                                    schema.as_deref(),
+                                    &new_name,
+                                    &new_location_str,
+                                )
+                                .await?;
                         }
 
                         (
@@ -2593,8 +2588,10 @@ impl PrototypeEngine {
                                     .await?;
 
                                 // 3. Physically remove dropped index snapshots
-                                for index_name in dropped_index_names {
-                                    let _ = remove_index_snapshot(&relation, &index_name);
+                                if let Ok((idx_store, idx_prefix)) = table_store_prefix(&relation) {
+                                    for index_name in dropped_index_names {
+                                        let _ = remove_index_snapshot(&idx_store, &idx_prefix, &index_name).await;
+                                    }
                                 }
 
                                 (
@@ -2674,29 +2671,23 @@ impl PrototypeEngine {
                 let database_name = database.as_deref().unwrap_or(&request.session.database);
                 for relation in relations {
                     if let Some(storage_path_str) = &relation.storage_path {
-                        let old_path = local_managed_storage_path(storage_path_str)?;
-                        if old_path.exists() {
-                            let file_name = old_path.file_name().unwrap().to_str().unwrap();
-                            let old_prefix = format!("{}__{}__", database_name, name);
-                            let new_prefix = format!("{}__{}__", database_name, new_name);
-                            let new_file_name = file_name.replace(&old_prefix, &new_prefix);
-                            let new_path = old_path.with_file_name(new_file_name);
-
-                            fs::rename(old_path, &new_path)?;
-
-                            self.control_plane
-                                .update_relation_storage_path(
-                                    &request.session,
-                                    Some(database_name),
-                                    Some(&new_name),
-                                    &relation.name,
-                                    &storage_location_from_local_path(
-                                        &new_path,
-                                        Some(storage_path_str),
-                                    ),
-                                )
-                                .await?;
-                        }
+                        let (store, old_obj_prefix) =
+                            storage::store_for_location(storage_path_str)?;
+                        let old_part = format!("{}__{}__", database_name, name);
+                        let new_part = format!("{}__{}__", database_name, new_name);
+                        let new_location_str = storage_path_str.replace(&old_part, &new_part);
+                        let (_, new_obj_prefix) =
+                            storage::store_for_location(&new_location_str)?;
+                        storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix).await?;
+                        self.control_plane
+                            .update_relation_storage_path(
+                                &request.session,
+                                Some(database_name),
+                                Some(&new_name),
+                                &relation.name,
+                                &new_location_str,
+                            )
+                            .await?;
                     }
                 }
 
@@ -2740,29 +2731,23 @@ impl PrototypeEngine {
                     // 3. Physically rename managed directories
                     for relation in relations {
                         if let Some(storage_path_str) = &relation.storage_path {
-                            let old_path = local_managed_storage_path(storage_path_str)?;
-                            if old_path.exists() {
-                                let file_name = old_path.file_name().unwrap().to_str().unwrap();
-                                let old_prefix = format!("{}__{}__", name, relation.schema);
-                                let new_prefix = format!("{}__{}__", new_name, relation.schema);
-                                let new_file_name = file_name.replace(&old_prefix, &new_prefix);
-                                let new_path = old_path.with_file_name(new_file_name);
-
-                                fs::rename(old_path, &new_path)?;
-
-                                self.control_plane
-                                    .update_relation_storage_path(
-                                        &request.session,
-                                        Some(&new_name),
-                                        Some(&relation.schema),
-                                        &relation.name,
-                                        &storage_location_from_local_path(
-                                            &new_path,
-                                            Some(storage_path_str),
-                                        ),
-                                    )
-                                    .await?;
-                            }
+                            let (store, old_obj_prefix) =
+                                storage::store_for_location(storage_path_str)?;
+                            let old_part = format!("{}__{}__", name, relation.schema);
+                            let new_part = format!("{}__{}__", new_name, relation.schema);
+                            let new_location_str = storage_path_str.replace(&old_part, &new_part);
+                            let (_, new_obj_prefix) =
+                                storage::store_for_location(&new_location_str)?;
+                            storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix).await?;
+                            self.control_plane
+                                .update_relation_storage_path(
+                                    &request.session,
+                                    Some(&new_name),
+                                    Some(&relation.schema),
+                                    &relation.name,
+                                    &new_location_str,
+                                )
+                                .await?;
                         }
                     }
 
@@ -3055,13 +3040,11 @@ impl PrototypeEngine {
                 if let Some(rel) = relation {
                     let relation_lock = self.relation_lock(&rel).await;
                     let _write_guard = relation_lock.write().await;
-                    // For managed tables, delete the storage directory
+                    // For managed tables, delete all storage objects
                     if rel.external_format.is_none() {
                         if let Some(path_str) = &rel.storage_path {
-                            let path = local_managed_storage_path(path_str)?;
-                            if path.exists() {
-                                fs::remove_dir_all(path)?;
-                            }
+                            let (store, prefix) = storage::store_for_location(path_str)?;
+                            storage::delete_prefix(&store, &prefix).await?;
                         }
                     }
                 }
@@ -3597,8 +3580,9 @@ impl PrototypeEngine {
         let mut best_match: Option<(analyticsdb_control::CatalogIndex, Vec<String>, usize, bool)> =
             None;
 
+        let (idx_store, idx_prefix) = table_store_prefix(relation)?;
         for index in &relation.indexes {
-            let Some(snapshot) = read_index_snapshot(relation, &index.name)? else {
+            let Some(snapshot) = read_index_snapshot(&idx_store, &idx_prefix, &index.name).await? else {
                 continue;
             };
             let Some((score, has_range, row_ids)) = self
@@ -3675,15 +3659,15 @@ impl PrototypeEngine {
 
         // Use a fresh context for internal index lookups to avoid catalog registration issues
         let df_context = DfSessionContext::new();
-        let root = index_snapshot_root(relation, &index.name)?;
-        let snapshot_path = root.join(&snapshot.entries_object);
-
-        if !snapshot_path.exists() {
+        let (store, table_prefix) = table_store_prefix(relation)?;
+        let data_key = index_data_key(&table_prefix, &index.name, &snapshot.entries_object);
+        if !storage::object_exists(&store, &data_key).await? {
             return Ok(None);
         }
 
+        let data_local_path = format!("/{}", data_key.as_ref());
         let mut df = df_context
-            .read_parquet(snapshot_path.to_str().unwrap(), Default::default())
+            .read_parquet(&data_local_path, Default::default())
             .await
             .map_err(sanitize_error)?;
 
@@ -3954,7 +3938,8 @@ fn normalize_insert_value(raw: &str, _data_type: &DataType) -> String {
 
 async fn write_dataframe_to_table_snapshot(
     df: datafusion::dataframe::DataFrame,
-    path: &Path,
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
 ) -> Result<usize> {
     let mut stream = df.execute_stream().await.map_err(sanitize_error)?;
     let mut row_count = 0;
@@ -3968,13 +3953,10 @@ async fn write_dataframe_to_table_snapshot(
         prepared_batches.push(prepared_batch);
     }
 
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-    }
-    clear_table_snapshot_files(path)?;
+    storage::clear_parquet_files(store, prefix).await?;
 
     for prepared_batch in prepared_batches {
-        append_record_batch_to_table_snapshot(prepared_batch, path).await?;
+        storage::append_parquet_batch(store, prefix, prepared_batch).await?;
     }
     Ok(row_count)
 }
@@ -4030,42 +4012,14 @@ fn prepare_batch_for_storage(batch: RecordBatch) -> Result<(usize, RecordBatch)>
     }
 }
 
-fn persist_empty_table_snapshot(path: &Path, schema: &SchemaRef) -> Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-    }
-    clear_table_snapshot_files(path)?;
-    let file_path = path.join("empty.parquet");
-    let file = fs::File::create(file_path)?;
-    let writer = ArrowWriter::try_new(file, Arc::clone(schema), None)?;
-    writer.close()?;
-    Ok(())
-}
-
-fn clear_table_snapshot_files(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if entry_path.is_file()
-            && entry_path.extension().and_then(|value| value.to_str()) == Some("parquet")
-        {
-            fs::remove_file(entry_path)?;
-        }
-    }
-    Ok(())
-}
-
-async fn append_record_batch_to_table_snapshot(batch: RecordBatch, path: &Path) -> Result<()> {
-    let file_path = path.join(format!("{}.parquet", uuid::Uuid::now_v7()));
-    let file = fs::File::create(file_path)?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+async fn persist_empty_table_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+    schema: &SchemaRef,
+) -> Result<()> {
+    storage::clear_parquet_files(store, prefix).await?;
+    let key = prefix.clone().join("empty.parquet");
+    storage::write_empty_parquet(store, &key, schema).await
 }
 
 fn utf8_record_batch(columns: &[&str], rows: &[Vec<String>]) -> Result<RecordBatch> {
@@ -4503,25 +4457,53 @@ fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStateme
     Ok(None)
 }
 
-fn local_managed_storage_path(storage_location: &str) -> Result<PathBuf> {
-    if let Some(path) = storage_location.strip_prefix("file://") {
-        return Ok(PathBuf::from(path));
-    }
-    if storage_location.contains("://") {
-        anyhow::bail!(
-            "Managed-table storage location '{}' is not writable through the local filesystem prototype",
-            storage_location
-        );
-    }
-    Ok(PathBuf::from(storage_location))
+fn table_store_prefix(
+    relation: &analyticsdb_control::CatalogRelation,
+) -> Result<(Arc<dyn ObjectStore>, OPath)> {
+    let location = relation.storage_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Managed table '{}.{}.{}' is missing a storage path",
+            relation.database,
+            relation.schema,
+            relation.name
+        )
+    })?;
+    storage::store_for_location(location)
 }
 
-fn storage_location_from_local_path(path: &Path, original_location: Option<&str>) -> String {
-    if original_location.is_some_and(|location| location.starts_with("file://")) {
-        format!("file://{}", path.to_string_lossy())
-    } else {
-        path.to_string_lossy().to_string()
-    }
+fn index_manifest_key(table_prefix: &OPath, index_name: &str) -> OPath {
+    table_prefix
+        .clone()
+        .join(".analyticsdb_indexes")
+        .join(index_name)
+        .join("manifest.json")
+}
+
+fn index_version_metadata_key(table_prefix: &OPath, index_name: &str, version: &str) -> OPath {
+    table_prefix
+        .clone()
+        .join(".analyticsdb_indexes")
+        .join(index_name)
+        .join("versions")
+        .join(version)
+        .join("metadata.json")
+}
+
+fn index_data_key(table_prefix: &OPath, index_name: &str, entries_object: &str) -> OPath {
+    table_prefix
+        .clone()
+        .join(".analyticsdb_indexes")
+        .join(index_name)
+        .join("versions")
+        .join(entries_object)
+        .join("data.parquet")
+}
+
+fn index_prefix_key(table_prefix: &OPath, index_name: &str) -> OPath {
+    table_prefix
+        .clone()
+        .join(".analyticsdb_indexes")
+        .join(index_name)
 }
 
 fn listing_table_url_for_storage_location(
@@ -4530,85 +4512,34 @@ fn listing_table_url_for_storage_location(
     datafusion::datasource::listing::ListingTableUrl::parse(storage_location).map_err(Into::into)
 }
 
-fn index_snapshot_root(
-    relation: &analyticsdb_control::CatalogRelation,
-    index_name: &str,
-) -> Result<PathBuf> {
-    let storage_path = relation.storage_path.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Managed table '{}.{}.{}' is missing a storage path",
-            relation.database,
-            relation.schema,
-            relation.name
-        )
-    })?;
-    Ok(local_managed_storage_path(storage_path)?
-        .join(".analyticsdb_indexes")
-        .join(index_name))
-}
-
-fn index_snapshot_manifest_path(
-    relation: &analyticsdb_control::CatalogRelation,
-    index_name: &str,
-) -> Result<PathBuf> {
-    Ok(index_snapshot_root(relation, index_name)?.join("manifest.json"))
-}
-
-fn read_index_snapshot(
-    relation: &analyticsdb_control::CatalogRelation,
+async fn read_index_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    table_prefix: &OPath,
     index_name: &str,
 ) -> Result<Option<IndexSnapshot>> {
-    let root = index_snapshot_root(relation, index_name)?;
-    let manifest_path = index_snapshot_manifest_path(relation, index_name)?;
-    if !manifest_path.exists() {
+    let manifest_key = index_manifest_key(table_prefix, index_name);
+    let Some(manifest_json) = storage::read_json(store, &manifest_key).await? else {
         return Ok(None);
-    }
-
-    let manifest: IndexSnapshotManifest =
-        serde_json::from_str(&fs::read_to_string(manifest_path)?)?;
-    let version_dir = root.join("versions").join(&manifest.version);
-    let metadata_path = version_dir.join("metadata.json");
-    if !metadata_path.exists() {
+    };
+    let manifest: IndexSnapshotManifest = serde_json::from_str(&manifest_json)?;
+    let metadata_key = index_version_metadata_key(table_prefix, index_name, &manifest.version);
+    let Some(metadata_json) = storage::read_json(store, &metadata_key).await? else {
         anyhow::bail!(
-            "Published index snapshot for '{}.{}.{}' is missing its metadata object",
-            relation.database,
-            relation.schema,
-            relation.name
+            "Published index snapshot for index '{}' is missing its metadata object",
+            index_name
         );
-    }
-    Ok(Some(serde_json::from_str(&fs::read_to_string(
-        metadata_path,
-    )?)?))
+    };
+    Ok(Some(serde_json::from_str(&metadata_json)?))
 }
 
-fn write_json_atomically(path: &Path, contents: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path '{}' has no parent", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let temp_path = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|file_name| file_name.to_str())
-            .unwrap_or("index-snapshot"),
-        uuid::Uuid::now_v7()
-    ));
-    fs::write(&temp_path, contents)?;
-    fs::rename(temp_path, path)?;
-    Ok(())
-}
-
-fn write_index_snapshot(
-    relation: &analyticsdb_control::CatalogRelation,
+async fn write_index_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    table_prefix: &OPath,
     snapshot: &IndexSnapshot,
     version: &str,
 ) -> Result<()> {
-    let root = index_snapshot_root(relation, &snapshot.index)?;
-    let version_dir = root.join("versions").join(version);
-    fs::create_dir_all(&version_dir)?;
-
-    let metadata_path = version_dir.join("metadata.json");
-    write_json_atomically(&metadata_path, &serde_json::to_string_pretty(snapshot)?)?;
+    let metadata_key = index_version_metadata_key(table_prefix, &snapshot.index, version);
+    storage::write_json(store, &metadata_key, &serde_json::to_string_pretty(snapshot)?).await?;
 
     let manifest = IndexSnapshotManifest {
         version: version.to_string(),
@@ -4616,22 +4547,18 @@ fn write_index_snapshot(
         row_count: snapshot.row_count,
         published_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    write_json_atomically(
-        &index_snapshot_manifest_path(relation, &snapshot.index)?,
-        &serde_json::to_string_pretty(&manifest)?,
-    )?;
+    let manifest_key = index_manifest_key(table_prefix, &snapshot.index);
+    storage::write_json(store, &manifest_key, &serde_json::to_string_pretty(&manifest)?).await?;
     Ok(())
 }
 
-fn remove_index_snapshot(
-    relation: &analyticsdb_control::CatalogRelation,
+async fn remove_index_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    table_prefix: &OPath,
     index_name: &str,
 ) -> Result<()> {
-    let path = index_snapshot_root(relation, index_name)?;
-    if path.exists() {
-        fs::remove_dir_all(path)?;
-    }
-    Ok(())
+    let prefix = index_prefix_key(table_prefix, index_name);
+    storage::delete_prefix(store, &prefix).await
 }
 
 fn index_column_positions(
