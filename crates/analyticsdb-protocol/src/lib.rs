@@ -1729,7 +1729,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             let res = self
                 .engine
                 .control_plane()
-                .join_cluster(req.node_id.as_deref(), &req.endpoint)
+                .join_cluster(req.node_id.as_deref(), req.advertise_host.as_deref())
                 .await
                 .map_err(status_from_error)?;
             let body = serde_json::to_vec(&res).map_err(status_from_error)?;

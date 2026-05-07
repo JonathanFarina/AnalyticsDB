@@ -72,7 +72,16 @@ pub type AnalyticsRaft = openraft::Raft<TypeConfig>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub node_id: Option<String>,
+    /// Deprecated — kept for wire compatibility; set to `"auto"`.
+    /// Use `advertise_host` instead.
+    #[serde(default)]
     pub endpoint: String,
+    /// The hostname or IP address that peer nodes should use to connect to
+    /// this node.  Combined with the coordinator-assigned Flight SQL port to
+    /// form the node's registered endpoint (`http://<host>:<port>`).
+    /// Defaults to `"127.0.0.1"` when absent.
+    #[serde(default)]
+    pub advertise_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -943,8 +943,10 @@ impl ControlPlane {
     pub async fn join_cluster(
         &self,
         requested_node_id: Option<&str>,
-        endpoint: &str,
+        advertise_host: Option<&str>,
     ) -> Result<raft::JoinResponse> {
+        let host = advertise_host.unwrap_or("127.0.0.1");
+
         let (node_id, postgres_port, flight_sql_port, new_config) = {
             let mut state = self.state.write().await;
 
@@ -967,21 +969,23 @@ impl ControlPlane {
                 }
             };
 
-            // 2. Allocate ports
+            // 2. Allocate ports from the coordinator's counter.
             let offset = config.next_available_port_offset + 1;
             let postgres_port = config.base_postgres_port + offset;
             let flight_sql_port = config.base_flight_sql_port + offset;
 
-            // 3. Update offset in config
+            // 3. Persist the new offset so the next joining node gets different ports.
             let mut new_config = config.clone();
             new_config.next_available_port_offset = offset;
             state.config = Some(new_config.clone());
 
-            // 4. Register the node as Ready
+            // 4. Register the node with a fully-qualified Flight SQL endpoint so
+            //    the distributed query client can connect to it later.
+            let endpoint = format!("http://{}:{}", host, flight_sql_port);
             let node = ClusterNode {
                 id: node_id.clone(),
-                role: NodeRole::Compute, // Default to compute for joining nodes
-                endpoint: endpoint.to_string(),
+                role: NodeRole::Compute,
+                endpoint,
                 status: NodeStatus::Ready,
                 last_heartbeat_at_epoch_ms: current_epoch_millis(),
             };

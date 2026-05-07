@@ -140,8 +140,16 @@ async fn run() -> Result<()> {
         warn!("\x1b[1;31mNo cluster configuration provided for control node. Using bootstrap defaults.\x1b[0m");
     }
 
-    let mut pg_addr = cli.postgres_addr.clone();
-    let mut flight_addr = cli.flight_sql_addr.clone();
+    // Addresses: explicit CLI values take precedence; joining nodes get ports
+    // assigned by the coordinator, so these are optional for non-primary nodes.
+    let mut pg_addr = cli
+        .postgres_addr
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:5432".to_string());
+    let mut flight_addr = cli
+        .flight_sql_addr
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:50051".to_string());
     let mut catalog_path = cli.catalog_path.clone();
     let mut node_id = cli.node_id.clone();
     let mut final_tls_cert = cli.tls_cert.clone();
@@ -205,6 +213,7 @@ async fn run() -> Result<()> {
         let req = analyticsdb_control::raft::JoinRequest {
             node_id: cli.node_id.clone(),
             endpoint: "auto".to_string(),
+            advertise_host: Some(cli.advertise_host.clone()),
         };
         let body = serde_json::to_vec(&req)?;
         let action = arrow_flight::Action {
@@ -219,13 +228,26 @@ async fn run() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No response from coordinator"))??;
         let res: analyticsdb_control::raft::JoinResponse = serde_json::from_slice(&res_bytes.body)?;
 
+        println!(
+            " \x1b[1;32mJoined cluster. Assigned ID: '{}'\x1b[0m",
+            res.node_id
+        );
+        println!(
+            " \x1b[1;32m  PostgreSQL  → {}:{}\x1b[0m",
+            cli.advertise_host, res.postgres_port
+        );
+        println!(
+            " \x1b[1;32m  Flight SQL  → {}:{}\x1b[0m",
+            cli.advertise_host, res.flight_sql_port
+        );
         info!(
-            "Successfully joined cluster. Assigned ID: '{}', Ports: PG={}, Flight={}",
+            "Joined cluster. ID='{}', PG={}, Flight={}",
             res.node_id, res.postgres_port, res.flight_sql_port
         );
         node_id = Some(res.node_id);
-        pg_addr = format!("127.0.0.1:{}", res.postgres_port);
-        flight_addr = format!("127.0.0.1:{}", res.flight_sql_port);
+        // Bind on all interfaces so the coordinator and peers can reach this node.
+        pg_addr = format!("0.0.0.0:{}", res.postgres_port);
+        flight_addr = format!("0.0.0.0:{}", res.flight_sql_port);
         catalog_path = res.config.catalog_path.clone();
 
         if final_tls_cert.is_none() {
@@ -334,10 +356,21 @@ struct Cli {
     join: Option<String>,
     #[arg(long)]
     cluster_config: Option<String>,
-    #[arg(long, default_value = "127.0.0.1:5432")]
-    postgres_addr: String,
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    flight_sql_addr: String,
+    /// Address to bind the PostgreSQL wire protocol on.
+    /// Non-primary nodes (--join) have this assigned automatically by the
+    /// coordinator; you only need to set it explicitly for the primary node.
+    #[arg(long)]
+    postgres_addr: Option<String>,
+    /// Address to bind the Flight SQL protocol on.
+    /// Non-primary nodes (--join) have this assigned automatically by the
+    /// coordinator; you only need to set it explicitly for the primary node.
+    #[arg(long)]
+    flight_sql_addr: Option<String>,
+    /// Hostname or IP that peer nodes use to reach this node.
+    /// Defaults to 127.0.0.1 (suitable for single-machine clusters).
+    /// Set to your network IP or DNS name for multi-host deployments.
+    #[arg(long, default_value = "127.0.0.1")]
+    advertise_host: String,
     #[arg(long, default_value = "analyticsdb-catalog.json")]
     catalog_path: String,
     #[arg(long)]
