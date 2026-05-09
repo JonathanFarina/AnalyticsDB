@@ -75,6 +75,7 @@ Rules:
 - PostgreSQL and Flight SQL must land in the same logical session model
 - PostgreSQL and Flight SQL adapters must consume the shared engine statement outcome contract for row-returning SQL versus command SQL; protocol-local string-prefix classification and affected-row scraping are not architectural sources of truth
 - Flight SQL row-returning paths should stream from the shared engine row stream and must not re-plan solely because a client moves from `GetFlightInfo` to `DoGet`
+- Flight SQL listeners must serve TLS whenever certificate/key material is configured, including dynamically joined nodes; node-to-node distributed execution uses a dedicated internal gRPC/Flight channel registered separately from the client-facing Flight SQL endpoint
 - differences in wire protocol must not create different product capabilities
 - error codes, metadata visibility, and auth semantics must be intentionally mapped and tested
 

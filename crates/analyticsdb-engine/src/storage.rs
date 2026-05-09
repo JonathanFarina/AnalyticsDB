@@ -66,7 +66,9 @@ pub async fn append_parquet_batch(
     prefix: &OPath,
     batch: RecordBatch,
 ) -> Result<()> {
-    let key = prefix.clone().join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
+    let key = prefix
+        .clone()
+        .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
     let bytes = encode_parquet_batches(batch.schema(), std::slice::from_ref(&batch))?;
     store.put(&key, bytes.into()).await?;
     Ok(())
@@ -129,10 +131,7 @@ pub async fn list_parquet_files(
 /// Deletes all `.parquet` files that are direct children of `prefix` (non-recursive).
 ///
 /// Objects in sub-prefixes (e.g. `.analyticsdb_indexes/`) are left untouched.
-pub async fn clear_parquet_files(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &OPath,
-) -> Result<()> {
+pub async fn clear_parquet_files(store: &Arc<dyn ObjectStore>, prefix: &OPath) -> Result<()> {
     let prefix_str = prefix.as_ref().to_owned();
     let mut list = store.list(Some(prefix));
     let mut to_delete = Vec::new();

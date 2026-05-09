@@ -1,6 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::path::PathBuf;
 
 use analyticsdb_engine::PrototypeEngine;
 use analyticsdb_protocol::serve_postgres_wire;
@@ -466,16 +466,25 @@ async fn test_reindex() {
         );
     }
 
-    let initial_email_lookup =
-        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    let initial_email_lookup = run_sql(
+        &endpoint,
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
     assert!(initial_email_lookup.contains("2"));
 
-    let email_index_root =
-        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_email_idx");
+    let email_index_root = index_snapshot_root(
+        &catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_email_idx",
+    );
     std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
 
-    let email_without_index =
-        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    let email_without_index = run_sql(
+        &endpoint,
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
     assert!(email_without_index.contains("2"));
     assert!(!email_without_index.contains("using index"));
 
@@ -489,12 +498,19 @@ async fn test_reindex() {
         "REINDEX INDEX should recreate the missing manifest"
     );
 
-    let email_with_index_again =
-        run_sql(&endpoint, "SELECT id FROM customers WHERE email = 'two@example.test'");
+    let email_with_index_again = run_sql(
+        &endpoint,
+        "SELECT id FROM customers WHERE email = 'two@example.test'",
+    );
     assert!(email_with_index_again.contains("2"));
 
-    let city_index_root =
-        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_city_idx");
+    let city_index_root = index_snapshot_root(
+        &catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_city_idx",
+    );
     std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
     std::fs::remove_dir_all(&city_index_root).expect("city index snapshot root should exist");
 

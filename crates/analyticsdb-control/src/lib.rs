@@ -35,6 +35,8 @@ pub struct ClusterNode {
     pub id: String,
     pub role: NodeRole,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_endpoint: Option<String>,
     pub status: NodeStatus,
     #[serde(default)]
     pub last_heartbeat_at_epoch_ms: u128,
@@ -206,6 +208,8 @@ pub struct QueryAdmission {
 pub struct ClusterConfig {
     pub base_postgres_port: u16,
     pub base_flight_sql_port: u16,
+    #[serde(default = "default_base_node_port")]
+    pub base_node_port: u16,
     pub catalog_path: String,
     #[serde(alias = "tls_cert")]
     pub tls_cert_path: Option<String>,
@@ -961,7 +965,7 @@ impl ControlPlane {
     ) -> Result<raft::JoinResponse> {
         let host = advertise_host.unwrap_or("127.0.0.1");
 
-        let (node_id, postgres_port, flight_sql_port, new_config) = {
+        let (node_id, postgres_port, flight_sql_port, node_port, new_config) = {
             let mut state = self.state.write().await;
 
             let config = state
@@ -987,26 +991,40 @@ impl ControlPlane {
             let offset = config.next_available_port_offset + 1;
             let postgres_port = config.base_postgres_port + offset;
             let flight_sql_port = config.base_flight_sql_port + offset;
+            let node_port = config.base_node_port + offset;
 
             // 3. Persist the new offset so the next joining node gets different ports.
             let mut new_config = config.clone();
             new_config.next_available_port_offset = offset;
             state.config = Some(new_config.clone());
 
-            // 4. Register the node with a fully-qualified Flight SQL endpoint so
-            //    the distributed query client can connect to it later.
-            //    Compute nodes' flight port is internal-only; always use plain
-            //    HTTP/2 to avoid TLS mismatch between the dispatcher and worker.
-            let endpoint = format!("http://{}:{}", host, flight_sql_port);
+            // 4. Register both the client-facing Flight SQL endpoint and the
+            //    dedicated node-to-node endpoint. Distributed execution uses
+            //    the internal endpoint so client TLS policy can evolve
+            //    independently from cluster transport policy.
+            let scheme = if config.tls_cert_path.is_some() && config.tls_key_path.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            let endpoint = format!("{}://{}:{}", scheme, host, flight_sql_port);
+            let internal_endpoint = format!("http://{}:{}", host, node_port);
             let node = ClusterNode {
                 id: node_id.clone(),
                 role: NodeRole::Compute,
                 endpoint,
+                internal_endpoint: Some(internal_endpoint),
                 status: NodeStatus::Ready,
                 last_heartbeat_at_epoch_ms: current_epoch_millis(),
             };
             state.nodes.insert(node_id.clone(), node);
-            (node_id, postgres_port, flight_sql_port, new_config)
+            (
+                node_id,
+                postgres_port,
+                flight_sql_port,
+                node_port,
+                new_config,
+            )
         };
 
         self.persist().await?;
@@ -1016,14 +1034,14 @@ impl ControlPlane {
         // inside the catalog's own config section).
         let mut response_config = new_config;
         if let Some(actual_path) = &self.catalog_path {
-            response_config.catalog_path =
-                actual_path.to_string_lossy().into_owned();
+            response_config.catalog_path = actual_path.to_string_lossy().into_owned();
         }
 
         Ok(raft::JoinResponse {
             node_id,
             postgres_port,
             flight_sql_port,
+            node_port,
             config: response_config,
         })
     }
@@ -2981,6 +2999,7 @@ fn bootstrap_state() -> CatalogState {
     let config = Some(ClusterConfig {
         base_postgres_port: 5432,
         base_flight_sql_port: 50051,
+        base_node_port: default_base_node_port(),
         catalog_path: DEFAULT_CATALOG_PATH.to_string(),
         tls_cert_path: None,
         tls_key_path: None,
@@ -2997,6 +3016,77 @@ fn bootstrap_state() -> CatalogState {
         conversions: BTreeMap::new(),
         functions: BTreeMap::new(),
         config,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build")
+            .block_on(future);
+    }
+
+    #[test]
+    fn join_cluster_advertises_plaintext_endpoint_without_tls_config() {
+        run_async_test(async {
+            let control_plane = ControlPlane::new_bootstrap();
+
+            let response = control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let nodes = control_plane.list_nodes().await.expect("nodes should list");
+            let worker = nodes
+                .iter()
+                .find(|node| node.id == response.node_id)
+                .expect("joined node should be registered");
+
+            assert_eq!(worker.endpoint, "http://10.0.0.2:50052");
+            assert_eq!(
+                worker.internal_endpoint.as_deref(),
+                Some("http://10.0.0.2:60052")
+            );
+        });
+    }
+
+    #[test]
+    fn join_cluster_advertises_tls_endpoint_when_tls_config_is_available() {
+        run_async_test(async {
+            let control_plane = ControlPlane::new_bootstrap();
+            control_plane
+                .set_tls_paths(
+                    Some("certs/server.crt".to_string()),
+                    Some("certs/server.key".to_string()),
+                )
+                .await
+                .expect("tls paths should update");
+
+            let response = control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let nodes = control_plane.list_nodes().await.expect("nodes should list");
+            let worker = nodes
+                .iter()
+                .find(|node| node.id == response.node_id)
+                .expect("joined node should be registered");
+
+            assert_eq!(worker.endpoint, "https://10.0.0.2:50052");
+            assert_eq!(
+                worker.internal_endpoint.as_deref(),
+                Some("http://10.0.0.2:60052")
+            );
+        });
     }
 }
 
@@ -3047,6 +3137,10 @@ fn relation_key(database: &str, schema: &str, name: &str) -> String {
 
 fn default_password_version() -> u64 {
     0
+}
+
+fn default_base_node_port() -> u16 {
+    60051
 }
 
 fn current_epoch_millis() -> u128 {
@@ -4251,10 +4345,7 @@ fn parse_reindex_statement(sql: &str) -> Option<MetadataStatement> {
         return None;
     }
 
-    let (concurrently, raw_name) = if after_kind
-        .to_ascii_uppercase()
-        .starts_with("CONCURRENTLY ")
-    {
+    let (concurrently, raw_name) = if after_kind.to_ascii_uppercase().starts_with("CONCURRENTLY ") {
         (true, after_kind["CONCURRENTLY ".len()..].trim())
     } else {
         (false, after_kind)

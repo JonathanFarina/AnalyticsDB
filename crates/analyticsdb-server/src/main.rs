@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
 use analyticsdb_engine::PrototypeEngine;
-use analyticsdb_protocol::{serve_flight_sql, serve_postgres_wire};
+use analyticsdb_protocol::{serve_flight_sql_with_label, serve_postgres_wire};
 use anyhow::{Context as AnyhowContext, Result};
 use clap::Parser;
 use futures::Future;
@@ -150,6 +150,10 @@ async fn run() -> Result<()> {
         .flight_sql_addr
         .clone()
         .unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let mut node_addr = cli
+        .node_addr
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:60051".to_string());
     let mut catalog_path = cli.catalog_path.clone();
     let mut node_id = cli.node_id.clone();
     let mut final_tls_cert = cli.tls_cert.clone();
@@ -259,14 +263,19 @@ async fn run() -> Result<()> {
             " \x1b[1;32m  Flight SQL  → {}:{}\x1b[0m",
             cli.advertise_host, res.flight_sql_port
         );
+        println!(
+            " \x1b[1;32m  Node channel → {}:{}\x1b[0m",
+            cli.advertise_host, res.node_port
+        );
         info!(
-            "Joined cluster. ID='{}', PG={}, Flight={}",
-            res.node_id, res.postgres_port, res.flight_sql_port
+            "Joined cluster. ID='{}', PG={}, Flight={}, Node={}",
+            res.node_id, res.postgres_port, res.flight_sql_port, res.node_port
         );
         node_id = Some(res.node_id);
         // Bind on all interfaces so the coordinator and peers can reach this node.
         pg_addr = format!("0.0.0.0:{}", res.postgres_port);
         flight_addr = format!("0.0.0.0:{}", res.flight_sql_port);
+        node_addr = format!("0.0.0.0:{}", res.node_port);
         catalog_path = res.config.catalog_path.clone();
 
         // Inherit TLS cert/key from the JoinResponse so the compute node's
@@ -300,27 +309,36 @@ async fn run() -> Result<()> {
     }
 
     let engine = Arc::new(PrototypeEngine::from_catalog_path(&actual_catalog_path).await?);
+    engine
+        .control_plane()
+        .set_tls_paths(final_tls_cert.clone(), final_tls_key.clone())
+        .await?;
 
     let node_id = node_id.unwrap_or_else(|| "standalone".to_string());
 
     // Joining nodes are already registered by the coordinator with the correct
-    // advertise endpoint (http://host:port).  Re-registering here would
-    // overwrite that with the bind address ("0.0.0.0:port") which is not a
-    // valid gRPC URI for peer-to-peer dispatch.
+    // advertised endpoints. Re-registering here would overwrite those with
+    // bind addresses ("0.0.0.0:port") which are not valid peer URIs.
     if cli.join.is_none() {
         // Clear stale Compute node entries from previous runs so the
         // coordinator doesn't dispatch to workers that are no longer running.
         // Compute nodes re-register themselves when they join.
         engine.control_plane().clear_compute_nodes().await?;
 
-        let flight_scheme = if final_tls_cert.is_some() { "https" } else { "http" };
+        let flight_scheme = if final_tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let flight_port = flight_addr.rsplit(':').next().unwrap_or("50051");
+        let node_port = node_addr.rsplit(':').next().unwrap_or("60051");
         engine
             .control_plane()
             .register_node(ClusterNode {
                 id: node_id.clone(),
                 role: cli.role.clone(),
                 endpoint: format!("{}://{}:{}", flight_scheme, cli.advertise_host, flight_port),
+                internal_endpoint: Some(format!("http://{}:{}", cli.advertise_host, node_port)),
                 status: NodeStatus::Ready,
                 last_heartbeat_at_epoch_ms: 0,
             })
@@ -342,9 +360,13 @@ async fn run() -> Result<()> {
     let flight_listener = TcpListener::bind(&flight_addr)
         .await
         .context("Failed to bind Flight SQL port")?;
+    let node_listener = TcpListener::bind(&node_addr)
+        .await
+        .context("Failed to bind node communication port")?;
 
     info!("PostgreSQL protocol listening on: {}", pg_addr);
     info!("Flight SQL protocol listening on: {}", flight_addr);
+    info!("Node communication channel listening on: {}", node_addr);
 
     let tls_config = match (&final_tls_cert, &final_tls_key) {
         (Some(cert_path), Some(key_path)) => {
@@ -356,14 +378,29 @@ async fn run() -> Result<()> {
         _ => anyhow::bail!("Both --tls-cert and --tls-key must be provided to enable TLS"),
     };
 
-    // Compute nodes (--join) serve plain HTTP/2 on their internal flight port.
-    // TLS is only needed on the coordinator's client-facing flight port.
-    let flight_tls_config = if cli.join.is_some() { None } else { tls_config.clone() };
+    // Client-facing Flight SQL uses TLS when cert/key paths are configured.
+    let flight_tls_config = tls_config.clone();
 
     let engine_for_flight = Arc::clone(&engine);
     let flight_handle = tokio::spawn(async move {
-        if let Err(e) = serve_flight_sql(flight_listener, engine_for_flight, flight_tls_config).await {
+        if let Err(e) = serve_flight_sql_with_label(
+            flight_listener,
+            engine_for_flight,
+            flight_tls_config,
+            "Client Flight SQL",
+        )
+        .await
+        {
             error!("Flight SQL server error: {}", e);
+        }
+    });
+
+    let engine_for_node = Arc::clone(&engine);
+    let node_handle = tokio::spawn(async move {
+        if let Err(e) =
+            serve_flight_sql_with_label(node_listener, engine_for_node, None, "Node channel").await
+        {
+            error!("Node communication server error: {}", e);
         }
     });
 
@@ -378,6 +415,7 @@ async fn run() -> Result<()> {
 
     tokio::select! {
         _ = flight_handle => {},
+        _ = node_handle => {},
         _ = pg_handle => {},
     }
 
@@ -407,6 +445,11 @@ struct Cli {
     /// coordinator; you only need to set it explicitly for the primary node.
     #[arg(long)]
     flight_sql_addr: Option<String>,
+    /// Address to bind the node-to-node communication channel on.
+    /// Non-primary nodes (--join) have this assigned automatically by the
+    /// coordinator; you only need to set it explicitly for the primary node.
+    #[arg(long)]
+    node_addr: Option<String>,
     /// Hostname or IP that peer nodes use to reach this node.
     /// Defaults to 127.0.0.1 (suitable for single-machine clusters).
     /// Set to your network IP or DNS name for multi-host deployments.

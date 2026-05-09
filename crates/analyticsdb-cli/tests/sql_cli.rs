@@ -1,6 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::path::PathBuf;
 use std::{collections::BTreeSet, fmt};
 
 use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
@@ -1448,8 +1448,13 @@ async fn cli_supports_reindex_index_and_table_statements() {
     assert_eq!(email_lookup.rows, vec![vec!["2".to_string()]]);
     assert!(email_lookup.message.contains("customers_email_idx"));
 
-    let email_index_root =
-        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_email_idx");
+    let email_index_root = index_snapshot_root(
+        &catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_email_idx",
+    );
     std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
     assert!(
         !email_index_root.join("manifest.json").exists(),
@@ -1512,8 +1517,13 @@ async fn cli_supports_reindex_index_and_table_statements() {
         .message
         .contains("using index 'customers_email_idx'"));
 
-    let city_index_root =
-        index_snapshot_root(&catalog_path, "postgres", "public", "customers", "customers_city_idx");
+    let city_index_root = index_snapshot_root(
+        &catalog_path,
+        "postgres",
+        "public",
+        "customers",
+        "customers_city_idx",
+    );
     std::fs::remove_dir_all(&email_index_root).expect("email index snapshot root should exist");
     std::fs::remove_dir_all(&city_index_root).expect("city index snapshot root should exist");
 
@@ -5362,6 +5372,7 @@ async fn cli_supports_single_endpoint_routing_via_control_plane() {
             id: expected_node_id.to_string(),
             role: NodeRole::Control,
             endpoint: addr.to_string(),
+            internal_endpoint: None,
             status: NodeStatus::Ready,
             last_heartbeat_at_epoch_ms: 0,
         })

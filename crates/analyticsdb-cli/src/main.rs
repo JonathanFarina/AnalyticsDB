@@ -519,9 +519,9 @@ fn parse_postgres_endpoint(endpoint: &str) -> Result<(String, u16)> {
         Some(pos) => &endpoint[pos + 3..],
         None => endpoint,
     };
-    let (host, port) = bare
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("PostgreSQL endpoint must be in 'host:port' form, got: '{endpoint}'"))?;
+    let (host, port) = bare.rsplit_once(':').ok_or_else(|| {
+        anyhow!("PostgreSQL endpoint must be in 'host:port' form, got: '{endpoint}'")
+    })?;
     let port = port
         .parse::<u16>()
         .with_context(|| format!("invalid PostgreSQL port in endpoint '{endpoint}'"))?;

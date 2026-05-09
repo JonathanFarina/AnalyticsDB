@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{BooleanArray, Int16Array, Int32Array, StringArray, UInt32Array};
+use datafusion::arrow::array::{
+    Array, BooleanArray, Int16Array, Int32Array, StringArray, UInt32Array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, SchemaProvider, Session};
@@ -19,6 +21,7 @@ use datafusion::physical_plan::{
     project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
+use datafusion::prelude::SessionContext as DfSessionContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 
@@ -146,7 +149,49 @@ impl SchemaProvider for AnalyticsSchemaProvider {
 
         if relation.kind == analyticsdb_control::CatalogRelationKind::Table {
             if let Some(storage_path) = &relation.storage_path {
-                let schema = catalog_relation_to_schema(&relation);
+                let mut schema = catalog_relation_to_schema(&relation);
+                let infer_context = DfSessionContext::new();
+                if let Ok(inferred_config) =
+                    ListingTableConfig::new(ListingTableUrl::parse(storage_path)?)
+                        .with_listing_options(ListingOptions::new(Arc::new(
+                            ParquetFormat::default(),
+                        )))
+                        .infer_schema(&infer_context.state())
+                        .await
+                {
+                    if let Some(inferred_schema) = inferred_config.file_schema {
+                        schema = refine_utf8_catalog_schema_with_inferred(schema, &inferred_schema);
+                    }
+                }
+                if schema
+                    .fields()
+                    .iter()
+                    .any(|field| matches!(field.data_type(), DataType::Utf8))
+                {
+                    if let Ok((store, prefix)) = crate::storage::store_for_location(storage_path) {
+                        if let Ok(files) = crate::storage::list_parquet_files(&store, &prefix).await
+                        {
+                            if !files.is_empty() {
+                                if let Ok(sample_df) = infer_context
+                                    .read_parquet(
+                                        files.iter().map(String::as_str).collect::<Vec<_>>(),
+                                        Default::default(),
+                                    )
+                                    .await
+                                {
+                                    if let Ok(limited_df) = sample_df.limit(0, Some(1024)) {
+                                        if let Ok(sample_batches) = limited_df.collect().await {
+                                            schema = refine_utf8_catalog_schema_with_sample(
+                                                schema,
+                                                &sample_batches,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let table_path = ListingTableUrl::parse(storage_path)?;
                 let config = ListingTableConfig::new(table_path)
@@ -208,6 +253,136 @@ fn catalog_relation_to_schema(relation: &analyticsdb_control::CatalogRelation) -
     }
 
     Arc::new(Schema::new(fields))
+}
+
+fn refine_utf8_catalog_schema_with_inferred(
+    catalog_schema: SchemaRef,
+    inferred_schema: &SchemaRef,
+) -> SchemaRef {
+    let fields = catalog_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if !matches!(field.data_type(), DataType::Utf8) || field.name() == "_row_id" {
+                return Arc::clone(field);
+            }
+
+            let Ok(inferred_idx) = inferred_schema.index_of(field.name()) else {
+                return Arc::clone(field);
+            };
+            let inferred_field = inferred_schema.field(inferred_idx);
+            if matches!(inferred_field.data_type(), DataType::Utf8) {
+                Arc::clone(field)
+            } else {
+                Arc::new(Field::new(
+                    field.name(),
+                    inferred_field.data_type().clone(),
+                    field.is_nullable(),
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+fn refine_utf8_catalog_schema_with_sample(
+    catalog_schema: SchemaRef,
+    sample_batches: &[RecordBatch],
+) -> SchemaRef {
+    let fields = catalog_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if !matches!(field.data_type(), DataType::Utf8) || field.name() == "_row_id" {
+                return Arc::clone(field);
+            }
+
+            if let Some(sample_batch) = sample_batches.first() {
+                let sample_schema = sample_batch.schema();
+                if let Ok(sample_idx) = sample_schema.index_of(field.name()) {
+                    let sample_field = sample_schema.field(sample_idx);
+                    if !matches!(
+                        sample_field.data_type(),
+                        DataType::Utf8 | DataType::Utf8View
+                    ) {
+                        return Arc::new(Field::new(
+                            field.name(),
+                            sample_field.data_type().clone(),
+                            field.is_nullable(),
+                        ));
+                    }
+                }
+            }
+
+            match infer_utf8_catalog_column_type(field.name(), sample_batches) {
+                Some(data_type) => {
+                    Arc::new(Field::new(field.name(), data_type, field.is_nullable()))
+                }
+                None => Arc::clone(field),
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+fn infer_utf8_catalog_column_type(
+    column_name: &str,
+    sample_batches: &[RecordBatch],
+) -> Option<DataType> {
+    let mut saw_value = false;
+    let mut all_numeric = true;
+    let mut all_date = true;
+    let mut all_timestamp = true;
+
+    for batch in sample_batches {
+        let Ok(idx) = batch.schema().index_of(column_name) else {
+            return None;
+        };
+        let Some(values) = batch.column(idx).as_any().downcast_ref::<StringArray>() else {
+            return None;
+        };
+
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                continue;
+            }
+            let value = values.value(row).trim();
+            if value.is_empty() {
+                all_numeric = false;
+                all_date = false;
+                all_timestamp = false;
+                continue;
+            }
+            saw_value = true;
+            if value.parse::<f64>().is_err() {
+                all_numeric = false;
+            }
+            if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() {
+                all_date = false;
+            }
+            if chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_err()
+                && chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_err()
+            {
+                all_timestamp = false;
+            }
+        }
+    }
+
+    if !saw_value {
+        return None;
+    }
+    if all_date {
+        Some(DataType::Date32)
+    } else if all_timestamp {
+        Some(DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+            None,
+        ))
+    } else if all_numeric {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
 }
 
 pub struct PgCatalogSchemaProvider {

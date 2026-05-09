@@ -78,7 +78,7 @@ pub struct JoinRequest {
     pub endpoint: String,
     /// The hostname or IP address that peer nodes should use to connect to
     /// this node.  Combined with the coordinator-assigned Flight SQL port to
-    /// form the node's registered endpoint (`http://<host>:<port>`).
+    /// form the node's registered client and internal endpoints.
     /// Defaults to `"127.0.0.1"` when absent.
     #[serde(default)]
     pub advertise_host: Option<String>,
@@ -89,5 +89,6 @@ pub struct JoinResponse {
     pub node_id: String,
     pub postgres_port: u16,
     pub flight_sql_port: u16,
+    pub node_port: u16,
     pub config: crate::ClusterConfig,
 }
