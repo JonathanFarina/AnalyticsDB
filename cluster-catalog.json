@@ -43,18 +43,34 @@
     "node-4": {
       "id": "node-4",
       "role": "Compute",
-      "endpoint": "https://127.0.0.1:50081",
-      "internal_endpoint": "http://127.0.0.1:60081",
+      "endpoint": "https://127.0.0.1:50099",
+      "internal_endpoint": "http://127.0.0.1:60099",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778319399194
+      "last_heartbeat_at_epoch_ms": 1778349842395
     },
     "node-5": {
       "id": "node-5",
       "role": "Compute",
-      "endpoint": "https://127.0.0.1:50082",
-      "internal_endpoint": "http://127.0.0.1:60082",
+      "endpoint": "https://127.0.0.1:50100",
+      "internal_endpoint": "http://127.0.0.1:60100",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778319399195
+      "last_heartbeat_at_epoch_ms": 1778349858234
+    },
+    "node-6": {
+      "id": "node-6",
+      "role": "Compute",
+      "endpoint": "https://127.0.0.1:50101",
+      "internal_endpoint": "http://127.0.0.1:60101",
+      "status": "Ready",
+      "last_heartbeat_at_epoch_ms": 1778349861607
+    },
+    "node-7": {
+      "id": "node-7",
+      "role": "Compute",
+      "endpoint": "https://127.0.0.1:50102",
+      "internal_endpoint": "http://127.0.0.1:60102",
+      "status": "Ready",
+      "last_heartbeat_at_epoch_ms": 1778349925616
     },
     "node1": {
       "id": "node1",
@@ -62,7 +78,7 @@
       "endpoint": "https://127.0.0.1:50051",
       "internal_endpoint": "http://127.0.0.1:60051",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778319391570
+      "last_heartbeat_at_epoch_ms": 1778349842261
     },
     "node2": {
       "id": "node2",
@@ -204,6 +220,6 @@
     "catalog_path": "analyticsdb-catalog.json",
     "tls_cert_path": "certs/server.crt",
     "tls_key_path": "certs/server.key",
-    "next_available_port_offset": 31
+    "next_available_port_offset": 51
   }
 }

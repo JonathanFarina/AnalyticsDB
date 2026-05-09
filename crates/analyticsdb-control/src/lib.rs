@@ -583,6 +583,16 @@ impl ControlPlane {
         }
     }
 
+    pub async fn local_node(&self) -> Option<ClusterNode> {
+        let state = self.state.read().await;
+        state.nodes.get(&self.coordinator_node_id).cloned()
+    }
+
+    pub fn is_coordinator(&self) -> bool {
+        // In this prototype, the ControlPlane instance *is* the coordinator.
+        true
+    }
+
     pub async fn admit_query(&self, session: &SessionContext) -> Result<QueryAdmission> {
         self.validate_session(session).await?;
 
@@ -916,6 +926,23 @@ impl ControlPlane {
         // Heartbeats don't necessarily need to be persisted every time for the prototype
         // but we'll do it for now to keep it simple and consistent.
         self.persist().await?;
+        Ok(())
+    }
+
+    pub async fn mark_node_unavailable(&self, node_id: &str) -> Result<()> {
+        let mut changed = false;
+        {
+            let mut state = self.state.write().await;
+            if let Some(node) = state.nodes.get_mut(node_id) {
+                if node.status != NodeStatus::Unavailable {
+                    node.status = NodeStatus::Unavailable;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist().await?;
+        }
         Ok(())
     }
 

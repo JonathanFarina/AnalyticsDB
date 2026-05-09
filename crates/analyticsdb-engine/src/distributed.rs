@@ -42,24 +42,66 @@ pub struct ExecutePartitionRequest {
     pub source_columns: Vec<CatalogColumn>,
 }
 
-/// Splits `files` into at most `num_workers` chunks using round-robin assignment.
+/// Splits `files` into at most `num_workers` chunks using greedy size-aware assignment.
 ///
 /// Empty chunks are never emitted — if `files.len() < num_workers` the returned
 /// Vec will have fewer entries than `num_workers`.  Returns an empty Vec when
 /// `files` is empty.
-pub fn partition_files_for_workers(files: Vec<String>, num_workers: usize) -> Vec<Vec<String>> {
+pub fn partition_files_for_workers(
+    files: Vec<(String, u64)>,
+    num_workers: usize,
+) -> Vec<Vec<String>> {
     if files.is_empty() || num_workers == 0 {
         return Vec::new();
     }
     let buckets = num_workers.min(files.len());
     let mut chunks: Vec<Vec<String>> = (0..buckets).map(|_| Vec::new()).collect();
-    for (i, file) in files.into_iter().enumerate() {
-        chunks[i % buckets].push(file);
+    let mut bucket_sizes: Vec<u64> = vec![0; buckets];
+
+    // Sort by size descending
+    let mut sorted = files;
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Greedy assignment: assign each file to the bucket with the smallest total size.
+    for (file, size) in sorted {
+        let min_idx = bucket_sizes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| *s)
+            .map(|(i, _)| i)
+            .unwrap();
+        chunks[min_idx].push(file);
+        bucket_sizes[min_idx] += size;
     }
     chunks
 }
 
 // ─── Arrow IPC encoding helpers ─────────────────────────────────────────────
+
+pub fn calculate_optimal_worker_count(
+    total_size: u64,
+    file_count: usize,
+    available_nodes: usize,
+) -> usize {
+    if available_nodes <= 1 {
+        return available_nodes;
+    }
+
+    // Heuristic:
+    // - Pick N such that each worker has ~128MB of data.
+    // - Pick N such that each worker has at least 2 files.
+    // - N must be between 1 and available_nodes.
+    
+    // For very small datasets, just use 1 node (coordinator).
+    if total_size < 10 * 1024 * 1024 && file_count < 4 {
+        return 1;
+    }
+
+    let by_size = (total_size as f64 / (128.0 * 1024.0 * 1024.0)).ceil() as usize;
+    let by_file = (file_count as f64 / 2.0).ceil() as usize;
+    
+    by_size.max(by_file).clamp(1, available_nodes)
+}
 
 /// Encodes a slice of `RecordBatch`es as a single Arrow IPC stream.
 pub fn batches_to_ipc_bytes(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Bytes> {
@@ -109,22 +151,58 @@ pub struct ExecutePartitionWriteAck {
 /// to them over Arrow Flight.
 pub struct PartitionClient {
     control_plane: Arc<ControlPlane>,
+    channels: Arc<dashmap::DashMap<String, tonic::transport::Channel>>,
+    is_compute_eligible: bool,
 }
 
 impl PartitionClient {
     pub fn new(control_plane: Arc<ControlPlane>) -> Self {
-        Self { control_plane }
+        Self {
+            control_plane,
+            channels: Arc::new(dashmap::DashMap::new()),
+            is_compute_eligible: false,
+        }
+    }
+
+    pub fn set_compute_eligible(&mut self, eligible: bool) {
+        self.is_compute_eligible = eligible;
+    }
+
+    async fn get_or_create_channel(&self, endpoint: &str) -> Result<tonic::transport::Channel> {
+        if let Some(ch) = self.channels.get(endpoint) {
+            return Ok(ch.clone());
+        }
+        let ch = build_channel(endpoint).await?;
+        self.channels.insert(endpoint.to_string(), ch.clone());
+        Ok(ch)
     }
 
     /// Returns all Ready Compute nodes available to accept partition tasks.
+    /// If `is_compute_eligible` is true and this node is the coordinator,
+    /// it includes itself in the list.
     pub async fn list_compute_nodes(&self) -> Result<Vec<ClusterNode>> {
-        Ok(self
+        let mut nodes = self
             .control_plane
             .list_nodes()
             .await?
             .into_iter()
             .filter(|n| n.role == NodeRole::Compute && n.status == NodeStatus::Ready)
-            .collect())
+            .collect::<Vec<_>>();
+
+        if self.is_compute_eligible {
+            if let Some(coordinator) = self.control_plane.local_node().await {
+                // If the coordinator is not already in the list (as a compute node), add it.
+                if !nodes.iter().any(|n| n.id == coordinator.id) {
+                    nodes.push(coordinator);
+                }
+            }
+        }
+
+        Ok(nodes)
+    }
+
+    pub async fn mark_node_unavailable(&self, node_id: &str) -> Result<()> {
+        self.control_plane.mark_node_unavailable(node_id).await
     }
 
     pub fn node_channel_endpoint(node: &ClusterNode) -> &str {
@@ -142,12 +220,12 @@ impl PartitionClient {
         node_endpoint: &str,
         req: &ExecutePartitionWriteRequest,
     ) -> Result<ExecutePartitionWriteAck> {
-        let channel = build_channel(node_endpoint).await?;
+        let channel = self.get_or_create_channel(node_endpoint).await?;
         let mut client = FlightSqlServiceClient::new(channel);
 
         let action = Action {
             r#type: "ExecutePartitionWrite".to_string(),
-            body: serde_json::to_vec(req)?.into(),
+            body: bincode::serialize(req)?.into(),
         };
 
         let mut stream = client.do_action(action).await?;
@@ -159,32 +237,37 @@ impl PartitionClient {
         Ok(ack)
     }
 
-    /// Sends an `ExecutePartition` DoAction to a Compute node and collects the
-    /// returned `RecordBatch`es.  The node endpoint must be a fully-qualified
+    /// Sends an `ExecutePartition` DoAction to a Compute node and returns a stream
+    /// of `RecordBatch`es.  The node endpoint must be a fully-qualified
     /// URI such as `http://host:50052` or `https://host:50052`.
     pub async fn execute_on_node(
         &self,
         node_endpoint: &str,
         req: &ExecutePartitionRequest,
-    ) -> Result<Vec<RecordBatch>> {
-        let channel = build_channel(node_endpoint).await?;
+    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<RecordBatch>> + Send>>> {
+        let channel = self.get_or_create_channel(node_endpoint).await?;
         let mut client = FlightSqlServiceClient::new(channel);
 
         let action = Action {
             r#type: "ExecutePartition".to_string(),
-            body: serde_json::to_vec(req)?.into(),
+            body: bincode::serialize(req)?.into(),
         };
 
-        let mut stream = client.do_action(action).await?;
-        let mut all_batches = Vec::new();
+        let stream = client.do_action(action).await?;
+        let batch_stream = stream.then(|result| async move {
+            match result {
+                Ok(flight_result) => match ipc_bytes_to_batches(&flight_result.body) {
+                    Ok(batches) => {
+                        let res: Vec<Result<RecordBatch>> = batches.into_iter().map(Ok).collect();
+                        futures::stream::iter(res)
+                    }
+                    Err(e) => futures::stream::iter(vec![Err(anyhow::anyhow!(e))]),
+                },
+                Err(e) => futures::stream::iter(vec![Err(anyhow::anyhow!(e))]),
+            }
+        });
 
-        while let Some(result) = stream.next().await {
-            let flight_result = result?;
-            let batches = ipc_bytes_to_batches(&flight_result.body)?;
-            all_batches.extend(batches);
-        }
-
-        Ok(all_batches)
+        Ok(Box::pin(batch_stream.flatten()))
     }
 }
 
@@ -339,8 +422,8 @@ mod tests {
             partition_files: vec!["/tmp/a.parquet".to_string()],
             source_columns: vec![],
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: ExecutePartitionRequest = serde_json::from_str(&json).unwrap();
+        let bytes = bincode::serialize(&req).unwrap();
+        let decoded: ExecutePartitionRequest = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.query_id, "q1");
         assert_eq!(decoded.partition_files, vec!["/tmp/a.parquet"]);
         assert!(decoded.source_columns.is_empty());
@@ -381,22 +464,54 @@ mod tests {
     }
 
     #[test]
-    fn partition_files_round_robin_even() {
-        let files: Vec<String> = (0..6).map(|i| format!("f{i}.parquet")).collect();
+    fn partition_files_size_aware_balanced() {
+        let files = vec![
+            ("f1.parquet".to_string(), 100),
+            ("f2.parquet".to_string(), 100),
+            ("f3.parquet".to_string(), 100),
+            ("f4.parquet".to_string(), 100),
+            ("f5.parquet".to_string(), 100),
+            ("f6.parquet".to_string(), 100),
+        ];
         let chunks = partition_files_for_workers(files, 3);
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0], vec!["f0.parquet", "f3.parquet"]);
-        assert_eq!(chunks[1], vec!["f1.parquet", "f4.parquet"]);
-        assert_eq!(chunks[2], vec!["f2.parquet", "f5.parquet"]);
+        // With equal sizes, it should still be balanced
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), 2);
+        }
+    }
+
+    #[test]
+    fn partition_files_size_aware_greedy() {
+        let files = vec![
+            ("large.parquet".to_string(), 1000),
+            ("small1.parquet".to_string(), 100),
+            ("small2.parquet".to_string(), 100),
+            ("small3.parquet".to_string(), 100),
+        ];
+        // 2 workers:
+        // Worker 1 should get large.parquet (1000)
+        // Worker 2 should get all small ones (300)
+        let chunks = partition_files_for_workers(files, 2);
+        assert_eq!(chunks.len(), 2);
+
+        let chunk0 = &chunks[0];
+        let chunk1 = &chunks[1];
+
+        if chunk0.contains(&"large.parquet".to_string()) {
+            assert_eq!(chunk0.len(), 1);
+            assert_eq!(chunk1.len(), 3);
+        } else {
+            assert_eq!(chunk1.len(), 1);
+            assert_eq!(chunk0.len(), 3);
+        }
     }
 
     #[test]
     fn partition_files_fewer_files_than_workers() {
-        let files: Vec<String> = vec!["a.parquet".to_string(), "b.parquet".to_string()];
+        let files = vec![("a.parquet".to_string(), 10), ("b.parquet".to_string(), 10)];
         let chunks = partition_files_for_workers(files, 5);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], vec!["a.parquet"]);
-        assert_eq!(chunks[1], vec!["b.parquet"]);
     }
 
     #[test]
@@ -407,9 +522,12 @@ mod tests {
 
     #[test]
     fn partition_files_single_worker() {
-        let files: Vec<String> = vec!["x.parquet".to_string(), "y.parquet".to_string()];
+        let files = vec![("x.parquet".to_string(), 10), ("y.parquet".to_string(), 10)];
         let chunks = partition_files_for_workers(files.clone(), 1);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], files);
+        assert_eq!(
+            chunks[0],
+            vec!["x.parquet".to_string(), "y.parquet".to_string()]
+        );
     }
 }
