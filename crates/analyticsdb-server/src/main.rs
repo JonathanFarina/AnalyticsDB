@@ -154,7 +154,26 @@ async fn run() -> Result<()> {
     let mut node_id = cli.node_id.clone();
     let mut final_tls_cert = cli.tls_cert.clone();
     let mut final_tls_key = cli.tls_key.clone();
-    let final_tls_ca_cert = cli.tls_ca_cert.clone();
+    // When joining with --cluster-config, load the config now so the cert
+    // path is available as a trust anchor before we connect to the coordinator.
+    let mut final_tls_ca_cert = cli.tls_ca_cert.clone();
+    if cli.join.is_some() {
+        if let Some(config_path) = &cli.cluster_config {
+            let config_raw = std::fs::read_to_string(config_path)
+                .with_context(|| format!("Failed to read cluster config: {}", config_path))?;
+            let config: analyticsdb_control::ClusterConfig = serde_json::from_str(&config_raw)?;
+            // Use the cert from the config as the CA trust anchor if not explicitly set.
+            if final_tls_ca_cert.is_none() {
+                final_tls_ca_cert = config.tls_cert_path.clone();
+            }
+            if final_tls_cert.is_none() {
+                final_tls_cert = config.tls_cert_path;
+            }
+            if final_tls_key.is_none() {
+                final_tls_key = config.tls_key_path;
+            }
+        }
+    }
 
     // If joining a cluster, request configuration from the coordinator
     if let Some(coordinator_endpoint) = &cli.join {
@@ -250,6 +269,10 @@ async fn run() -> Result<()> {
         flight_addr = format!("0.0.0.0:{}", res.flight_sql_port);
         catalog_path = res.config.catalog_path.clone();
 
+        // Inherit TLS cert/key from the JoinResponse so the compute node's
+        // flight server also serves with TLS.  The coordinator dispatches to
+        // it via https:// using an insecure connector (cert verification
+        // skipped for intra-cluster gRPC on a trusted internal network).
         if final_tls_cert.is_none() {
             final_tls_cert = res.config.tls_cert_path;
         }
@@ -279,25 +302,39 @@ async fn run() -> Result<()> {
     let engine = Arc::new(PrototypeEngine::from_catalog_path(&actual_catalog_path).await?);
 
     let node_id = node_id.unwrap_or_else(|| "standalone".to_string());
-    engine
-        .control_plane()
-        .register_node(ClusterNode {
-            id: node_id.clone(),
-            role: cli.role.clone(),
-            endpoint: flight_addr.clone(),
-            status: NodeStatus::Ready,
-            last_heartbeat_at_epoch_ms: 0,
-        })
-        .await?;
 
-    println!(
-        " \x1b[1;32mRegistered node '{}' as {:?} in control plane\x1b[0m",
-        node_id, cli.role
-    );
-    info!(
-        "Registered node '{}' as {:?} in control plane",
-        node_id, cli.role
-    );
+    // Joining nodes are already registered by the coordinator with the correct
+    // advertise endpoint (http://host:port).  Re-registering here would
+    // overwrite that with the bind address ("0.0.0.0:port") which is not a
+    // valid gRPC URI for peer-to-peer dispatch.
+    if cli.join.is_none() {
+        // Clear stale Compute node entries from previous runs so the
+        // coordinator doesn't dispatch to workers that are no longer running.
+        // Compute nodes re-register themselves when they join.
+        engine.control_plane().clear_compute_nodes().await?;
+
+        let flight_scheme = if final_tls_cert.is_some() { "https" } else { "http" };
+        let flight_port = flight_addr.rsplit(':').next().unwrap_or("50051");
+        engine
+            .control_plane()
+            .register_node(ClusterNode {
+                id: node_id.clone(),
+                role: cli.role.clone(),
+                endpoint: format!("{}://{}:{}", flight_scheme, cli.advertise_host, flight_port),
+                status: NodeStatus::Ready,
+                last_heartbeat_at_epoch_ms: 0,
+            })
+            .await?;
+
+        println!(
+            " \x1b[1;32mRegistered node '{}' as {:?} in control plane\x1b[0m",
+            node_id, cli.role
+        );
+        info!(
+            "Registered node '{}' as {:?} in control plane",
+            node_id, cli.role
+        );
+    }
 
     let pg_listener = TcpListener::bind(&pg_addr)
         .await
@@ -319,9 +356,13 @@ async fn run() -> Result<()> {
         _ => anyhow::bail!("Both --tls-cert and --tls-key must be provided to enable TLS"),
     };
 
+    // Compute nodes (--join) serve plain HTTP/2 on their internal flight port.
+    // TLS is only needed on the coordinator's client-facing flight port.
+    let flight_tls_config = if cli.join.is_some() { None } else { tls_config.clone() };
+
     let engine_for_flight = Arc::clone(&engine);
     let flight_handle = tokio::spawn(async move {
-        if let Err(e) = serve_flight_sql(flight_listener, engine_for_flight, tls_config).await {
+        if let Err(e) = serve_flight_sql(flight_listener, engine_for_flight, flight_tls_config).await {
             error!("Flight SQL server error: {}", e);
         }
     });

@@ -4,5 +4,5 @@
    "catalog_path": "cluster-catalog.json",
    "tls_cert_path": "certs/server.crt",
    "tls_key_path": "certs/server.key",
-   "next_available_port_offset": 0
+   "next_available_port_offset": 1
 }

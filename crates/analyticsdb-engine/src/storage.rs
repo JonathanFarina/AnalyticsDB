@@ -12,8 +12,10 @@ use object_store::{Error as OsError, ObjectStore, ObjectStoreExt};
 
 /// Creates a `(store, prefix)` pair from a storage-location string.
 ///
-/// Supports `file://` URIs and plain absolute paths for the local filesystem.
-/// The returned prefix is a key within the store (no leading `/`).
+/// Supports `file://` URIs and plain paths (absolute or relative) for the
+/// local filesystem.  Relative paths are resolved against the current working
+/// directory so they match what DataFusion's `ListingTableUrl` would resolve
+/// to.  The returned prefix is a key within the store (no leading `/`).
 pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
     let local_path = if let Some(p) = location.strip_prefix("file://") {
         p
@@ -27,9 +29,24 @@ pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath
         );
     };
 
+    // LocalFileSystem::new() is rooted at the filesystem root (/), so it
+    // requires absolute paths.  Resolve relative paths against cwd so they
+    // point to the same location DataFusion's ListingTableUrl would use.
+    let abs_path = {
+        let p = std::path::Path::new(local_path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {}", e))?
+                .join(p)
+        }
+    };
+
     let store = Arc::new(LocalFileSystem::new()) as Arc<dyn ObjectStore>;
     // Object-store Path keys must not begin with '/'.
-    let path_str = local_path.trim_start_matches('/');
+    let abs_str = abs_path.to_string_lossy();
+    let path_str = abs_str.trim_start_matches('/');
     let prefix = OPath::parse(path_str)
         .map_err(|e| anyhow::anyhow!("Invalid storage path '{}': {}", path_str, e))?;
     Ok((store, prefix))

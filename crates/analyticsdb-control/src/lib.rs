@@ -940,6 +940,20 @@ impl ControlPlane {
         Ok(state.nodes.values().cloned().collect())
     }
 
+    /// Removes all Compute nodes from the catalog.
+    ///
+    /// Called on coordinator startup so that stale entries from previous runs
+    /// don't cause dispatch attempts to non-running workers.  Compute nodes
+    /// re-register by calling `join_cluster` when they start.
+    pub async fn clear_compute_nodes(&self) -> Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state.nodes.retain(|_, n| n.role != NodeRole::Compute);
+        }
+        self.persist().await?;
+        Ok(())
+    }
+
     pub async fn join_cluster(
         &self,
         requested_node_id: Option<&str>,
@@ -981,6 +995,8 @@ impl ControlPlane {
 
             // 4. Register the node with a fully-qualified Flight SQL endpoint so
             //    the distributed query client can connect to it later.
+            //    Compute nodes' flight port is internal-only; always use plain
+            //    HTTP/2 to avoid TLS mismatch between the dispatcher and worker.
             let endpoint = format!("http://{}:{}", host, flight_sql_port);
             let node = ClusterNode {
                 id: node_id.clone(),
@@ -995,12 +1011,40 @@ impl ControlPlane {
 
         self.persist().await?;
 
+        // Override catalog_path in the response so the joining node loads
+        // from the same file as the coordinator (not the default path stored
+        // inside the catalog's own config section).
+        let mut response_config = new_config;
+        if let Some(actual_path) = &self.catalog_path {
+            response_config.catalog_path =
+                actual_path.to_string_lossy().into_owned();
+        }
+
         Ok(raft::JoinResponse {
             node_id,
             postgres_port,
             flight_sql_port,
-            config: new_config,
+            config: response_config,
         })
+    }
+
+    /// Updates only the TLS cert/key paths in the in-memory cluster config.
+    ///
+    /// Not persisted — the canonical source for TLS config is the
+    /// cluster-config.json file, not the catalog.  Called at coordinator
+    /// startup so that `join_cluster` registers compute nodes with the
+    /// correct scheme (`https://` vs `http://`).
+    pub async fn set_tls_paths(
+        &self,
+        cert_path: Option<String>,
+        key_path: Option<String>,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(ref mut config) = state.config {
+            config.tls_cert_path = cert_path;
+            config.tls_key_path = key_path;
+        }
+        Ok(())
     }
 
     pub async fn update_cluster_config(&self, config: ClusterConfig) -> Result<()> {

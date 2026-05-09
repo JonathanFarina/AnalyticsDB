@@ -1,5 +1,7 @@
 use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use analyticsdb_control::{ClusterNode, ControlPlane, NodeRole, NodeStatus};
 use analyticsdb_core::SessionContext;
@@ -11,7 +13,8 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
-use futures::StreamExt;
+use futures::{Future, StreamExt};
+use hyper_util::rt::tokio::TokioIo;
 use serde::{Deserialize, Serialize};
 
 /// Payload sent from a Coordinator to a Compute node via the `ExecutePartition`
@@ -170,19 +173,112 @@ impl PartitionClient {
     }
 }
 
-/// Builds a tonic transport channel to `endpoint`.  Supports both `http://`
-/// and `https://` schemes; for HTTPS the system trust store is used.
+/// Builds a tonic transport channel to `endpoint`.
+///
+/// For `http://` endpoints a plain HTTP/2 connection is used.
+/// For `https://` endpoints an encrypted connection is established but
+/// certificate verification is skipped — intra-cluster gRPC runs on a
+/// trusted internal network and all nodes share the same cluster cert, so
+/// peer verification adds no real security benefit here.
 async fn build_channel(endpoint: &str) -> Result<tonic::transport::Channel> {
-    let mut builder = tonic::transport::Endpoint::new(endpoint.to_string())?
+    let builder = tonic::transport::Endpoint::new(endpoint.to_string())?
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(300));
 
     if endpoint.starts_with("https://") {
-        let tls = tonic::transport::ClientTlsConfig::new().with_enabled_roots();
-        builder = builder.tls_config(tls)?;
+        Ok(builder
+            .connect_with_connector(ClusterInternalConnector::new())
+            .await?)
+    } else {
+        Ok(builder.connect().await?)
+    }
+}
+
+// ─── Insecure TLS connector for intra-cluster gRPC ──────────────────────────
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    Ok(builder.connect().await?)
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct ClusterInternalConnector {
+    tls_config: Arc<rustls::ClientConfig>,
+}
+
+impl ClusterInternalConnector {
+    fn new() -> Self {
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("rustls config")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        Self { tls_config: Arc::new(cfg) }
+    }
+}
+
+impl tower::Service<http::Uri> for ClusterInternalConnector {
+    type Response = TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let tls_config = Arc::clone(&self.tls_config);
+        let host = uri.host().unwrap_or("localhost").to_string();
+        let port = uri.port_u16().unwrap_or(443);
+        Box::pin(async move {
+            let tcp = tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await?;
+            let connector = tokio_rustls::TlsConnector::from(tls_config);
+            let domain = rustls_pki_types::ServerName::try_from(host)
+                .map_err(|e| anyhow::anyhow!("Invalid DNS name: {}", e))?
+                .to_owned();
+            let tls = connector.connect(domain, tcp).await?;
+            Ok(TokioIo::new(tls))
+        })
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

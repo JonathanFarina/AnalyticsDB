@@ -513,9 +513,15 @@ where
 }
 
 fn parse_postgres_endpoint(endpoint: &str) -> Result<(String, u16)> {
-    let (host, port) = endpoint
+    // Strip any URL scheme (e.g. https://, postgresql://) — PostgreSQL wire
+    // protocol is not HTTP; the scheme is meaningless here.
+    let bare = match endpoint.find("://") {
+        Some(pos) => &endpoint[pos + 3..],
+        None => endpoint,
+    };
+    let (host, port) = bare
         .rsplit_once(':')
-        .ok_or_else(|| anyhow!("PostgreSQL endpoint must be in 'host:port' form"))?;
+        .ok_or_else(|| anyhow!("PostgreSQL endpoint must be in 'host:port' form, got: '{endpoint}'"))?;
     let port = port
         .parse::<u16>()
         .with_context(|| format!("invalid PostgreSQL port in endpoint '{endpoint}'"))?;

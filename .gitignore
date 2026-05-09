@@ -7,3 +7,5 @@ dist/
 analyticsdb-catalog.managed/.DS_Store
 cluster-catalog.managed/.DS_Store
 docs/.DS_Store
+.claude/worktrees/strange-heyrovsky-2c07fa/
+*.old

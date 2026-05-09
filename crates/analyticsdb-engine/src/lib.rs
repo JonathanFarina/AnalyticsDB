@@ -29,7 +29,7 @@ use futures::stream;
 use sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub mod functions;
 pub mod postgres_compatibility;
@@ -47,6 +47,15 @@ use system_catalog::PgCatalogSchemaProvider;
 
 #[allow(dead_code)]
 const INSERT_SELECT_PARQUET_ROW_GROUP_SIZE: usize = 1_048_576;
+
+/// Returns a `SessionConfig` with `schema_force_view_types = false` so DataFusion
+/// reads Parquet string columns as `Utf8` / `Binary` rather than the newer
+/// `Utf8View` / `BinaryView` types that many Arrow Flight clients don't yet support.
+fn base_session_config() -> SessionConfig {
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.schema_force_view_types = false;
+    config
+}
 
 fn sanitize_error<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
     let e = e.into();
@@ -430,21 +439,28 @@ impl PrototypeEngine {
     ) -> Result<QueryExecutionResult> {
         let started = std::time::Instant::now();
 
-        let ctx = datafusion::prelude::SessionContext::new();
+        let ctx = DfSessionContext::new_with_config(base_session_config());
         register_postgres_functions(&ctx);
 
-        // When partition files are provided, read them directly via the Rust API.
-        // DataFusion does not expose `read_parquet([...])` as a SQL table function.
-        let df = if !req.partition_files.is_empty() {
-            ctx.read_parquet(
-                req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
-                Default::default(),
-            )
-            .await
-            .map_err(sanitize_error)?
-        } else {
-            ctx.sql(&req.sql).await.map_err(sanitize_error)?
-        };
+        // Register partition files as `__partition__` so the coordinator-
+        // supplied SQL (which references `__partition__` instead of the
+        // catalog table name) can execute with WHERE/LIMIT/projections intact.
+        // DataFusion will push predicates and the LIMIT into the Parquet scan.
+        if !req.partition_files.is_empty() {
+            let partition_df = ctx
+                .read_parquet(
+                    req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
+                    Default::default(),
+                )
+                .await
+                .map_err(sanitize_error)?;
+            // Register as a lazy view so DataFusion can push WHERE/LIMIT into
+            // the Parquet scan rather than materialising all rows first.
+            ctx.register_table("__partition__", partition_df.into_view())
+                .map_err(sanitize_error)?;
+        }
+
+        let df = ctx.sql(&req.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(df.schema().as_arrow().as_ref().clone());
         let batches = df.collect().await.map_err(sanitize_error)?;
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -473,7 +489,7 @@ impl PrototypeEngine {
     ) -> Result<distributed::ExecutePartitionWriteAck> {
         let (store, prefix) = storage::store_for_location(&req.write_prefix)?;
 
-        let ctx = datafusion::prelude::SessionContext::new();
+        let ctx = DfSessionContext::new_with_config(base_session_config());
         register_postgres_functions(&ctx);
 
         // Use the Rust API to read partition files directly — DataFusion does not
@@ -763,7 +779,7 @@ impl PrototypeEngine {
         }
 
         // Use a clean DataFusion SessionContext to filter by _row_id
-        let context = DfSessionContext::new();
+        let context = DfSessionContext::new_with_config(base_session_config());
 
         let storage_path = relation
             .storage_path
@@ -849,7 +865,7 @@ impl PrototypeEngine {
             };
 
             // Use a fresh context for internal validation to avoid catalog registration issues
-            let df_context = DfSessionContext::new();
+            let df_context = DfSessionContext::new_with_config(base_session_config());
             let new_batch_df = df_context.read_batch(batch.clone())?;
 
             let data_key = index_data_key(&table_prefix, &index.name, &snapshot.entries_object);
@@ -999,17 +1015,37 @@ impl PrototypeEngine {
         }
 
         // Partition files across available workers (round-robin).
-        let chunks = distributed::partition_files_for_workers(files, compute_nodes.len());
+        let chunks = distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
+
+        let node_list: Vec<&str> = compute_nodes.iter().map(|n| n.endpoint.as_str()).collect();
+        info!(
+            "[coordinator] Distributed SELECT on '{}': {} file(s) across {} worker(s): [{}]",
+            table_name,
+            files.len(),
+            compute_nodes.len(),
+            node_list.join(", ")
+        );
+
+        // Rewrite the original SQL so workers query `__partition__` instead of
+        // the catalog table name.  This preserves WHERE, LIMIT, projections, etc.
+        // so DataFusion can push them into the Parquet scan.  Falls back to
+        // `SELECT * FROM __partition__` if rewriting fails.
+        let worker_sql = rewrite_sql_for_partition(&request.sql, &table_name)
+            .unwrap_or_else(|| "SELECT * FROM __partition__".to_string());
 
         // Build one ExecutePartitionRequest per worker chunk.
         let worker_tasks: Vec<_> = chunks
             .into_iter()
             .zip(compute_nodes.iter())
             .map(|(chunk_files, node)| {
+                info!(
+                    "[coordinator] → {} gets {} file(s)",
+                    node.endpoint,
+                    chunk_files.len()
+                );
                 let req = distributed::ExecutePartitionRequest {
                     query_id: admission.query_id.clone(),
-                    // sql is unused when partition_files is non-empty; kept for tracing.
-                    sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
+                    sql: worker_sql.clone(),
                     session: request.session.clone(),
                     partition_files: chunk_files,
                 };
@@ -2246,7 +2282,7 @@ impl PrototypeEngine {
                 format,
                 location,
             } => {
-                let context = DfSessionContext::new();
+                let context = DfSessionContext::new_with_config(base_session_config());
                 let table_path =
                     datafusion::datasource::listing::ListingTableUrl::parse(&location)?;
                 let config = datafusion::datasource::listing::ListingTableConfig::new(table_path)
@@ -3579,7 +3615,7 @@ impl PrototypeEngine {
         _session: &SessionContext,
         relation: &analyticsdb_control::CatalogRelation,
     ) -> Result<Vec<Vec<String>>> {
-        let context = DfSessionContext::new();
+        let context = DfSessionContext::new_with_config(base_session_config());
         let storage_path = relation
             .storage_path
             .as_ref()
@@ -3625,7 +3661,7 @@ impl PrototypeEngine {
             }
         }
 
-        let config = SessionConfig::new()
+        let config = base_session_config()
             .with_default_catalog_and_schema(&session.database, &session.schema)
             .with_target_partitions(1);
 
@@ -4075,7 +4111,7 @@ impl PrototypeEngine {
         }
 
         // Use a fresh context for internal index lookups to avoid catalog registration issues
-        let df_context = DfSessionContext::new();
+        let df_context = DfSessionContext::new_with_config(base_session_config());
         let (store, table_prefix) = table_store_prefix(relation)?;
         let data_key = index_data_key(&table_prefix, &index.name, &snapshot.entries_object);
         if !storage::object_exists(&store, &data_key).await? {
@@ -4873,6 +4909,47 @@ fn parse_plain_select_table(sql: &str) -> Option<(Option<String>, Option<String>
         [db, schema, table] => Some((Some(db.clone()), Some(schema.clone()), table.clone())),
         _ => None,
     }
+}
+
+/// Rewrites `sql` so that the FROM clause referencing `source_table` (any level
+/// of qualification) is replaced with `__partition__`.  The caller registers
+/// the worker's local Parquet files as a DataFusion table named `__partition__`
+/// before executing the returned SQL, which preserves WHERE, LIMIT, projections,
+/// and other clauses so DataFusion can push them into the scan.
+///
+/// Returns `None` if the SQL cannot be parsed or the table is not found.
+fn rewrite_sql_for_partition(sql: &str, source_table: &str) -> Option<String> {
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let mut statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.get_mut(0)?;
+
+    let Statement::Query(ref mut query) = statement else {
+        return None;
+    };
+    let SetExpr::Select(ref mut select) = *query.body else {
+        return None;
+    };
+
+    let mut replaced = false;
+    for twj in &mut select.from {
+        if let TableFactor::Table { ref mut name, ref mut alias, .. } = twj.relation {
+            let last = name.0.last().and_then(|p| match p {
+                ObjectNamePart::Identifier(id) => Some(id.value.clone()),
+                _ => None,
+            });
+            if last.as_deref().map(|t| t.eq_ignore_ascii_case(source_table)).unwrap_or(false) {
+                *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("__partition__"))]);
+                // Remove any alias so the query can reference columns directly.
+                *alias = None;
+                replaced = true;
+            }
+        }
+    }
+
+    if replaced { Some(statement.to_string()) } else { None }
 }
 
 fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStatement>> {

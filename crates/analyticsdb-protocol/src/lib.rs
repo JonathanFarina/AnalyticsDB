@@ -1743,11 +1743,24 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             let req: analyticsdb_engine::ExecutePartitionRequest =
                 serde_json::from_slice(&action.body).map_err(status_from_error)?;
 
+            info!(
+                "[worker] ExecutePartition: query_id={} files={}",
+                req.query_id,
+                req.partition_files.len()
+            );
+
             let result = self
                 .engine
                 .execute_partition(&req)
                 .await
                 .map_err(status_from_error)?;
+
+            info!(
+                "[worker] ExecutePartition done: query_id={} batches={} rows={}",
+                req.query_id,
+                result.batches.len(),
+                result.batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            );
 
             let ipc_bytes = analyticsdb_engine::distributed::batches_to_ipc_bytes(
                 &result.schema,
