@@ -1754,42 +1754,48 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
 
         if action.r#type == "ExecutePartition" {
             let req: analyticsdb_engine::ExecutePartitionRequest =
-                serde_json::from_slice(&action.body).map_err(status_from_error)?;
+                bincode::deserialize(&action.body).map_err(status_from_error)?;
 
             info!(
-                "[worker] ExecutePartition: query_id={} files={}",
+                "[worker] ExecutePartition (streaming): query_id={} files={}",
                 req.query_id,
                 req.partition_files.len()
             );
 
-            let result = self
-                .engine
-                .execute_partition(&req)
-                .await
-                .map_err(status_from_error)?;
+            let engine = Arc::clone(&self.engine);
+            let response_stream = async_stream::try_stream! {
+                let mut stream = engine.execute_partition_stream(&req).await.map_err(status_from_error)?;
+                let schema = stream.schema();
+                let mut row_count = 0;
+                let mut batch_count = 0;
 
-            info!(
-                "[worker] ExecutePartition done: query_id={} batches={} rows={}",
-                req.query_id,
-                result.batches.len(),
-                result.batches.iter().map(|b| b.num_rows()).sum::<usize>()
-            );
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.map_err(status_from_error)?;
+                    row_count += batch.num_rows();
+                    batch_count += 1;
 
-            let ipc_bytes = analyticsdb_engine::distributed::batches_to_ipc_bytes(
-                &result.schema,
-                &result.batches,
-            )
-            .map_err(status_from_error)?;
+                    let ipc_bytes = analyticsdb_engine::distributed::batches_to_ipc_bytes(
+                        &schema,
+                        &[batch],
+                    ).map_err(status_from_error)?;
 
-            let response = FlightResult { body: ipc_bytes };
-            return Ok(Response::new(Box::pin(stream::once(async {
-                Ok(response)
-            }))));
+                    yield FlightResult { body: ipc_bytes };
+                }
+
+                info!(
+                    "[worker] ExecutePartition done (streaming): query_id={} batches={} rows={}",
+                    req.query_id,
+                    batch_count,
+                    row_count
+                );
+            };
+
+            return Ok(Response::new(Box::pin(response_stream)));
         }
 
         if action.r#type == "ExecutePartitionWrite" {
             let req: analyticsdb_engine::ExecutePartitionWriteRequest =
-                serde_json::from_slice(&action.body).map_err(status_from_error)?;
+                bincode::deserialize(&action.body).map_err(status_from_error)?;
 
             let ack = self
                 .engine

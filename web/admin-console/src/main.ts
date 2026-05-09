@@ -45,52 +45,53 @@ app.innerHTML = `
   <div class="console-shell">
     <aside class="product-rail" aria-label="Primary navigation">
       <div class="brand-lockup">
-        <span class="brand-mark">A</span>
+        <span class="brand-mark">ADB</span>
         <span>AnalyticsDB</span>
       </div>
       <nav class="rail-nav">
-        <a class="rail-link is-active" href="#query-heading"><span>Q</span> Query editor</a>
-        <a class="rail-link" href="#explorer-heading"><span>E</span> Explorer</a>
-        <a class="rail-link" href="#results-heading"><span>R</span> Results</a>
-        <a class="rail-link" href="#inspector-heading"><span>I</span> Inspector</a>
-        <a class="rail-link is-disabled" href="#"><span>M</span> Metrics</a>
-        <a class="rail-link is-disabled" href="#"><span>L</span> Logs</a>
+        <a class="rail-link is-active" href="#query-heading"><span>Q</span><em>Query editor</em></a>
+        <a class="rail-link" href="#explorer-heading"><span>E</span><em>Explorer</em></a>
+        <a class="rail-link" href="#results-heading"><span>R</span><em>Results</em></a>
+        <a class="rail-link" href="#inspector-heading"><span>I</span><em>Inspector</em></a>
+        <div class="rail-sep"></div>
+        <a class="rail-link is-disabled" href="#"><span>M</span><em>Metrics</em></a>
+        <a class="rail-link is-disabled" href="#"><span>L</span><em>Logs</em></a>
       </nav>
       <div class="rail-footer">
         <span class="status-dot"></span>
         <div>
-          <strong>Prototype UI</strong>
-          <small>No live web gateway yet</small>
+          <strong>Engine online</strong>
+          <small>Prototype · local client</small>
         </div>
       </div>
     </aside>
 
     <div class="app-frame">
       <header class="topbar">
-        <button class="menu-button" type="button" aria-label="Open navigation">Menu</button>
-        <div class="global-search" role="search">
-          <span>Search resources, saved queries, jobs</span>
+        <button class="menu-button" type="button" aria-label="Open navigation">⌘ Nav</button>
+        <div class="global-search" role="search" aria-label="Global search">
+          <span>Search tables, views, saved queries…</span>
           <kbd>/</kbd>
         </div>
         <div class="topbar-actions">
-          <span class="topbar-chip">PostgreSQL + Flight SQL</span>
-          <span class="avatar" aria-label="Signed in administrator">JA</span>
+          <span class="topbar-chip">PostgreSQL · Flight SQL</span>
+          <span class="avatar" aria-label="Administrator">JA</span>
         </div>
       </header>
 
-      <section class="page-header" aria-label="Query workspace summary">
+      <section class="page-header" aria-label="Workspace summary">
         <div>
-          <p class="eyebrow">BigQuery-style workbench</p>
+          <p class="eyebrow">Distributed analytics engine</p>
           <h1>SQL workspace</h1>
-          <p class="page-copy">Explore catalog metadata, compose SQL, and inspect prototype result timing without leaving the query page.</p>
+          <p class="page-copy">Query your distributed cluster, explore the catalog hierarchy, and inspect execution plans and timings across all nodes.</p>
         </div>
         <div class="metric-strip">
           <article class="metric-card">
-            <span>Selected database</span>
+            <span>Active database</span>
             <strong id="selected-database-metric">postgres</strong>
           </article>
           <article class="metric-card">
-            <span>Selected schema</span>
+            <span>Active schema</span>
             <strong id="selected-schema-metric">public</strong>
           </article>
           <article class="metric-card">
@@ -100,17 +101,17 @@ app.innerHTML = `
         </div>
       </section>
 
-      <section class="workspace-grid" aria-label="Admin console workspace">
+      <section class="workspace-grid" aria-label="Console workspace">
         <aside class="explorer-card panel" aria-labelledby="explorer-heading">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">Resources</p>
+              <p class="eyebrow">Catalog</p>
               <h2 id="explorer-heading">Explorer</h2>
             </div>
             <span class="badge">Preview</span>
           </div>
-          <label class="field-label" for="explorer-filter">Filter metadata</label>
-          <input id="explorer-filter" class="filter-input" type="search" placeholder="fact, reporting, pg_" />
+          <label class="field-label" for="explorer-filter">Filter objects</label>
+          <input id="explorer-filter" class="filter-input" type="search" placeholder="tables, views, schemas…" />
           <div id="explorer-tree" class="explorer-tree" aria-live="polite"></div>
         </aside>
 
@@ -119,11 +120,11 @@ app.innerHTML = `
             <div class="query-tabs" aria-label="Query tabs">
               <button class="query-tab is-active" type="button">Untitled query</button>
               <button class="query-tab" type="button">Scratchpad</button>
-              <button class="query-tab add-tab" type="button">+</button>
+              <button class="query-tab add-tab" type="button" aria-label="New tab">+</button>
             </div>
             <div class="panel-heading editor-heading">
               <div>
-                <p class="eyebrow">SQL workbench</p>
+                <p class="eyebrow">SQL editor</p>
                 <h2 id="query-heading">Query editor</h2>
               </div>
               <div class="session-controls">
@@ -145,12 +146,12 @@ app.innerHTML = `
               </div>
             </div>
             <div class="editor-frame">
-              <div class="line-rail" aria-hidden="true">1<br />2<br />3<br />4<br />5<br />6<br />7<br />8</div>
+              <div class="line-rail" aria-hidden="true">1<br />2<br />3<br />4<br />5<br />6<br />7<br />8<br />9<br />10</div>
               <textarea id="query-input" spellcheck="false" aria-label="SQL query editor"></textarea>
             </div>
             <div class="query-actions">
-              <button id="run-query" class="primary-action" type="button">Run query</button>
-              <button id="preview-relation" type="button">Preview selected</button>
+              <button id="run-query" class="primary-action" type="button">▶ Run query</button>
+              <button id="preview-relation" type="button">Preview</button>
               <button id="describe-relation" type="button">Describe</button>
               <button id="count-relation" type="button">Count rows</button>
             </div>
@@ -159,7 +160,7 @@ app.innerHTML = `
           <section class="result-card panel" aria-labelledby="results-heading">
             <div class="panel-heading results-heading">
               <div>
-                <p class="eyebrow">Execution</p>
+                <p class="eyebrow">Execution output</p>
                 <h2 id="results-heading">Results</h2>
               </div>
               <span id="result-state" class="badge">Idle</span>
@@ -173,7 +174,7 @@ app.innerHTML = `
         <aside class="inspector-card panel" aria-labelledby="inspector-heading">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">Details</p>
+              <p class="eyebrow">Schema details</p>
               <h2 id="inspector-heading">Inspector</h2>
             </div>
           </div>
@@ -344,7 +345,8 @@ function renderEditor(): void {
   previewButton.disabled = !state.selectedRelation;
   describeButton.disabled = !state.selectedRelation;
   countButton.disabled = !state.selectedRelation;
-  runQueryButton.textContent = state.isRunning ? "Running..." : "Run query";
+  runQueryButton.textContent = state.isRunning ? "● Running…" : "▶ Run query";
+  runQueryButton.classList.toggle("is-running", state.isRunning);
 }
 
 function renderInspector(): void {

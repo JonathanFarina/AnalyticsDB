@@ -18,6 +18,91 @@ use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
+use datafusion::datasource::MemTable;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion_physical_plan::streaming::StreamingTableExec;
+
+struct PartitionStreamImpl {
+    schema: SchemaRef,
+    stream: Arc<tokio::sync::Mutex<Option<SendableRecordBatchStream>>>,
+}
+
+impl std::fmt::Debug for PartitionStreamImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionStreamImpl")
+            .field("schema", &self.schema)
+            .field("stream", &"<stream>")
+            .finish()
+    }
+}
+
+impl PartitionStream for PartitionStreamImpl {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+    fn execute(&self, _ctx: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
+        let mut guard = self.stream.try_lock().expect("PartitionStream scanned twice");
+        guard
+            .take()
+            .expect("PartitionStream can only be executed once")
+    }
+}
+
+struct StreamingTableProvider {
+    schema: SchemaRef,
+    stream: Arc<tokio::sync::Mutex<Option<SendableRecordBatchStream>>>,
+}
+
+impl std::fmt::Debug for StreamingTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingTableProvider")
+            .field("schema", &self.schema)
+            .field("stream", &"<stream>")
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for StreamingTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+    async fn scan(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let schema = if let Some(p) = projection {
+            Arc::new(self.schema.project(p)?)
+        } else {
+            Arc::clone(&self.schema)
+        };
+
+        let stream = PartitionStreamImpl {
+            schema: Arc::clone(&self.schema),
+            stream: Arc::clone(&self.stream),
+        };
+
+        Ok(Arc::new(StreamingTableExec::try_new(
+            schema,
+            vec![Arc::new(stream) as Arc<dyn PartitionStream>],
+            projection,
+            None,
+            true, // is_infinite
+            limit,
+        )?))
+    }
+}
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{
@@ -27,8 +112,11 @@ use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::SendableRecordBatchStream;
-use futures::stream;
-use sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use futures::{stream, StreamExt};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem,
+    SetExpr, Statement, TableFactor,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tracing::{info, warn};
@@ -61,6 +149,7 @@ fn base_session_config() -> SessionConfig {
         .execution
         .parquet
         .schema_force_view_types = false;
+    config.options_mut().execution.target_partitions = num_cpus::get();
     config
 }
 
@@ -91,10 +180,57 @@ fn session_context_cache_key(session: &SessionContext) -> String {
     .join("\u{1f}")
 }
 
+use dashmap::DashMap;
+
+pub struct FileListCache {
+    cache: DashMap<String, (u64, Vec<(String, u64)>)>, // table_key -> (epoch, files)
+    epochs: DashMap<String, u64>,                      // table_key -> current_epoch
+}
+
+impl FileListCache {
+    pub fn new() -> Self {
+        Self {
+            cache: DashMap::new(),
+            epochs: DashMap::new(),
+        }
+    }
+
+    pub async fn get_or_list(
+        &self,
+        table_key: &str,
+        store: &Arc<dyn ObjectStore>,
+        prefix: &object_store::path::Path,
+    ) -> Result<Vec<(String, u64)>> {
+        let current_epoch = self.epochs.get(table_key).map(|r| *r.value()).unwrap_or(0);
+        if let Some(entry) = self.cache.get(table_key) {
+            let (cached_epoch, files) = entry.value();
+            if *cached_epoch == current_epoch {
+                return Ok(files.clone());
+            }
+        }
+
+        let files = storage::list_parquet_files_with_sizes(store, prefix).await?;
+        self.cache
+            .insert(table_key.to_string(), (current_epoch, files.clone()));
+        Ok(files)
+    }
+
+    pub fn invalidate(&self, table_key: &str) {
+        let new_epoch = self
+            .epochs
+            .get(table_key)
+            .map(|r| *r.value() + 1)
+            .unwrap_or(1);
+        self.epochs.insert(table_key.to_string(), new_epoch);
+    }
+}
+
 pub struct PrototypeEngine {
     control_plane: Arc<ControlPlane>,
     session_context_cache: Arc<tokio::sync::RwLock<HashMap<String, DfSessionContext>>>,
     relation_locks: Arc<tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    partition_client: Arc<PartitionClient>,
+    file_list_cache: Arc<FileListCache>,
 }
 
 impl std::fmt::Debug for PrototypeEngine {
@@ -102,6 +238,8 @@ impl std::fmt::Debug for PrototypeEngine {
         f.debug_struct("PrototypeEngine")
             .field("control_plane", &self.control_plane)
             .field("session_context_cache", &"<cached session contexts>")
+            .field("partition_client", &"<partition client>")
+            .field("file_list_cache", &"<file list cache>")
             .finish()
     }
 }
@@ -112,6 +250,8 @@ impl Clone for PrototypeEngine {
             control_plane: Arc::clone(&self.control_plane),
             session_context_cache: Arc::clone(&self.session_context_cache),
             relation_locks: Arc::clone(&self.relation_locks),
+            partition_client: Arc::clone(&self.partition_client),
+            file_list_cache: Arc::clone(&self.file_list_cache),
         }
     }
 }
@@ -415,18 +555,30 @@ fn projected_metadata_schema(sql: &str, base_schema: &SchemaRef) -> Result<Schem
 
 impl PrototypeEngine {
     pub fn new() -> Result<Self> {
+        let control_plane = Arc::new(ControlPlane::new_bootstrap());
+        let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
+        partition_client.set_compute_eligible(true);
+        let partition_client = Arc::new(partition_client);
         Ok(Self {
-            control_plane: Arc::new(ControlPlane::new_bootstrap()),
+            control_plane,
             session_context_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             relation_locks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            partition_client,
+            file_list_cache: Arc::new(FileListCache::new()),
         })
     }
 
     pub async fn from_catalog_path(catalog_path: &str) -> Result<Self> {
+        let control_plane = Arc::new(ControlPlane::from_catalog_path(catalog_path).await?);
+        let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
+        partition_client.set_compute_eligible(true);
+        let partition_client = Arc::new(partition_client);
         Ok(Self {
-            control_plane: Arc::new(ControlPlane::from_catalog_path(catalog_path).await?),
+            control_plane,
             session_context_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             relation_locks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            partition_client,
+            file_list_cache: Arc::new(FileListCache::new()),
         })
     }
 
@@ -434,25 +586,14 @@ impl PrototypeEngine {
         Arc::clone(&self.control_plane)
     }
 
-    /// Executes an `ExecutePartitionRequest` on behalf of a Coordinator.
-    ///
-    /// The worker runs `req.sql` in a fresh DataFusion session, bypassing
-    /// admission control (the Coordinator has already admitted the query).
-    /// The SQL must be fully self-contained — if it references specific Parquet
-    /// files it should use DataFusion's `read_parquet([…])` function directly.
-    pub async fn execute_partition(
+    /// Executes an `ExecutePartitionRequest` and returns a stream of `RecordBatch`es.
+    pub async fn execute_partition_stream(
         &self,
         req: &distributed::ExecutePartitionRequest,
-    ) -> Result<QueryExecutionResult> {
-        let started = std::time::Instant::now();
-
+    ) -> Result<SendableRecordBatchStream> {
         let ctx = DfSessionContext::new_with_config(base_session_config());
         register_postgres_functions(&ctx);
 
-        // Register partition files as `__partition__` so the coordinator-
-        // supplied SQL (which references `__partition__` instead of the
-        // catalog table name) can execute with WHERE/LIMIT/projections intact.
-        // DataFusion will push predicates and the LIMIT into the Parquet scan.
         if !req.partition_files.is_empty() {
             let paths = req
                 .partition_files
@@ -473,15 +614,30 @@ impl PrototypeEngine {
                 .await
                 .map_err(sanitize_error)?
             };
-            // Register as a lazy view so DataFusion can push WHERE/LIMIT into
-            // the Parquet scan rather than materialising all rows first.
             ctx.register_table("__partition__", partition_df.into_view())
                 .map_err(sanitize_error)?;
         }
 
         let df = ctx.sql(&req.sql).await.map_err(sanitize_error)?;
-        let schema = Arc::new(df.schema().as_arrow().as_ref().clone());
-        let batches = df.collect().await.map_err(sanitize_error)?;
+        df.execute_stream().await.map_err(sanitize_error)
+    }
+
+    /// Executes an `ExecutePartitionRequest` on behalf of a Coordinator.
+    ///
+    /// The worker runs `req.sql` in a fresh DataFusion session, bypassing
+    /// admission control (the Coordinator has already admitted the query).
+    /// The SQL must be fully self-contained — if it references specific Parquet
+    /// files it should use DataFusion's `read_parquet([…])` function directly.
+    pub async fn execute_partition(
+        &self,
+        req: &distributed::ExecutePartitionRequest,
+    ) -> Result<QueryExecutionResult> {
+        let started = std::time::Instant::now();
+        let stream = self.execute_partition_stream(req).await?;
+        let schema = stream.schema();
+        let batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .map_err(sanitize_error)?;
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         Ok(QueryExecutionResult {
@@ -537,16 +693,36 @@ impl PrototypeEngine {
         let mut written_files = Vec::new();
         let mut total_rows = 0usize;
 
+        let mut current_batch = Vec::new();
+        let mut current_rows = 0;
+
         for batch in batches {
             let (row_count, prepared) = prepare_batch_for_storage(batch)?;
             if row_count == 0 {
                 continue;
             }
+
+            current_batch.push(prepared);
+            current_rows += row_count;
+            total_rows += row_count;
+
+            if current_rows >= INSERT_SELECT_PARQUET_ROW_GROUP_SIZE {
+                let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+                let key = prefix.clone().join(file_name.as_str());
+                let schema = current_batch[0].schema();
+                storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
+                written_files.push(format!("/{}", key.as_ref()));
+                current_batch.clear();
+                current_rows = 0;
+            }
+        }
+
+        if !current_batch.is_empty() {
             let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
             let key = prefix.clone().join(file_name.as_str());
-            storage::write_parquet_batches(&store, &key, prepared.schema(), &[prepared]).await?;
+            let schema = current_batch[0].schema();
+            storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
             written_files.push(format!("/{}", key.as_ref()));
-            total_rows += row_count;
         }
 
         Ok(distributed::ExecutePartitionWriteAck {
@@ -729,15 +905,24 @@ impl PrototypeEngine {
             return;
         }
 
-        if let Err(rebuild_error) = self.rebuild_all_index_snapshots(session, relation).await {
-            warn!(
-                database = %relation.database,
-                schema = %relation.schema,
-                table = %relation.name,
-                error = %rebuild_error,
-                "failed to rebuild managed-table index sidecars after mutation; previous published snapshot remains active"
-            );
-        }
+        let engine = self.clone();
+        let session = session.clone();
+        let relation = relation.clone();
+
+        tokio::spawn(async move {
+            if let Err(rebuild_error) = engine
+                .rebuild_all_index_snapshots(&session, &relation)
+                .await
+            {
+                warn!(
+                    database = %relation.database,
+                    schema = %relation.schema,
+                    table = %relation.name,
+                    error = %rebuild_error,
+                    "failed to rebuild managed-table index sidecars in background; previous published snapshot remains active"
+                );
+            }
+        });
     }
 
     fn validate_unique_indexes_for_rows(
@@ -980,21 +1165,13 @@ impl PrototypeEngine {
             .await
     }
 
-    /// Attempts to execute `request.sql` as a distributed scatter-gather query.
-    ///
-    /// Returns `None` when:
-    /// - the SQL is not a plain `SELECT … FROM <table>` targeting a managed table, or
-    /// - there are no Ready Compute nodes available (falls through to local execution).
-    ///
-    /// When Compute nodes are available the query is rewritten to use
-    /// `read_parquet([…])` syntax so workers don't need catalog access, then
-    /// dispatched concurrently.  RecordBatches from all workers are concatenated.
-    async fn try_execute_distributed_select(
+    /// Attempts to execute `request.sql` as a distributed scatter-gather query stream.
+    async fn try_execute_distributed_select_stream(
         &self,
         request: &QueryRequest,
         admission: &QueryAdmission,
         started: Instant,
-    ) -> Result<Option<QueryExecutionResult>> {
+    ) -> Result<Option<QueryExecutionStream>> {
         // Only attempt distribution for plain SELECT statements.
         let Some((db, schema_name, table_name)) = parse_plain_select_table(&request.sql) else {
             return Ok(None);
@@ -1019,108 +1196,354 @@ impl PrototypeEngine {
             return Ok(None);
         };
 
-        // Discover available Compute nodes.
-        let partition_client = distributed::PartitionClient::new(Arc::clone(&self.control_plane));
-        let compute_nodes = partition_client.list_compute_nodes().await?;
-        if compute_nodes.is_empty() {
+        // Enumerate the Parquet files backing the table.
+        let (store, prefix) = storage::store_for_location(storage_location)?;
+        let table_key = format!(
+            "{}.{}.{}",
+            relation.database, relation.schema, relation.name
+        );
+        let files = self
+            .file_list_cache
+            .get_or_list(&table_key, &store, &prefix)
+            .await?;
+
+        let aggregate_plan = distributed_aggregate_plan(&request.sql, &table_name);
+        if aggregate_plan.is_none() && select_projection_contains_function(&request.sql) {
             return Ok(None);
         }
 
-        // Enumerate the Parquet files backing the table.
-        let (store, prefix) = storage::store_for_location(storage_location)?;
-        let files = storage::list_parquet_files(&store, &prefix).await?;
-        if files.is_empty() {
-            // Table is empty — return zero rows without hitting workers.
-            let schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
-            return Ok(Some(QueryExecutionResult {
-                query_id: admission.query_id.clone(),
-                coordinator_node_id: admission.coordinator_node_id.clone(),
-                session: request.session.clone(),
-                schema,
-                batches: vec![],
-                message: "Distributed query: 0 row(s) returned (empty table).".to_string(),
-                outcome: StatementOutcome::Rows,
-                execution_time_ms: started.elapsed().as_millis(),
-            }));
+        // Calculate optimal worker count based on data size and file count.
+        let total_size: u64 = files.iter().map(|(_, size)| *size).sum();
+        let file_count = files.len();
+        let partition_client = Arc::clone(&self.partition_client);
+
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 3;
+
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
+
+            // Discover available Compute nodes.
+            let mut compute_nodes = partition_client.list_compute_nodes().await?;
+            if compute_nodes.is_empty() {
+                warn!("[coordinator] No compute nodes available for distributed query; falling back to local execution.");
+                return Ok(None);
+            }
+
+            let optimal_worker_count = distributed::calculate_optimal_worker_count(
+                total_size,
+                file_count,
+                compute_nodes.len(),
+            );
+
+            // If heuristic says 1 node and it's just the coordinator, might as well run locally
+            // unless we want to use the partition executor anyway. For now, if N=1 and we have
+            // workers, we'll still pick one worker to keep the distributed path exercised.
+            
+            // Select a subset of nodes (round-robin selection could be added here, 
+            // but for now we just take the first N).
+            compute_nodes.truncate(optimal_worker_count);
+
+            if files.is_empty() {
+                let schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
+                return self
+                    .execute_coordinator_select_over_partition_batches(
+                        request,
+                        admission,
+                        started,
+                        &table_name,
+                        schema,
+                        Vec::new(),
+                        compute_nodes.len(),
+                        None,
+                    )
+                    .await
+                    .map(Some);
+            }
+
+            // Partition files across available workers (greedy size-aware).
+            let chunks = distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
+
+            let node_list: Vec<&str> = compute_nodes
+                .iter()
+                .map(distributed::PartitionClient::node_channel_endpoint)
+                .collect();
+            info!(
+                "[coordinator] Distributed SELECT on '{}' (attempt {}): {} file(s) across {} worker(s) [{} of {} available]: [{}]",
+                table_name,
+                attempts,
+                files.len(),
+                compute_nodes.len(),
+                optimal_worker_count,
+                partition_client.list_compute_nodes().await?.len(),
+                node_list.join(", ")
+            );
+
+            let worker_sql = aggregate_plan
+                .as_ref()
+                .map(|(worker_sql, _)| worker_sql.clone())
+                .unwrap_or_else(|| "SELECT * FROM __partition__".to_string());
+
+            // Build tasks.
+            let worker_tasks: Vec<_> = chunks
+                .into_iter()
+                .zip(compute_nodes.iter())
+                .map(|(chunk_files, node)| {
+                    let req = distributed::ExecutePartitionRequest {
+                        query_id: admission.query_id.clone(),
+                        sql: worker_sql.clone(),
+                        session: request.session.clone(),
+                        partition_files: chunk_files,
+                        source_columns: relation.columns.clone(),
+                    };
+                    (node, req)
+                })
+                .collect();
+
+            // Dispatch all concurrently.
+            let mut dispatch_futures = Vec::new();
+            for (node, req) in &worker_tasks {
+                let endpoint = distributed::PartitionClient::node_channel_endpoint(node).to_string();
+                let pc = Arc::clone(&partition_client);
+                let node_id = node.id.clone();
+                dispatch_futures.push(async move {
+                    match pc.execute_on_node(&endpoint, &req).await {
+                        Ok(stream) => Ok((node_id, stream)),
+                        Err(e) => Err((node_id, e)),
+                    }
+                });
+            }
+
+            let dispatch_results = futures::future::join_all(dispatch_futures).await;
+            let mut worker_streams = Vec::new();
+            let mut failed_node_id = None;
+
+            for res in dispatch_results {
+                match res {
+                    Ok((node_id, stream)) => {
+                        // Wrap stream to catch mid-flight failures and identify the node.
+                        let node_id_inner = node_id.clone();
+                        worker_streams.push(stream.map(move |batch_res| {
+                            batch_res.map_err(|e| (node_id_inner.clone(), e))
+                        }));
+                    }
+                    Err((node_id, e)) => {
+                        warn!("[coordinator] Failed to dispatch to node '{}': {}", node_id, e);
+                        failed_node_id = Some(node_id);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(node_id) = failed_node_id {
+                info!("[coordinator] Marking node '{}' as unavailable and retrying query...", node_id);
+                let _ = partition_client.mark_node_unavailable(&node_id).await;
+                continue;
+            }
+
+            // Merge all worker streams into one concurrent stream.
+            let mut merged_stream = futures::stream::select_all(worker_streams);
+            let base_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
+
+            if aggregate_plan.is_some() {
+                // For aggregates, we must materialize the (small) partial results to finalize.
+                let mut all_batches = Vec::new();
+                let mut stream_failed_node_id = None;
+
+                while let Some(batch_res) = merged_stream.next().await {
+                    match batch_res {
+                        Ok(batch) => all_batches.push(batch),
+                        Err((node_id, e)) => {
+                            warn!("[coordinator] Node '{}' failed during streaming: {}", node_id, e);
+                            stream_failed_node_id = Some(node_id);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(node_id) = stream_failed_node_id {
+                    info!("[coordinator] Marking node '{}' as unavailable and retrying query...", node_id);
+                    let _ = partition_client.mark_node_unavailable(&node_id).await;
+                    continue;
+                }
+
+                // Success!
+                let schema = all_batches
+                    .first()
+                    .map(|batch| batch.schema())
+                    .unwrap_or(Arc::clone(&base_schema));
+
+                return self.execute_coordinator_select_over_partition_batches(
+                    request,
+                    admission,
+                    started,
+                    &table_name,
+                    schema,
+                    all_batches,
+                    compute_nodes.len(),
+                    aggregate_plan.map(|(_, final_sql)| final_sql),
+                )
+                .await
+                .map(Some);
+            } else {
+                // For plain SELECTs (large results), use the TRUE STREAMING path.
+                let df_stream = merged_stream.map(|res| match res {
+                    Ok(batch) => Ok(batch),
+                    Err((node_id, e)) => {
+                        Err(DataFusionError::Execution(format!("Node {node_id} failed: {e}")))
+                    }
+                });
+
+                let partition_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&base_schema),
+                    df_stream,
+                ));
+
+                return self.execute_coordinator_select_over_partition_stream(
+                    request,
+                    admission,
+                    started,
+                    &table_name,
+                    base_schema,
+                    partition_stream,
+                    compute_nodes.len(),
+                    None,
+                )
+                .await
+                .map(Some);
+            }
         }
 
-        // Partition files across available workers (round-robin).
-        let chunks = distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
+        warn!("[coordinator] Distributed query failed after {} attempts; falling back to local execution.", MAX_ATTEMPTS);
+        Ok(None)
+    }
 
-        let node_list: Vec<&str> = compute_nodes
-            .iter()
-            .map(distributed::PartitionClient::node_channel_endpoint)
-            .collect();
-        info!(
-            "[coordinator] Distributed SELECT on '{}': {} file(s) across {} worker(s): [{}]",
-            table_name,
-            files.len(),
-            compute_nodes.len(),
-            node_list.join(", ")
-        );
+    async fn execute_coordinator_select_over_partition_stream(
+        &self,
+        request: &QueryRequest,
+        admission: &QueryAdmission,
+        started: Instant,
+        table_name: &str,
+        partition_schema: SchemaRef,
+        partition_stream: SendableRecordBatchStream,
+        worker_count: usize,
+        final_sql_override: Option<String>,
+    ) -> Result<QueryExecutionStream> {
+        let final_sql = final_sql_override.unwrap_or_else(|| {
+            rewrite_sql_for_partition(&request.sql, table_name)
+                .unwrap_or_else(|| "SELECT * FROM __partition__".to_string())
+        });
+        let context = DfSessionContext::new_with_config(base_session_config());
+        register_postgres_functions(&context);
 
-        // Rewrite the original SQL so workers query `__partition__` instead of
-        // the catalog table name.  This preserves WHERE, LIMIT, projections, etc.
-        // so DataFusion can push them into the Parquet scan.  Falls back to
-        // `SELECT * FROM __partition__` if rewriting fails.
-        let worker_sql = rewrite_sql_for_partition(&request.sql, &table_name)
-            .unwrap_or_else(|| "SELECT * FROM __partition__".to_string());
-
-        // Build one ExecutePartitionRequest per worker chunk.
-        let worker_tasks: Vec<_> = chunks
-            .into_iter()
-            .zip(compute_nodes.iter())
-            .map(|(chunk_files, node)| {
-                info!(
-                    "[coordinator] → {} gets {} file(s)",
-                    distributed::PartitionClient::node_channel_endpoint(node),
-                    chunk_files.len()
-                );
-                let req = distributed::ExecutePartitionRequest {
-                    query_id: admission.query_id.clone(),
-                    sql: worker_sql.clone(),
-                    session: request.session.clone(),
-                    partition_files: chunk_files,
-                    source_columns: relation.columns.clone(),
-                };
-                let endpoint =
-                    distributed::PartitionClient::node_channel_endpoint(node).to_string();
-                (endpoint, req)
-            })
-            .collect();
-
-        // Dispatch concurrently.
-        let dispatch_futures: Vec<_> = worker_tasks
-            .iter()
-            .map(|(endpoint, req)| partition_client.execute_on_node(endpoint, req))
-            .collect();
-
-        let results = futures::future::join_all(dispatch_futures).await;
-
-        // Collect and merge all RecordBatches.
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for result in results {
-            all_batches.extend(result?);
-        }
-
-        let schema: SchemaRef = if let Some(first) = all_batches.first() {
-            first.schema()
-        } else {
-            build_arrow_schema_from_catalog_columns(&relation.columns)?
+        let table = StreamingTableProvider {
+            schema: Arc::clone(&partition_schema),
+            stream: Arc::new(tokio::sync::Mutex::new(Some(partition_stream))),
         };
+        context.register_table("__partition__", Arc::new(table))?;
 
-        let row_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
-        Ok(Some(QueryExecutionResult {
+        let dataframe = context.sql(&final_sql).await.map_err(sanitize_error)?;
+        let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
+        let stream = dataframe.execute_stream().await.map_err(sanitize_error)?;
+
+        Ok(QueryExecutionStream {
             query_id: admission.query_id.clone(),
             coordinator_node_id: admission.coordinator_node_id.clone(),
             session: request.session.clone(),
             schema,
-            batches: all_batches,
+            stream,
             message: format!(
-                "Distributed query: {row_count} row(s) returned from {} node(s).",
-                compute_nodes.len()
+                "Distributed query: coordinator streaming result from {worker_count} node(s)."
             ),
             outcome: StatementOutcome::Rows,
+            execution_time_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    async fn execute_coordinator_select_over_partition_batches(
+        &self,
+        request: &QueryRequest,
+        admission: &QueryAdmission,
+        started: Instant,
+        table_name: &str,
+        partition_schema: SchemaRef,
+        partition_batches: Vec<RecordBatch>,
+        worker_count: usize,
+        final_sql_override: Option<String>,
+    ) -> Result<QueryExecutionStream> {
+        let final_sql = final_sql_override.unwrap_or_else(|| {
+            rewrite_sql_for_partition(&request.sql, table_name)
+                .unwrap_or_else(|| "SELECT * FROM __partition__".to_string())
+        });
+        let context = DfSessionContext::new_with_config(base_session_config());
+        register_postgres_functions(&context);
+        let partitions = if partition_batches.is_empty() {
+            vec![vec![RecordBatch::new_empty(Arc::clone(&partition_schema))]]
+        } else {
+            vec![partition_batches]
+        };
+        let table = MemTable::try_new(Arc::clone(&partition_schema), partitions)?;
+        context.register_table("__partition__", Arc::new(table))?;
+
+        let dataframe = context.sql(&final_sql).await.map_err(sanitize_error)?;
+        let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
+        let stream = dataframe.execute_stream().await.map_err(sanitize_error)?;
+
+        Ok(QueryExecutionStream {
+            query_id: admission.query_id.clone(),
+            coordinator_node_id: admission.coordinator_node_id.clone(),
+            session: request.session.clone(),
+            schema,
+            stream,
+            message: format!(
+                "Distributed query: coordinator finalized result from {worker_count} node(s)."
+            ),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    /// Attempts to execute `request.sql` as a distributed scatter-gather query.
+    ///
+    /// Returns `None` when:
+    /// - the SQL is not a plain `SELECT … FROM <table>` targeting a managed table, or
+    /// - there are no Ready Compute nodes available (falls through to local execution).
+    ///
+    /// When Compute nodes are available the query is rewritten to use
+    /// `read_parquet([…])` syntax so workers don't need catalog access, then
+    /// dispatched concurrently.  RecordBatches from all workers are concatenated.
+    async fn try_execute_distributed_select(
+        &self,
+        request: &QueryRequest,
+        admission: &QueryAdmission,
+        started: Instant,
+    ) -> Result<Option<QueryExecutionResult>> {
+        let Some(exec_stream) = self
+            .try_execute_distributed_select_stream(request, admission, started)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let schema = exec_stream.schema;
+        let batches = datafusion::physical_plan::common::collect(exec_stream.stream)
+            .await
+            .map_err(sanitize_error)?;
+
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        Ok(Some(QueryExecutionResult {
+            query_id: exec_stream.query_id,
+            coordinator_node_id: exec_stream.coordinator_node_id,
+            session: exec_stream.session,
+            schema,
+            batches,
+            message: format!(
+                "Distributed query: {row_count} row(s) returned from {} nodes.",
+                // We don't have the node count easily here without re-calculating,
+                // but we can just use the message from exec_stream or a generic one.
+                "multiple"
+            ),
+            outcome: exec_stream.outcome,
             execution_time_ms: started.elapsed().as_millis(),
         }))
     }
@@ -1178,13 +1601,6 @@ impl PrototypeEngine {
             return Ok(None);
         };
 
-        // Discover Ready Compute nodes.
-        let partition_client = distributed::PartitionClient::new(Arc::clone(&self.control_plane));
-        let compute_nodes = partition_client.list_compute_nodes().await?;
-        if compute_nodes.is_empty() {
-            return Ok(None);
-        }
-
         // Resolve the source relation and its Parquet files.
         let source_relation = match self
             .control_plane
@@ -1205,7 +1621,15 @@ impl PrototypeEngine {
         };
 
         let (src_store, src_prefix) = storage::store_for_location(source_storage)?;
-        let source_files = storage::list_parquet_files(&src_store, &src_prefix).await?;
+        let src_key = format!(
+            "{}.{}.{}",
+            source_relation.database, source_relation.schema, source_relation.name
+        );
+        let source_files = self
+            .file_list_cache
+            .get_or_list(&src_key, &src_store, &src_prefix)
+            .await?;
+
         if source_files.is_empty() {
             // Nothing to insert.
             return Ok(Some(QueryExecutionResult {
@@ -1226,71 +1650,127 @@ impl PrototypeEngine {
             }));
         }
 
-        // Partition source files across workers.
-        let chunks = distributed::partition_files_for_workers(source_files, compute_nodes.len());
+        let total_size: u64 = source_files.iter().map(|(_, size)| *size).sum();
+        let file_count = source_files.len();
+        let partition_client = Arc::clone(&self.partition_client);
 
-        // Acquire the write lock on the target relation.
-        let relation_lock = self.relation_lock(&target_relation).await;
-        let _write_guard = relation_lock.write().await;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 3;
 
-        // Build one ExecutePartitionWriteRequest per worker chunk.
-        let worker_tasks: Vec<_> = chunks
-            .into_iter()
-            .zip(compute_nodes.iter())
-            .map(|(chunk_files, node)| {
-                let req = distributed::ExecutePartitionWriteRequest {
-                    query_id: admission.query_id.clone(),
-                    // sql is unused when partition_files is non-empty; kept for tracing.
-                    sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
-                    session: request.session.clone(),
-                    partition_files: chunk_files,
-                    source_columns: source_relation.columns.clone(),
-                    write_prefix: target_storage.to_string(),
-                };
-                (
-                    distributed::PartitionClient::node_channel_endpoint(node).to_string(),
-                    req,
-                )
-            })
-            .collect();
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
 
-        // Dispatch all workers concurrently.
-        let dispatch_futures: Vec<_> = worker_tasks
-            .iter()
-            .map(|(endpoint, req)| partition_client.write_on_node(endpoint, req))
-            .collect();
+            // Discover Ready Compute nodes.
+            let mut compute_nodes = partition_client.list_compute_nodes().await?;
+            if compute_nodes.is_empty() {
+                warn!("[coordinator] No compute nodes available for distributed insert; falling back to local execution.");
+                return Ok(None);
+            }
 
-        let results = futures::future::join_all(dispatch_futures).await;
+            let optimal_worker_count = distributed::calculate_optimal_worker_count(
+                total_size,
+                file_count,
+                compute_nodes.len(),
+            );
+            compute_nodes.truncate(optimal_worker_count);
 
-        let mut total_rows = 0usize;
-        for result in results {
-            let ack = result?;
-            total_rows += ack.row_count;
+            // Partition source files across workers (greedy size-aware).
+            let chunks = distributed::partition_files_for_workers(source_files.clone(), compute_nodes.len());
+
+            // Acquire the write lock on the target relation.
+            let relation_lock = self.relation_lock(&target_relation).await;
+            let _write_guard = relation_lock.write().await;
+
+            // Build one ExecutePartitionWriteRequest per worker chunk.
+            let worker_tasks: Vec<_> = chunks
+                .into_iter()
+                .zip(compute_nodes.iter())
+                .map(|(chunk_files, node)| {
+                    let req = distributed::ExecutePartitionWriteRequest {
+                        query_id: admission.query_id.clone(),
+                        // sql is unused when partition_files is non-empty; kept for tracing.
+                        sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
+                        session: request.session.clone(),
+                        partition_files: chunk_files,
+                        source_columns: source_relation.columns.clone(),
+                        write_prefix: target_storage.to_string(),
+                    };
+                    (node, req)
+                })
+                .collect();
+
+            // Dispatch all concurrently.
+            let mut dispatch_futures = Vec::new();
+            for (node, req) in &worker_tasks {
+                let endpoint = distributed::PartitionClient::node_channel_endpoint(node).to_string();
+                let pc = Arc::clone(&partition_client);
+                let node_id = node.id.clone();
+                dispatch_futures.push(async move {
+                    match pc.write_on_node(&endpoint, &req).await {
+                        Ok(ack) => Ok((node_id, ack)),
+                        Err(e) => Err((node_id, e)),
+                    }
+                });
+            }
+
+            let dispatch_results = futures::future::join_all(dispatch_futures).await;
+            let mut all_acks = Vec::new();
+            let mut failed_node_id = None;
+
+            for res in dispatch_results {
+                match res {
+                    Ok((_, ack)) => all_acks.push(ack),
+                    Err((node_id, e)) => {
+                        warn!("[coordinator] Node '{}' failed during distributed write: {}", node_id, e);
+                        failed_node_id = Some(node_id);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(node_id) = failed_node_id {
+                info!("[coordinator] Marking node '{}' as unavailable and retrying distributed insert...", node_id);
+                let _ = partition_client.mark_node_unavailable(&node_id).await;
+                continue;
+            }
+
+            // Success!
+            let total_rows: usize = all_acks.iter().map(|a| a.row_count).sum();
+
+            // Commit: refresh index sidecars now that new Parquet files are visible.
+            self.refresh_index_snapshots_after_mutation(&request.session, &target_relation)
+                .await;
+
+            let table_key = format!(
+                "{}.{}.{}",
+                target_relation.database, target_relation.schema, target_relation.name
+            );
+            self.file_list_cache.invalidate(&table_key);
+
+            return Ok(Some(QueryExecutionResult {
+                query_id: admission.query_id.clone(),
+                coordinator_node_id: admission.coordinator_node_id.clone(),
+                session: request.session.clone(),
+                schema: Arc::new(Schema::empty()),
+                batches: vec![],
+                message: format!(
+                    "Distributed insert: {total_rows} row(s) inserted into '{}.{}.{}' via {} node(s) (attempt {}).",
+                    target_relation.database,
+                    target_relation.schema,
+                    target_relation.name,
+                    compute_nodes.len(),
+                    attempts,
+                ),
+                outcome: StatementOutcome::Command {
+                    tag: "INSERT".to_string(),
+                    rows_affected: total_rows as u64,
+                },
+                execution_time_ms: started.elapsed().as_millis(),
+            }));
         }
 
-        // Commit: refresh index sidecars now that new Parquet files are visible.
-        self.refresh_index_snapshots_after_mutation(&request.session, &target_relation)
-            .await;
-
-        Ok(Some(QueryExecutionResult {
-            query_id: admission.query_id.clone(),
-            coordinator_node_id: admission.coordinator_node_id.clone(),
-            session: request.session.clone(),
-            schema: Arc::new(Schema::empty()),
-            batches: vec![],
-            message: format!(
-                "Distributed insert: {total_rows} row(s) inserted into '{}.{}.{}' via {} node(s).",
-                target_relation.database,
-                target_relation.schema,
-                target_relation.name,
-                compute_nodes.len(),
-            ),
-            outcome: StatementOutcome::Command {
-                tag: "INSERT".to_string(),
-                rows_affected: total_rows as u64,
-            },
-            execution_time_ms: started.elapsed().as_millis(),
-        }))
+        warn!("[coordinator] Distributed insert failed after {} attempts; falling back to local execution.", MAX_ATTEMPTS);
+        Ok(None)
     }
 
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
@@ -1447,27 +1927,11 @@ impl PrototypeEngine {
             });
         }
 
-        if let Some(execution) = self
-            .try_execute_distributed_select(request, &admission, started)
+        if let Some(result) = self
+            .try_execute_distributed_select_stream(request, &admission, started)
             .await?
         {
-            let schema = Arc::clone(&execution.schema);
-            let batches = if execution.batches.is_empty() {
-                vec![RecordBatch::new_empty(Arc::clone(&schema))]
-            } else {
-                execution.batches
-            };
-            let batch_stream = stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>));
-            return Ok(QueryExecutionStream {
-                query_id: execution.query_id,
-                coordinator_node_id: execution.coordinator_node_id,
-                session: execution.session,
-                schema: Arc::clone(&schema),
-                stream: Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
-                message: execution.message,
-                outcome: StatementOutcome::Rows,
-                execution_time_ms: execution.execution_time_ms,
-            });
+            return Ok(result);
         }
 
         let control_plane = Arc::clone(&self.control_plane);
@@ -1653,11 +2117,17 @@ impl PrototypeEngine {
             .await
             .map_err(sanitize_error)?;
         let mut inserted_row_count = 0;
+        let mut current_batch = Vec::new();
+        let mut current_rows = 0;
 
         use futures::StreamExt;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(sanitize_error)?;
             let (batch_row_count, prepared_batch) = prepare_batch_for_storage(batch)?;
+
+            if batch_row_count == 0 {
+                continue;
+            }
 
             if !relation.indexes.is_empty() {
                 self.validate_batch_against_table_uniqueness(
@@ -1668,12 +2138,37 @@ impl PrototypeEngine {
                 .await?;
             }
 
-            storage::append_parquet_batch(&store, &prefix, prepared_batch).await?;
+            current_batch.push(prepared_batch);
+            current_rows += batch_row_count;
             inserted_row_count += batch_row_count;
+
+            if current_rows >= INSERT_SELECT_PARQUET_ROW_GROUP_SIZE {
+                let schema = current_batch[0].schema();
+                let key = prefix
+                    .clone()
+                    .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
+                storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
+                current_batch.clear();
+                current_rows = 0;
+            }
+        }
+
+        if !current_batch.is_empty() {
+            let schema = current_batch[0].schema();
+            let key = prefix
+                .clone()
+                .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
+            storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
         }
 
         self.refresh_index_snapshots_after_mutation(&request.session, &relation)
             .await;
+
+        let table_key = format!(
+            "{}.{}.{}",
+            relation.database, relation.schema, relation.name
+        );
+        self.file_list_cache.invalidate(&table_key);
 
         Ok(QueryExecutionResult {
             query_id: admission.query_id,
@@ -3714,8 +4209,7 @@ impl PrototypeEngine {
         }
 
         let config = base_session_config()
-            .with_default_catalog_and_schema(&session.database, &session.schema)
-            .with_target_partitions(1);
+            .with_default_catalog_and_schema(&session.database, &session.schema);
 
         let ctx = DfSessionContext::new_with_config(config);
 
@@ -5152,6 +5646,182 @@ fn rewrite_sql_for_partition(sql: &str, source_table: &str) -> Option<String> {
     }
 }
 
+fn distributed_aggregate_plan(sql: &str, source_table: &str) -> Option<(String, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let mut partition_sql = rewrite_sql_for_partition(trimmed, source_table)?;
+
+    let dialect = PostgreSqlDialect {};
+    let mut statements = Parser::parse_sql(&dialect, &partition_sql).ok()?;
+    let statement = statements.get_mut(0)?;
+    let Statement::Query(ref mut query) = statement else {
+        return None;
+    };
+    let SetExpr::Select(ref mut select) = *query.body else {
+        return None;
+    };
+    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+        || select.having.is_some()
+        || select.distinct.is_some()
+    {
+        return None;
+    }
+
+    let mut worker_items = Vec::new();
+    let mut final_items = Vec::new();
+    for (idx, item) in select.projection.iter().enumerate() {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, quote_sql_identifier(&expr.to_string())),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                (expr, quote_sql_identifier(alias.value.as_str()))
+            }
+            _ => return None,
+        };
+        let aggregate = aggregate_expr_parts(expr)?;
+        let output = format!("__adb_agg_{idx}");
+        match aggregate.function.as_str() {
+            "count" => {
+                worker_items.push(format!(
+                    "COUNT({}) AS {}",
+                    aggregate.argument,
+                    quote_sql_identifier(&output)
+                ));
+                final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+            }
+            "sum" => {
+                worker_items.push(format!(
+                    "SUM({}) AS {}",
+                    aggregate.argument,
+                    quote_sql_identifier(&output)
+                ));
+                final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+            }
+            "min" => {
+                worker_items.push(format!(
+                    "MIN({}) AS {}",
+                    aggregate.argument,
+                    quote_sql_identifier(&output)
+                ));
+                final_items.push(format!("MIN({}) AS {alias}", quote_sql_identifier(&output)));
+            }
+            "max" => {
+                worker_items.push(format!(
+                    "MAX({}) AS {}",
+                    aggregate.argument,
+                    quote_sql_identifier(&output)
+                ));
+                final_items.push(format!("MAX({}) AS {alias}", quote_sql_identifier(&output)));
+            }
+            "avg" => {
+                let sum_output = format!("{output}_sum");
+                let count_output = format!("{output}_count");
+                worker_items.push(format!(
+                    "SUM({}) AS {}, COUNT({}) AS {}",
+                    aggregate.argument,
+                    quote_sql_identifier(&sum_output),
+                    aggregate.argument,
+                    quote_sql_identifier(&count_output)
+                ));
+                final_items.push(format!(
+                    "SUM({}) / SUM({}) AS {alias}",
+                    quote_sql_identifier(&sum_output),
+                    quote_sql_identifier(&count_output)
+                ));
+            }
+            _ => return None,
+        }
+    }
+
+    select.projection = vec![SelectItem::UnnamedExpr(Expr::Value(
+        sqlparser::ast::Value::Number("1".to_string(), false).into(),
+    ))];
+    partition_sql = statement.to_string();
+    let re = regex::Regex::new(r"(?is)^\s*SELECT\s+1\s+FROM\s+").ok()?;
+    let worker_sql = re
+        .replace(
+            &partition_sql,
+            format!("SELECT {} FROM ", worker_items.join(", ")).as_str(),
+        )
+        .to_string();
+    let final_sql = format!("SELECT {} FROM __partition__", final_items.join(", "));
+    Some((worker_sql, final_sql))
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn select_projection_contains_function(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, trimmed) else {
+        return false;
+    };
+    let Some(Statement::Query(query)) = statements.first() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(Expr::Function(_)) => true,
+        SelectItem::ExprWithAlias {
+            expr: Expr::Function(_),
+            ..
+        } => true,
+        _ => false,
+    })
+}
+
+struct AggregateExprParts {
+    function: String,
+    argument: String,
+}
+
+fn aggregate_expr_parts(expr: &Expr) -> Option<AggregateExprParts> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    if function.filter.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+
+    let function_name = function
+        .name
+        .to_string()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_ascii_lowercase();
+
+    let FunctionArguments::List(args) = &function.args else {
+        return None;
+    };
+    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() || args.args.len() != 1 {
+        return None;
+    }
+    let FunctionArg::Unnamed(arg) = &args.args[0] else {
+        return None;
+    };
+    let argument = match arg {
+        FunctionArgExpr::Wildcard => "*".to_string(),
+        FunctionArgExpr::Expr(expr) => expr.to_string(),
+        FunctionArgExpr::QualifiedWildcard(_) => return None,
+    };
+    if argument == "*" && function_name != "count" {
+        return None;
+    }
+
+    Some(AggregateExprParts {
+        function: function_name,
+        argument,
+    })
+}
+
 fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStatement>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
@@ -5838,6 +6508,229 @@ FROM generate_series(1, 10) AS s(n)";
         cleanup_catalog_artifacts(&catalog_path);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coordinator_finalizes_distributed_count_to_one_row() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch_a = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                1, 2,
+            ]))],
+        )
+        .unwrap();
+        let batch_b = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                3,
+            ]))],
+        )
+        .unwrap();
+        let request = QueryRequest {
+            sql: "SELECT COUNT(*) FROM customers".to_string(),
+            session: session.clone(),
+        };
+        let admission = QueryAdmission {
+            query_id: "test-distributed-count-finalize".to_string(),
+            coordinator_node_id: "coord-test".to_string(),
+        };
+
+        let result = engine
+            .execute_coordinator_select_over_partition_batches(
+                &request,
+                &admission,
+                Instant::now(),
+                "customers",
+                schema,
+                vec![batch_a, batch_b],
+                3,
+                None,
+            )
+            .await
+            .expect("coordinator should finalize distributed count");
+        let schema = Arc::clone(&result.schema);
+        let batches = datafusion::physical_plan::common::collect(result.stream)
+            .await
+            .unwrap();
+        let response = QueryExecutionResult {
+            query_id: admission.query_id,
+            coordinator_node_id: admission.coordinator_node_id,
+            session,
+            schema,
+            batches,
+            message: String::new(),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: 0,
+        }
+        .to_query_response();
+
+        assert_eq!(response.rows, vec![vec!["3".to_string()]]);
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coordinator_sums_distributed_partial_count_to_one_row() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__adb_agg_0",
+            DataType::Int64,
+            false,
+        )]));
+        let partials = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                101, 203, 307,
+            ]))],
+        )
+        .unwrap();
+        let request = QueryRequest {
+            sql: "SELECT COUNT(*) FROM customers".to_string(),
+            session: session.clone(),
+        };
+        let admission = QueryAdmission {
+            query_id: "test-distributed-partial-count-finalize".to_string(),
+            coordinator_node_id: "coord-test".to_string(),
+        };
+        let (_, final_sql) = distributed_aggregate_plan(&request.sql, "customers").unwrap();
+
+        let result = engine
+            .execute_coordinator_select_over_partition_batches(
+                &request,
+                &admission,
+                Instant::now(),
+                "customers",
+                schema,
+                vec![partials],
+                3,
+                Some(final_sql),
+            )
+            .await
+            .expect("coordinator should sum partial counts");
+        let schema = Arc::clone(&result.schema);
+        let batches = datafusion::physical_plan::common::collect(result.stream)
+            .await
+            .unwrap();
+        let response = QueryExecutionResult {
+            query_id: admission.query_id,
+            coordinator_node_id: admission.coordinator_node_id,
+            session,
+            schema,
+            batches,
+            message: String::new(),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: 0,
+        }
+        .to_query_response();
+
+        assert_eq!(response.rows, vec![vec!["611".to_string()]]);
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coordinator_combines_multiple_distributed_aggregates() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("__adb_agg_0", DataType::Int64, false),
+            Field::new("__adb_agg_1", DataType::Float64, true),
+            Field::new("__adb_agg_2_sum", DataType::Float64, true),
+            Field::new("__adb_agg_2_count", DataType::Int64, false),
+            Field::new("__adb_agg_3", DataType::Int64, true),
+            Field::new("__adb_agg_4", DataType::Int64, true),
+        ]));
+        let partials = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![2, 3])),
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![
+                    30.0, 120.0,
+                ])),
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![
+                    30.0, 120.0,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![2, 3])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![10, 5])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![20, 60])),
+            ],
+        )
+        .unwrap();
+        let request = QueryRequest {
+            sql: "SELECT COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS avg_amount, MIN(id) AS first_id, MAX(id) AS last_id FROM customers".to_string(),
+            session: session.clone(),
+        };
+        let admission = QueryAdmission {
+            query_id: "test-distributed-multi-agg-finalize".to_string(),
+            coordinator_node_id: "coord-test".to_string(),
+        };
+        let (worker_sql, final_sql) =
+            distributed_aggregate_plan(&request.sql, "customers").unwrap();
+        assert_eq!(
+            worker_sql,
+            "SELECT COUNT(*) AS \"__adb_agg_0\", SUM(amount) AS \"__adb_agg_1\", SUM(amount) AS \"__adb_agg_2_sum\", COUNT(amount) AS \"__adb_agg_2_count\", MIN(id) AS \"__adb_agg_3\", MAX(id) AS \"__adb_agg_4\" FROM __partition__"
+        );
+
+        let result = engine
+            .execute_coordinator_select_over_partition_batches(
+                &request,
+                &admission,
+                Instant::now(),
+                "customers",
+                schema,
+                vec![partials],
+                2,
+                Some(final_sql),
+            )
+            .await
+            .expect("coordinator should combine aggregate partials");
+        let schema = Arc::clone(&result.schema);
+        let batches = datafusion::physical_plan::common::collect(result.stream)
+            .await
+            .unwrap();
+        let response = QueryExecutionResult {
+            query_id: admission.query_id,
+            coordinator_node_id: admission.coordinator_node_id,
+            session,
+            schema,
+            batches,
+            message: String::new(),
+            outcome: StatementOutcome::Rows,
+            execution_time_ms: 0,
+        }
+        .to_query_response();
+
+        assert_eq!(
+            response.rows,
+            vec![vec![
+                "5".to_string(),
+                "150.0".to_string(),
+                "30.0".to_string(),
+                "5".to_string(),
+                "60".to_string()
+            ]]
+        );
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
     #[test]
     fn parse_plain_select_table_simple() {
         assert_eq!(
@@ -6052,6 +6945,84 @@ FROM generate_series(1, 10) AS s(n)";
         ));
 
         cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_select_retries_and_falls_back_on_node_failure() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        // Create a table with some data.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE fail_test (id INT)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO fail_test SELECT * FROM generate_series(1, 10) AS s(id)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Register a bogus compute node that will fail connection.
+        engine.control_plane().register_node(analyticsdb_control::ClusterNode {
+            id: "bogus-node".to_string(),
+            role: analyticsdb_control::NodeRole::Compute,
+            endpoint: "http://127.0.0.1:1".to_string(), // Invalid port
+            status: analyticsdb_control::NodeStatus::Ready,
+            last_heartbeat_at_epoch_ms: 0,
+            ..analyticsdb_control::ClusterNode::default()
+        }).await.unwrap();
+
+        // Query should still succeed by retrying and eventually falling back to local.
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT * FROM fail_test".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("Query should succeed via fallback despite bogus node");
+
+        assert_eq!(
+            result.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10
+        );
+
+        // Verify the node was marked Unavailable.
+        let nodes = engine.control_plane().list_nodes().await.unwrap();
+        let bogus = nodes.iter().find(|n| n.id == "bogus-node").unwrap();
+        assert_eq!(bogus.status, analyticsdb_control::NodeStatus::Unavailable);
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[test]
+    fn optimal_worker_count_heuristic() {
+        use crate::distributed::calculate_optimal_worker_count;
+
+        // Small data, few files -> 1 node (coordinator)
+        assert_eq!(calculate_optimal_worker_count(1024, 2, 10), 1);
+        
+        // Large data, many files -> subset of nodes
+        // 1GB / 128MB = 8 nodes
+        assert_eq!(calculate_optimal_worker_count(1024 * 1024 * 1024, 20, 20), 10); // file count / 2 is 10
+        
+        // 10GB / 128MB = 80 nodes, clamped to available 20
+        assert_eq!(calculate_optimal_worker_count(10 * 1024 * 1024 * 1024, 100, 20), 20);
+        
+        // Moderate data, many files
+        // 100MB / 128MB = 1 node, but 20 files / 2 = 10 nodes
+        assert_eq!(calculate_optimal_worker_count(100 * 1024 * 1024, 20, 20), 10);
     }
 }
 
