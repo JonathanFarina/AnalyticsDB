@@ -265,6 +265,15 @@ pub async fn serve_flight_sql(
     engine: Arc<PrototypeEngine>,
     tls_config: Option<(Vec<u8>, Vec<u8>)>,
 ) -> anyhow::Result<()> {
+    serve_flight_sql_with_label(listener, engine, tls_config, "Flight SQL").await
+}
+
+pub async fn serve_flight_sql_with_label(
+    listener: TcpListener,
+    engine: Arc<PrototypeEngine>,
+    tls_config: Option<(Vec<u8>, Vec<u8>)>,
+    label: &'static str,
+) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
     let service = AnalyticsFlightSqlService {
         engine,
@@ -274,13 +283,17 @@ pub async fn serve_flight_sql(
     let mut builder = Server::builder();
 
     let router = if let Some((cert, key)) = tls_config {
-        info!("Flight SQL: Starting with TLS enabled");
+        info!("{}: Starting with TLS enabled", label);
         let identity = tonic::transport::Identity::from_pem(cert, key);
         builder
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
             .add_service(FlightServiceServer::new(service))
     } else {
-        warn!("Flight SQL: Starting in PLAINTEXT mode (insecure)");
+        if label == "Flight SQL" || label == "Client Flight SQL" {
+            warn!("{}: Starting in PLAINTEXT mode (insecure)", label);
+        } else {
+            warn!("{}: Starting in PLAINTEXT mode (internal)", label);
+        }
         builder.add_service(FlightServiceServer::new(service))
     };
 

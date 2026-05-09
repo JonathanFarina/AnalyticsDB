@@ -106,7 +106,7 @@ A feature is `Complete` only when all of the following are true:
 - Prototype protocol crate now includes tested PostgreSQL startup auth negative paths for unknown-user and wrong-password failures
 - Prototype protocol crate can expose a tested Flight SQL statement query/update path plus basic metadata listing
 - Prototype protocol crate now includes a shared prototype auth hook path used by PostgreSQL startup and Flight SQL handshake, with control-plane user lookup and role/auth-method metadata propagation into session context
-- Prototype server now supports **TLS/SSL encryption** for Flight SQL and **Prepared Statements** with schema planning, enabling standard JDBC/ODBC connectivity
+- Prototype server now supports **TLS/SSL encryption** for client-facing Flight SQL, including joined nodes when cluster TLS cert/key paths are configured, plus a separate internal node communication channel for distributed partition dispatch and **Prepared Statements** with schema planning, enabling standard JDBC/ODBC connectivity
 - Flight SQL statement and prepared-statement query tickets now carry the planned row schema from `GetFlightInfo`/prepare, and `DoGet` streams row batches from the shared engine row-stream path instead of re-planning and materializing the full result before encoding
 - CLI-driven tests now prove a narrow PostgreSQL/Flight SQL protocol-equivalent slice for non-parameterized SQL execution, requested schema routing, schema-scoped managed table/view workflows, cross-database metadata/DDL flows (`CREATE DATABASE`, `CREATE SCHEMA <database>.<schema>`, `SHOW DATABASES`, `SHOW SCHEMAS FROM <database>`, schema-qualified table create/insert/list), SQL metadata statements, user-visible unknown-database/unknown-schema/missing-relation query errors, and user-visible duplicate-table-create/NOT NULL/INSERT-value-count command errors through live listeners
 - CLI-driven tests now include a table-driven parity matrix over the current supported SQL surface that compares live PostgreSQL and Flight SQL user-visible success/error contracts
@@ -127,8 +127,9 @@ A feature is `Complete` only when all of the following are true:
 - Prototype metadata SQL subset exists for creating and listing databases, schemas, tables, and views, plus table column introspection, prototype `ALTER USER ... PASSWORD ...` rotation, and **SHOW NODES** node discovery
 - Control plane supports **distributed coordination** with **leader election (coordinator)** and **heartbeat-based health tracking**
 - Cluster supports **dynamic scaling** with **automatic port assignment** for new nodes joining the coordinator
-- Managed cluster configuration holds common settings for ports, catalog paths, and security policies
+- Managed cluster configuration holds common settings for ports, catalog paths, and security policies; coordinator startup now applies configured Flight SQL TLS paths to join responses so dynamically assigned client endpoints use `https://`, while node-to-node dispatch uses each node's dedicated internal endpoint
 - CLI supports **automatic failover** and transparent reconnection across multiple cluster endpoints
+- Prototype distributed partition dispatch exists for the current managed-table SELECT and INSERT SELECT scaffold; partition workers receive the source table catalog schema when scanning assigned Parquet files so catalog types such as NUMERIC and DATE are preserved during worker-side planning
 - Managed tables can be materialized from `CREATE TABLE ... AS SELECT ...` and queried from a later CLI process
 - Managed tables can also be defined with explicit column schemas and populated with `INSERT INTO ... VALUES ...` across later CLI processes
 - Managed tables now support a prototype `INSERT INTO ... SELECT ...` append path that writes through DataFusion's Parquet sink into local Parquet snapshots, with CLI-driven coverage for a bounded generated-series insert
@@ -148,7 +149,7 @@ A feature is `Complete` only when all of the following are true:
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
 - Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths
-- No distributed execution yet
+- No production distributed execution yet; the current distributed path remains a prototype scaffold without production-grade planning, retry/cancellation semantics, broad SQL coverage, or CLI-driven distributed compatibility coverage
 - No object-storage-backed production columnar managed-table storage yet (currently local Parquet)
 - No external Iceberg table support yet
 - No deployment manifests yet

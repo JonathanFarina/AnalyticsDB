@@ -20,7 +20,9 @@ use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::prelude::{col, lit, SessionConfig, SessionContext as DfSessionContext};
+use datafusion::prelude::{
+    col, lit, ParquetReadOptions, SessionConfig, SessionContext as DfSessionContext,
+};
 use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -31,15 +33,16 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tracing::{info, warn};
 
+pub mod distributed;
 pub mod functions;
 pub mod postgres_compatibility;
-pub mod distributed;
 pub mod sql_rewriter;
 pub mod storage;
 pub mod system_catalog;
 
 pub use distributed::{
-    ExecutePartitionRequest, ExecutePartitionWriteAck, ExecutePartitionWriteRequest, PartitionClient,
+    ExecutePartitionRequest, ExecutePartitionWriteAck, ExecutePartitionWriteRequest,
+    PartitionClient,
 };
 
 use functions::register_postgres_functions;
@@ -53,7 +56,11 @@ const INSERT_SELECT_PARQUET_ROW_GROUP_SIZE: usize = 1_048_576;
 /// `Utf8View` / `BinaryView` types that many Arrow Flight clients don't yet support.
 fn base_session_config() -> SessionConfig {
     let mut config = SessionConfig::new();
-    config.options_mut().execution.parquet.schema_force_view_types = false;
+    config
+        .options_mut()
+        .execution
+        .parquet
+        .schema_force_view_types = false;
     config
 }
 
@@ -447,13 +454,25 @@ impl PrototypeEngine {
         // catalog table name) can execute with WHERE/LIMIT/projections intact.
         // DataFusion will push predicates and the LIMIT into the Parquet scan.
         if !req.partition_files.is_empty() {
-            let partition_df = ctx
-                .read_parquet(
-                    req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
-                    Default::default(),
+            let paths = req
+                .partition_files
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let partition_df = if req.source_columns.is_empty() {
+                ctx.read_parquet(paths, ParquetReadOptions::default())
+                    .await
+                    .map_err(sanitize_error)?
+            } else {
+                let source_schema =
+                    build_partition_read_schema(&ctx, paths.clone(), &req.source_columns).await?;
+                ctx.read_parquet(
+                    paths,
+                    ParquetReadOptions::default().schema(source_schema.as_ref()),
                 )
                 .await
-                .map_err(sanitize_error)?;
+                .map_err(sanitize_error)?
+            };
             // Register as a lazy view so DataFusion can push WHERE/LIMIT into
             // the Parquet scan rather than materialising all rows first.
             ctx.register_table("__partition__", partition_df.into_view())
@@ -494,13 +513,25 @@ impl PrototypeEngine {
 
         // Use the Rust API to read partition files directly — DataFusion does not
         // expose `read_parquet([...])` as a SQL table function in this version.
-        let df = ctx
-            .read_parquet(
-                req.partition_files.iter().map(String::as_str).collect::<Vec<_>>(),
-                Default::default(),
+        let paths = req
+            .partition_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let df = if req.source_columns.is_empty() {
+            ctx.read_parquet(paths, ParquetReadOptions::default())
+                .await
+                .map_err(sanitize_error)?
+        } else {
+            let source_schema =
+                build_partition_read_schema(&ctx, paths.clone(), &req.source_columns).await?;
+            ctx.read_parquet(
+                paths,
+                ParquetReadOptions::default().schema(source_schema.as_ref()),
             )
             .await
-            .map_err(sanitize_error)?;
+            .map_err(sanitize_error)?
+        };
         let batches = df.collect().await.map_err(sanitize_error)?;
 
         let mut written_files = Vec::new();
@@ -860,7 +891,8 @@ impl PrototypeEngine {
             }
 
             let (store, table_prefix) = table_store_prefix(relation)?;
-            let Some(snapshot) = read_index_snapshot(&store, &table_prefix, &index.name).await? else {
+            let Some(snapshot) = read_index_snapshot(&store, &table_prefix, &index.name).await?
+            else {
                 continue;
             };
 
@@ -964,9 +996,7 @@ impl PrototypeEngine {
         started: Instant,
     ) -> Result<Option<QueryExecutionResult>> {
         // Only attempt distribution for plain SELECT statements.
-        let Some((db, schema_name, table_name)) =
-            parse_plain_select_table(&request.sql)
-        else {
+        let Some((db, schema_name, table_name)) = parse_plain_select_table(&request.sql) else {
             return Ok(None);
         };
 
@@ -1017,7 +1047,10 @@ impl PrototypeEngine {
         // Partition files across available workers (round-robin).
         let chunks = distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
 
-        let node_list: Vec<&str> = compute_nodes.iter().map(|n| n.endpoint.as_str()).collect();
+        let node_list: Vec<&str> = compute_nodes
+            .iter()
+            .map(distributed::PartitionClient::node_channel_endpoint)
+            .collect();
         info!(
             "[coordinator] Distributed SELECT on '{}': {} file(s) across {} worker(s): [{}]",
             table_name,
@@ -1040,7 +1073,7 @@ impl PrototypeEngine {
             .map(|(chunk_files, node)| {
                 info!(
                     "[coordinator] → {} gets {} file(s)",
-                    node.endpoint,
+                    distributed::PartitionClient::node_channel_endpoint(node),
                     chunk_files.len()
                 );
                 let req = distributed::ExecutePartitionRequest {
@@ -1048,8 +1081,10 @@ impl PrototypeEngine {
                     sql: worker_sql.clone(),
                     session: request.session.clone(),
                     partition_files: chunk_files,
+                    source_columns: relation.columns.clone(),
                 };
-                let endpoint = node.endpoint.clone();
+                let endpoint =
+                    distributed::PartitionClient::node_channel_endpoint(node).to_string();
                 (endpoint, req)
             })
             .collect();
@@ -1081,7 +1116,10 @@ impl PrototypeEngine {
             session: request.session.clone(),
             schema,
             batches: all_batches,
-            message: format!("Distributed query: {row_count} row(s) returned from {} node(s).", compute_nodes.len()),
+            message: format!(
+                "Distributed query: {row_count} row(s) returned from {} node(s).",
+                compute_nodes.len()
+            ),
             outcome: StatementOutcome::Rows,
             execution_time_ms: started.elapsed().as_millis(),
         }))
@@ -1106,8 +1144,7 @@ impl PrototypeEngine {
         started: Instant,
     ) -> Result<Option<QueryExecutionResult>> {
         // Only distribute when the SELECT source is a plain table reference.
-        let Some((src_db, src_schema, src_table)) =
-            parse_plain_select_table(&statement.query_sql)
+        let Some((src_db, src_schema, src_table)) = parse_plain_select_table(&statement.query_sql)
         else {
             return Ok(None);
         };
@@ -1207,9 +1244,13 @@ impl PrototypeEngine {
                     sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
                     session: request.session.clone(),
                     partition_files: chunk_files,
+                    source_columns: source_relation.columns.clone(),
                     write_prefix: target_storage.to_string(),
                 };
-                (node.endpoint.clone(), req)
+                (
+                    distributed::PartitionClient::node_channel_endpoint(node).to_string(),
+                    req,
+                )
             })
             .collect();
 
@@ -2351,7 +2392,8 @@ impl PrototypeEngine {
                     .map_err(sanitize_error)?;
                 let arrow_schema = Arc::new(dataframe.schema().as_arrow().clone());
                 let columns_metadata = catalog_columns_from_schema(&arrow_schema);
-                let row_count = write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
+                let row_count =
+                    write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
 
                 let created_message = self
                     .control_plane
@@ -2405,7 +2447,8 @@ impl PrototypeEngine {
                     .map_err(sanitize_error)?;
                 let arrow_schema = Arc::new(dataframe.schema().as_arrow().clone());
                 let columns_metadata = catalog_columns_from_schema(&arrow_schema);
-                let row_count = write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
+                let row_count =
+                    write_dataframe_to_table_snapshot(dataframe, &store, &prefix).await?;
 
                 let created_message = self
                     .control_plane
@@ -2864,7 +2907,8 @@ impl PrototypeEngine {
                                         &version,
                                     )
                                     .await?;
-                                write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
+                                write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version)
+                                    .await?;
                             }
 
                             message = match self
@@ -2881,8 +2925,12 @@ impl PrototypeEngine {
                                 Ok(message) => message,
                                 Err(error) => {
                                     for index_name in &staged_index_names {
-                                        let _ =
-                                            remove_index_snapshot(&idx_store, &idx_prefix, index_name).await;
+                                        let _ = remove_index_snapshot(
+                                            &idx_store,
+                                            &idx_prefix,
+                                            index_name,
+                                        )
+                                        .await;
                                     }
                                     return Err(error);
                                 }
@@ -2921,8 +2969,7 @@ impl PrototypeEngine {
                             let new_suffix = format!("{}.table.parquet", new_name);
                             let new_location_str =
                                 storage_path_str.replace(&old_suffix, &new_suffix);
-                            let (_, new_prefix) =
-                                storage::store_for_location(&new_location_str)?;
+                            let (_, new_prefix) = storage::store_for_location(&new_location_str)?;
                             storage::rename_prefix(&store, &old_prefix, &new_prefix).await?;
 
                             // 3. Update the storage path in catalog after physical rename
@@ -3043,7 +3090,12 @@ impl PrototypeEngine {
                                 // 3. Physically remove dropped index snapshots
                                 if let Ok((idx_store, idx_prefix)) = table_store_prefix(&relation) {
                                     for index_name in dropped_index_names {
-                                        let _ = remove_index_snapshot(&idx_store, &idx_prefix, &index_name).await;
+                                        let _ = remove_index_snapshot(
+                                            &idx_store,
+                                            &idx_prefix,
+                                            &index_name,
+                                        )
+                                        .await;
                                     }
                                 }
 
@@ -3129,8 +3181,7 @@ impl PrototypeEngine {
                         let old_part = format!("{}__{}__", database_name, name);
                         let new_part = format!("{}__{}__", database_name, new_name);
                         let new_location_str = storage_path_str.replace(&old_part, &new_part);
-                        let (_, new_obj_prefix) =
-                            storage::store_for_location(&new_location_str)?;
+                        let (_, new_obj_prefix) = storage::store_for_location(&new_location_str)?;
                         storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix).await?;
                         self.control_plane
                             .update_relation_storage_path(
@@ -3191,7 +3242,8 @@ impl PrototypeEngine {
                             let new_location_str = storage_path_str.replace(&old_part, &new_part);
                             let (_, new_obj_prefix) =
                                 storage::store_for_location(&new_location_str)?;
-                            storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix).await?;
+                            storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix)
+                                .await?;
                             self.control_plane
                                 .update_relation_storage_path(
                                     &request.session,
@@ -4035,7 +4087,8 @@ impl PrototypeEngine {
 
         let (idx_store, idx_prefix) = table_store_prefix(relation)?;
         for index in &relation.indexes {
-            let Some(snapshot) = read_index_snapshot(&idx_store, &idx_prefix, &index.name).await? else {
+            let Some(snapshot) = read_index_snapshot(&idx_store, &idx_prefix, &index.name).await?
+            else {
                 continue;
             };
             let Some((score, has_range, row_ids)) = self
@@ -4203,6 +4256,119 @@ fn build_arrow_schema_from_catalog_columns(columns: &[CatalogColumn]) -> Result<
         })
         .collect::<Vec<_>>();
     build_arrow_schema_from_definitions(&definitions, false)
+}
+
+async fn build_partition_read_schema(
+    ctx: &DfSessionContext,
+    paths: Vec<&str>,
+    columns: &[CatalogColumn],
+) -> Result<SchemaRef> {
+    let mut schema = build_arrow_schema_from_catalog_columns(columns)?;
+    if !schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), DataType::Utf8))
+    {
+        return Ok(schema);
+    }
+
+    let sample_df = ctx
+        .read_parquet(paths, ParquetReadOptions::default())
+        .await
+        .map_err(sanitize_error)?;
+    let inferred_schema = Arc::new(sample_df.schema().as_arrow().as_ref().clone());
+    let sample_batches = sample_df
+        .limit(0, Some(1024))
+        .map_err(sanitize_error)?
+        .collect()
+        .await
+        .map_err(sanitize_error)?;
+
+    schema = refine_utf8_partition_schema_from_sample(&schema, &inferred_schema, &sample_batches);
+    Ok(schema)
+}
+
+fn refine_utf8_partition_schema_from_sample(
+    schema: &SchemaRef,
+    inferred_schema: &SchemaRef,
+    sample_batches: &[RecordBatch],
+) -> SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if !matches!(field.data_type(), DataType::Utf8) || field.name() == "_row_id" {
+                return Arc::clone(field);
+            }
+
+            if let Ok(inferred_idx) = inferred_schema.index_of(field.name()) {
+                let inferred_field = inferred_schema.field(inferred_idx);
+                if !matches!(inferred_field.data_type(), DataType::Utf8) {
+                    return Arc::new(Field::new(
+                        field.name(),
+                        inferred_field.data_type().clone(),
+                        field.is_nullable(),
+                    ));
+                }
+            }
+
+            match infer_utf8_partition_column_type(field.name(), sample_batches) {
+                Some(data_type) => {
+                    Arc::new(Field::new(field.name(), data_type, field.is_nullable()))
+                }
+                None => Arc::clone(field),
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+fn infer_utf8_partition_column_type(
+    column_name: &str,
+    sample_batches: &[RecordBatch],
+) -> Option<DataType> {
+    let mut saw_value = false;
+    let mut all_numeric = true;
+    let mut all_date = true;
+
+    for batch in sample_batches {
+        let Ok(idx) = batch.schema().index_of(column_name) else {
+            return None;
+        };
+        let Some(values) = batch.column(idx).as_any().downcast_ref::<StringArray>() else {
+            return None;
+        };
+
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                continue;
+            }
+            let value = values.value(row).trim();
+            if value.is_empty() {
+                all_numeric = false;
+                all_date = false;
+                continue;
+            }
+            saw_value = true;
+            if value.parse::<f64>().is_err() {
+                all_numeric = false;
+            }
+            if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() {
+                all_date = false;
+            }
+        }
+    }
+
+    if !saw_value {
+        return None;
+    }
+    if all_date {
+        Some(DataType::Date32)
+    } else if all_numeric {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
 }
 
 fn catalog_columns_from_schema(schema: &SchemaRef) -> Vec<CatalogColumn> {
@@ -4532,10 +4698,18 @@ fn execute_pg_catalog_select(
     }
 
     let projected = metadata_projection_indices(select, columns)?;
-    let projected_columns = projected.iter().map(|idx| columns[*idx]).collect::<Vec<_>>();
+    let projected_columns = projected
+        .iter()
+        .map(|idx| columns[*idx])
+        .collect::<Vec<_>>();
     let projected_rows = filtered_rows
         .iter()
-        .map(|row| projected.iter().map(|idx| row[*idx].clone()).collect::<Vec<_>>())
+        .map(|row| {
+            projected
+                .iter()
+                .map(|idx| row[*idx].clone())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     let batch = utf8_record_batch(&projected_columns, &projected_rows)?;
@@ -4543,7 +4717,10 @@ fn execute_pg_catalog_select(
     Ok((batch, count))
 }
 
-fn metadata_projection_indices(select: &sqlparser::ast::Select, columns: &[&str]) -> Result<Vec<usize>> {
+fn metadata_projection_indices(
+    select: &sqlparser::ast::Select,
+    columns: &[&str],
+) -> Result<Vec<usize>> {
     if select
         .projection
         .iter()
@@ -4582,7 +4759,11 @@ fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
                 .map(|value| row[idx] == value)
                 .unwrap_or(true)
         }
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let Some(column_name) = metadata_expr_column_name(expr) else {
                 return true;
             };
@@ -4593,7 +4774,11 @@ fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
                 .iter()
                 .filter_map(metadata_literal_value)
                 .any(|value| row[idx] == value);
-            if *negated { !matched } else { matched }
+            if *negated {
+                !matched
+            } else {
+                matched
+            }
         }
         Expr::Nested(expr) => metadata_row_matches(expr, columns, row),
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
@@ -4935,13 +5120,24 @@ fn rewrite_sql_for_partition(sql: &str, source_table: &str) -> Option<String> {
 
     let mut replaced = false;
     for twj in &mut select.from {
-        if let TableFactor::Table { ref mut name, ref mut alias, .. } = twj.relation {
+        if let TableFactor::Table {
+            ref mut name,
+            ref mut alias,
+            ..
+        } = twj.relation
+        {
             let last = name.0.last().and_then(|p| match p {
                 ObjectNamePart::Identifier(id) => Some(id.value.clone()),
                 _ => None,
             });
-            if last.as_deref().map(|t| t.eq_ignore_ascii_case(source_table)).unwrap_or(false) {
-                *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("__partition__"))]);
+            if last
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case(source_table))
+                .unwrap_or(false)
+            {
+                *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                    "__partition__",
+                ))]);
                 // Remove any alias so the query can reference columns directly.
                 *alias = None;
                 replaced = true;
@@ -4949,7 +5145,11 @@ fn rewrite_sql_for_partition(sql: &str, source_table: &str) -> Option<String> {
         }
     }
 
-    if replaced { Some(statement.to_string()) } else { None }
+    if replaced {
+        Some(statement.to_string())
+    } else {
+        None
+    }
 }
 
 fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSelectStatement>> {
@@ -5074,7 +5274,12 @@ async fn write_index_snapshot(
     version: &str,
 ) -> Result<()> {
     let metadata_key = index_version_metadata_key(table_prefix, &snapshot.index, version);
-    storage::write_json(store, &metadata_key, &serde_json::to_string_pretty(snapshot)?).await?;
+    storage::write_json(
+        store,
+        &metadata_key,
+        &serde_json::to_string_pretty(snapshot)?,
+    )
+    .await?;
 
     let manifest = IndexSnapshotManifest {
         version: version.to_string(),
@@ -5083,7 +5288,12 @@ async fn write_index_snapshot(
         published_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
     let manifest_key = index_manifest_key(table_prefix, &snapshot.index);
-    storage::write_json(store, &manifest_key, &serde_json::to_string_pretty(&manifest)?).await?;
+    storage::write_json(
+        store,
+        &manifest_key,
+        &serde_json::to_string_pretty(&manifest)?,
+    )
+    .await?;
     Ok(())
 }
 
@@ -5427,11 +5637,204 @@ FROM generate_series(1, 10) AS s(n)";
                 ..SessionContext::default()
             },
             partition_files: vec![],
+            source_columns: vec![],
         };
 
-        let result = engine.execute_partition(&req).await.expect("partition should execute");
+        let result = engine
+            .execute_partition(&req)
+            .await
+            .expect("partition should execute");
         assert_eq!(result.query_id, "test-partition-q1");
-        assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            result.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1
+        );
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_partition_uses_catalog_schema_for_order_aggregates() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("orders table should be created");
+        engine
+            .execute_query(&QueryRequest {
+                sql: "INSERT INTO orders (id, customer_name, order_value, date_of_purchase) SELECT 1, 'A', CAST(10.50 AS NUMERIC(12,2)), CAST('2024-01-15' AS DATE) UNION ALL SELECT 2, 'B', CAST(20.25 AS NUMERIC(12,2)), CAST('2019-06-01' AS DATE)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("orders should be inserted");
+
+        let relation = engine
+            .control_plane()
+            .table_relation(&session, None, None, "orders")
+            .await
+            .expect("orders relation should exist");
+        let storage_path = relation
+            .storage_path
+            .clone()
+            .expect("orders should have managed storage");
+        let (store, prefix) = crate::storage::store_for_location(&storage_path).unwrap();
+        let partition_files = crate::storage::list_parquet_files(&store, &prefix)
+            .await
+            .unwrap();
+        assert!(
+            !partition_files.is_empty(),
+            "orders table must have parquet files"
+        );
+
+        let req = crate::distributed::ExecutePartitionRequest {
+            query_id: "test-partition-orders-agg".to_string(),
+            sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
+            session: session.clone(),
+            partition_files: partition_files.clone(),
+            source_columns: relation.columns.clone(),
+        };
+
+        let result = engine
+            .execute_partition(&req)
+            .await
+            .expect("partition aggregate should use catalog schema");
+        let response = result.to_query_response();
+        assert_eq!(response.rows.len(), 1);
+        assert_eq!(response.rows[0][0], "1");
+        assert_eq!(response.rows[0][1], "10.5000000000");
+
+        let wrong_utf8_columns = relation
+            .columns
+            .iter()
+            .map(|column| {
+                let mut column = column.clone();
+                if column.name == "order_value" || column.name == "date_of_purchase" {
+                    column.data_type = "Utf8".to_string();
+                }
+                column
+            })
+            .collect::<Vec<_>>();
+        let req = crate::distributed::ExecutePartitionRequest {
+            query_id: "test-partition-orders-agg-wrong-catalog".to_string(),
+            sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
+            session: session.clone(),
+            partition_files,
+            source_columns: wrong_utf8_columns,
+        };
+        let result = engine
+            .execute_partition(&req)
+            .await
+            .expect("partition aggregate should refine wrong string catalog metadata");
+        let response = result.to_query_response();
+        assert_eq!(response.rows.len(), 1);
+        assert_eq!(response.rows[0][0], "1");
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_partition_refines_string_backed_order_aggregate_columns() {
+        let catalog_path = temp_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("customer_name", DataType::Utf8, false),
+            Field::new("order_value", DataType::Utf8, false),
+            Field::new("date_of_purchase", DataType::Utf8, false),
+            Field::new("_row_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["A", "B"])),
+                Arc::new(StringArray::from(vec!["10.50", "20.25"])),
+                Arc::new(StringArray::from(vec!["2024-01-15", "2019-06-01"])),
+                Arc::new(StringArray::from(vec!["r1", "r2"])),
+            ],
+        )
+        .unwrap();
+
+        let write_dir = std::env::temp_dir().join(format!(
+            "analyticsdb-string-backed-orders-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&write_dir).unwrap();
+        let storage_path = format!("file://{}", write_dir.display());
+        let (store, prefix) = crate::storage::store_for_location(&storage_path).unwrap();
+        crate::storage::append_parquet_batch(&store, &prefix, batch)
+            .await
+            .unwrap();
+        let partition_files = crate::storage::list_parquet_files(&store, &prefix)
+            .await
+            .unwrap();
+
+        let req = crate::distributed::ExecutePartitionRequest {
+            query_id: "test-partition-string-backed-orders-agg".to_string(),
+            sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
+            session,
+            partition_files,
+            source_columns: vec![
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: true,
+                    default_value: None,
+                },
+                CatalogColumn {
+                    name: "customer_name".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    default_value: None,
+                },
+                CatalogColumn {
+                    name: "order_value".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    default_value: None,
+                },
+                CatalogColumn {
+                    name: "date_of_purchase".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    default_value: None,
+                },
+                CatalogColumn {
+                    name: "_row_id".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    default_value: None,
+                },
+            ],
+        };
+
+        let result = engine
+            .execute_partition(&req)
+            .await
+            .expect("string-backed partition aggregate should be refined");
+        let response = result.to_query_response();
+        assert_eq!(response.rows.len(), 1);
+        assert_eq!(response.rows[0][0], "1");
+        assert_eq!(response.rows[0][1], "10.5");
+
+        let _ = std::fs::remove_dir_all(write_dir);
         cleanup_catalog_artifacts(&catalog_path);
     }
 
@@ -5523,7 +5926,10 @@ FROM generate_series(1, 10) AS s(n)";
             .await
             .expect("local fallback should succeed");
 
-        assert_eq!(result.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            result.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1
+        );
         cleanup_catalog_artifacts(&catalog_path);
     }
 
@@ -5548,7 +5954,8 @@ FROM generate_series(1, 10) AS s(n)";
             .unwrap();
         engine
             .execute_query(&QueryRequest {
-                sql: "INSERT INTO write_src SELECT * FROM generate_series(1, 5) AS s(n)".to_string(),
+                sql: "INSERT INTO write_src SELECT * FROM generate_series(1, 5) AS s(n)"
+                    .to_string(),
                 session: session.clone(),
             })
             .await
@@ -5561,18 +5968,18 @@ FROM generate_series(1, 10) AS s(n)";
             .await
             .unwrap();
         let src_path = src_relation.storage_path.clone().unwrap();
-        let (src_store, src_prefix) =
-            crate::storage::store_for_location(&src_path).unwrap();
+        let (src_store, src_prefix) = crate::storage::store_for_location(&src_path).unwrap();
         let src_files = crate::storage::list_parquet_files(&src_store, &src_prefix)
             .await
             .unwrap();
-        assert!(!src_files.is_empty(), "source table must have parquet files");
+        assert!(
+            !src_files.is_empty(),
+            "source table must have parquet files"
+        );
 
         // Create a target directory for the worker to write into.
-        let write_dir = std::env::temp_dir().join(format!(
-            "analyticsdb-write-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let write_dir =
+            std::env::temp_dir().join(format!("analyticsdb-write-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&write_dir).unwrap();
         let write_prefix = format!("file://{}", write_dir.display());
 
@@ -5581,6 +5988,7 @@ FROM generate_series(1, 10) AS s(n)";
             sql: format!("SELECT * FROM partition ({} files)", src_files.len()),
             session: session.clone(),
             partition_files: src_files,
+            source_columns: src_relation.columns.clone(),
             write_prefix,
         };
 

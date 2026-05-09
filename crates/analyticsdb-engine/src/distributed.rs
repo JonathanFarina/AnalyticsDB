@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use analyticsdb_control::{ClusterNode, ControlPlane, NodeRole, NodeStatus};
+use analyticsdb_control::{CatalogColumn, ClusterNode, ControlPlane, NodeRole, NodeStatus};
 use analyticsdb_core::SessionContext;
 use anyhow::Result;
 use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -33,6 +33,13 @@ pub struct ExecutePartitionRequest {
     /// Parquet file paths assigned to this worker.  May be empty when the
     /// coordinator sends the original SQL without file-level partitioning.
     pub partition_files: Vec<String>,
+    /// Catalog schema for the source table behind `partition_files`.
+    ///
+    /// Workers must not rely only on Parquet schema inference, because managed
+    /// table writes may need catalog types such as NUMERIC/DATE to preserve SQL
+    /// semantics across distributed execution.
+    #[serde(default)]
+    pub source_columns: Vec<CatalogColumn>,
 }
 
 /// Splits `files` into at most `num_workers` chunks using round-robin assignment.
@@ -82,6 +89,8 @@ pub struct ExecutePartitionWriteRequest {
     pub sql: String,
     pub session: SessionContext,
     pub partition_files: Vec<String>,
+    #[serde(default)]
+    pub source_columns: Vec<CatalogColumn>,
     /// Absolute filesystem path prefix under which the worker writes its output files.
     pub write_prefix: String,
 }
@@ -116,6 +125,12 @@ impl PartitionClient {
             .into_iter()
             .filter(|n| n.role == NodeRole::Compute && n.status == NodeStatus::Ready)
             .collect())
+    }
+
+    pub fn node_channel_endpoint(node: &ClusterNode) -> &str {
+        node.internal_endpoint
+            .as_deref()
+            .unwrap_or(node.endpoint.as_str())
     }
 
     /// Sends an `ExecutePartitionWrite` DoAction to a Compute node, instructing
@@ -252,7 +267,9 @@ impl ClusterInternalConnector {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
         cfg.alpn_protocols = vec![b"h2".to_vec()];
-        Self { tls_config: Arc::new(cfg) }
+        Self {
+            tls_config: Arc::new(cfg),
+        }
     }
 }
 
@@ -320,11 +337,47 @@ mod tests {
             sql: "SELECT 1".to_string(),
             session: SessionContext::default(),
             partition_files: vec!["/tmp/a.parquet".to_string()],
+            source_columns: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: ExecutePartitionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.query_id, "q1");
         assert_eq!(decoded.partition_files, vec!["/tmp/a.parquet"]);
+        assert!(decoded.source_columns.is_empty());
+    }
+
+    #[test]
+    fn partition_client_prefers_internal_node_channel_endpoint() {
+        let node = ClusterNode {
+            id: "worker-1".to_string(),
+            role: NodeRole::Compute,
+            endpoint: "https://worker.example:50052".to_string(),
+            internal_endpoint: Some("http://10.0.0.2:60052".to_string()),
+            status: NodeStatus::Ready,
+            last_heartbeat_at_epoch_ms: 0,
+        };
+
+        assert_eq!(
+            PartitionClient::node_channel_endpoint(&node),
+            "http://10.0.0.2:60052"
+        );
+    }
+
+    #[test]
+    fn partition_client_falls_back_to_client_endpoint_for_legacy_nodes() {
+        let node = ClusterNode {
+            id: "worker-1".to_string(),
+            role: NodeRole::Compute,
+            endpoint: "https://worker.example:50052".to_string(),
+            internal_endpoint: None,
+            status: NodeStatus::Ready,
+            last_heartbeat_at_epoch_ms: 0,
+        };
+
+        assert_eq!(
+            PartitionClient::node_channel_endpoint(&node),
+            "https://worker.example:50052"
+        );
     }
 
     #[test]

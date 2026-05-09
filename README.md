@@ -104,7 +104,7 @@ Included today:
 - prototype PostgreSQL wire introspection-query compatibility for common JDBC-style probes (`SELECT version()`, `SELECT current_database()`, `SELECT current_schema()`, `SELECT current_user`, `SELECT session_user`, `SELECT current_setting('<name>')`) is now implemented via real DataFusion UDFs
 - prototype PostgreSQL transaction-statement support for `BEGIN`, `COMMIT`, and `ROLLBACK` as successful no-ops to support standard client lifecycles
 - prototype PostgreSQL extended-query placeholder rendering now avoids rewriting parameter markers inside SQL string literals (for example, `SELECT '$1', $1`)
-- prototype Flight SQL support for **TLS encryption** (`--tls-cert` and `--tls-key`) and **Prepared Statements**, enabling standard JDBC/ODBC client connectivity
+- prototype Flight SQL support for **TLS encryption** (`--tls-cert` and `--tls-key`) and **Prepared Statements**, enabling standard JDBC/ODBC client connectivity; joined nodes inherit configured cluster TLS paths for client-facing Flight SQL and use a separate internal node channel for distributed partition dispatch
 - integrated **structured logging** via `tracing`, controllable through `RUST_LOG` env variable
 
 Explicitly not included yet:
@@ -184,13 +184,14 @@ cargo run -p analyticsdb-server -- \
   --role control \
   --postgres-addr 127.0.0.1:5432 \
   --flight-sql-addr 127.0.0.1:50051 \
+  --node-addr 127.0.0.1:60051 \
   --catalog-path cluster-catalog.json \
   --tls-cert certs/server.crt \
   --tls-key certs/server.key
 ```
 
 #### 2. Join additional nodes (Dynamic Port Assignment)
-Subsequent nodes can join the cluster by pointing to the coordinator. They will automatically receive their assigned ports and common configuration.
+Subsequent nodes can join the cluster by pointing to the coordinator. They will automatically receive assigned PostgreSQL, client Flight SQL, and internal node-channel ports plus common configuration.
 ```bash
 cargo run -p analyticsdb-server -- \
   --node-id node-2 \
