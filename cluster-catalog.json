@@ -23,21 +23,24 @@
       "is_admin": false,
       "password": "analytics_reader",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206
+      "password_rotated_at_epoch_ms": 1777221067206,
+      "members": []
     },
     "analyticsdb_admin": {
       "name": "analyticsdb_admin",
       "is_admin": false,
       "password": "analyticsdb_admin",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206
+      "password_rotated_at_epoch_ms": 1777221067206,
+      "members": []
     },
     "postgres": {
       "name": "postgres",
       "is_admin": true,
       "password": "postgres",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206
+      "password_rotated_at_epoch_ms": 1777221067206,
+      "members": []
     }
   },
   "nodes": {
@@ -51,10 +54,10 @@
     "node-4": {
       "id": "node-4",
       "role": "Compute",
-      "endpoint": "https://127.0.0.1:50111",
-      "internal_endpoint": "http://127.0.0.1:60111",
+      "endpoint": "https://127.0.0.1:50112",
+      "internal_endpoint": "http://127.0.0.1:60112",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778360419361
+      "last_heartbeat_at_epoch_ms": 1778442995488
     },
     "node1": {
       "id": "node1",
@@ -62,7 +65,7 @@
       "endpoint": "https://127.0.0.1:50051",
       "internal_endpoint": "http://127.0.0.1:60051",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778360413343
+      "last_heartbeat_at_epoch_ms": 1778442987983
     },
     "node2": {
       "id": "node2",
@@ -308,6 +311,6 @@
     "catalog_path": "analyticsdb-catalog.json",
     "tls_cert_path": "certs/server.crt",
     "tls_key_path": "certs/server.key",
-    "next_available_port_offset": 60
+    "next_available_port_offset": 61
   }
 }
