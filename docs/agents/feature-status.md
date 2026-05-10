@@ -67,7 +67,7 @@ A feature is `Complete` only when all of the following are true:
 | Automatic storage-medium selection | Prototype | policy engine scaffold | tested policy decisions, explainability, and override path |
 | Unified SQL surface for native/external | Partial | unified planner logic | no user-facing special cases for normal querying workflows |
 | Distributed planner | Prototype | multi-stage plan generation | correctness, skew handling, and metrics coverage |
-| Distributed executor | Prototype | remote stage execution scaffold | resilience, retries, cancellation, and backpressure handling |
+| Distributed executor | Partial | remote stage execution scaffold with concurrent fetch, zero-materialization streaming, and node resilience | retries, cancellation, and backpressure handling |
 | Replication/eventual consistency | Prototype | design plus metadata hooks | failure recovery, repair flows, and consistency guarantees documented |
 | Caching: query results | Prototype | cache abstraction and tests | invalidation, visibility rules, metrics, and predictable behavior |
 | Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
@@ -149,7 +149,12 @@ A feature is `Complete` only when all of the following are true:
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
 - Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths
-- No production distributed execution yet; the current distributed path remains a prototype scaffold without production-grade planning, retry/cancellation semantics, broad SQL coverage, or CLI-driven distributed compatibility coverage
+- Distributed scatter-gather path now supports **concurrent worker fetch** and **zero-materialization streaming** via a `StreamingTableProvider`, allowing large result sets (e.g. 1B rows) to flow from workers directly to the client without coordinator-side materialization
+- Distributed executor now includes **node resilience** with active failure detection (marking nodes `Unavailable`) and automatic **query retry** with re-partitioning across remaining healthy nodes, with transparent fallback to local execution if the cluster is unavailable
+- Coordinator now uses a **cost-aware worker selection heuristic** to determine the optimal number of nodes based on data size (~128MB per worker target) and file count, avoiding "scatter-gather tax" on small datasets by selectively dispatching to a subset of the cluster
+- Distributed path performance optimized with **Bincode serialization** for internal gRPC, **connection pooling** for worker channels, **size-aware greedy partitioning**, and a **FileListCache** with version epochs to eliminate redundant object store listings
+- Managed table write paths (`INSERT INTO ... SELECT`) optimized with **batched Parquet writes** (consolidating into 1M row files) and **lazy index rebuilding** in background tasks to reduce write latency
+- No production distributed execution yet; the current distributed path remains a prototype scaffold without production-grade planning, cancellation semantics, broad SQL coverage, or CLI-driven distributed compatibility coverage
 - No object-storage-backed production columnar managed-table storage yet (currently local Parquet)
 - No external Iceberg table support yet
 - No deployment manifests yet

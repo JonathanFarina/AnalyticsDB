@@ -22,20 +22,34 @@ Commands are grouped by their current coverage status. Status values are unchang
 | ALTER COLLATION | `test_alter_aggregate_and_collation_coverage` | Current prototype metadata object operations validate rename success plus missing-object and duplicate-name failures |
 | ALTER DATABASE | `test_alter_database_and_shims_coverage` | RENAME TO supported with relation migration |
 | ALTER FUNCTION | `test_function_coverage`, `test_function_advanced_coverage` | RENAME TO, OWNER TO, and SET SCHEMA supported |
+| ALTER GROUP | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | ADD/DROP USER and RENAME TO supported. |
+| ALTER INDEX | `test_alter_index`, `cli_supports_create_alter_and_drop_index_statements`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | RENAME TO supported; physically updates sidecar indexes. |
+| ALTER ROLE | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | ADD/DROP USER and RENAME TO supported. |
+| ALTER SCHEMA | `test_alter_schema` | RENAME TO supported with automatic relation migration. |
+| ALTER TABLE | `test_alter_table`, `cli_supports_rename_column_drop_column_and_drop_constraint` | RENAME TO, ADD COLUMN, DROP COLUMN, RENAME COLUMN, DROP CONSTRAINT, and ALTER COLUMN (TYPE, SET/DROP NOT NULL, SET/DROP DEFAULT) supported; includes physical snapshot updates and schema-on-read default value support. |
+| ALTER USER | `test_user_management`, `test_alter_user`, `cli_supports_user_lifecycle_across_postgres_and_flight_sql` | PASSWORD rotation supported. |
 | CREATE AGGREGATE | `test_alter_aggregate_and_collation_coverage` |  |
 | CREATE COLLATION | `test_alter_aggregate_and_collation_coverage` |  |
 | CREATE CONVERSION | `test_alter_aggregate_and_collation_coverage` |  |
 | CREATE DATABASE | `test_create_database` |  |
 | CREATE FUNCTION | `test_function_coverage`, `test_function_advanced_coverage` | OR REPLACE supported |
+| CREATE GROUP | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | Aliased to roles; membership supported. |
+| CREATE INDEX | `test_create_index`, `cli_supports_create_alter_and_drop_index_statements`, `cli_create_unique_index_failure_is_atomic`, `cli_rejects_duplicate_index_names_within_schema`, `cli_supports_index_manifests_and_broader_predicates`, `cli_supports_broader_index_predicates_across_postgres_and_flight_sql`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Managed-table prototype supports column-list indexes with schema-wide name uniqueness, versioned sidecar manifest publication, and duplicate validation plus the current equality/`IN`/bounded-range lookup slice. |
+| CREATE ROLE | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | Aliased to groups; membership supported. |
 | CREATE SCHEMA | `test_create_schema` |  |
 | CREATE TABLE | `test_create_table` |  |
 | CREATE TABLE AS | `test_create_table_as` |  |
+| CREATE USER | `test_user_management`, `cli_supports_user_lifecycle_across_postgres_and_flight_sql` | Supported with optional PASSWORD. |
 | CREATE VIEW | `test_create_view` |  |
 | DELETE | `test_delete` |  |
 | DROP DATABASE | `test_drop_database` |  |
 | DROP FUNCTION | `test_function_coverage`, `test_function_advanced_coverage` | IF EXISTS and CASCADE/RESTRICT supported |
+| DROP GROUP | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | IF EXISTS supported. |
+| DROP INDEX | `test_drop_index`, `cli_supports_create_alter_and_drop_index_statements`, `cli_rejects_dropping_primary_key_backing_index`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Standalone managed-table indexes can be dropped; indexes backing `PRIMARY KEY` / `UNIQUE` constraints are intentionally protected and sidecar manifests are removed together with the standalone index. |
+| DROP ROLE | `test_group_management`, `cli_supports_group_lifecycle_across_postgres_and_flight_sql` | IF EXISTS supported. |
 | DROP SCHEMA | `test_drop_schema` |  |
 | DROP TABLE | `test_drop_table` |  |
+| DROP USER | `test_user_management`, `cli_supports_user_lifecycle_across_postgres_and_flight_sql` | IF EXISTS supported. |
 | DROP VIEW | `test_drop_view` |  |
 | EXPLAIN | `test_explain` |  |
 | INSERT | `test_insert` |  |
@@ -50,12 +64,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 
 | Command | Test Case | Notes |
 | :--- | :--- | :--- |
-| ALTER INDEX | `cli_supports_create_alter_and_drop_index_statements`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | `RENAME TO` supported for standalone managed-table indexes; constraint-backed indexes are intentionally protected and broader PostgreSQL index DDL remains unsupported |
-| ALTER SCHEMA | `test_alter_schema` | RENAME TO supported |
-| ALTER TABLE | `test_alter_table`, `cli_supports_rename_column_drop_column_and_drop_constraint` | RENAME TO, ADD COLUMN, DROP COLUMN, RENAME COLUMN, DROP CONSTRAINT, and ALTER COLUMN (TYPE, SET/DROP NOT NULL, SET/DROP DEFAULT) supported |
-| ALTER USER | `test_alter_user` | PASSWORD rotation supported |
-| CREATE INDEX | `cli_supports_create_alter_and_drop_index_statements`, `cli_create_unique_index_failure_is_atomic`, `cli_rejects_duplicate_index_names_within_schema`, `cli_supports_index_manifests_and_broader_predicates`, `cli_supports_broader_index_predicates_across_postgres_and_flight_sql`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Managed-table prototype supports column-list indexes with schema-wide name uniqueness, versioned sidecar manifest publication, and duplicate validation plus the current equality/`IN`/bounded-range lookup slice; external/partial/expression/concurrent index features are unsupported |
-| DROP INDEX | `cli_supports_create_alter_and_drop_index_statements`, `cli_rejects_dropping_primary_key_backing_index`, `cli_supports_index_lifecycle_across_postgres_and_flight_sql` | Standalone managed-table indexes can be dropped; indexes backing `PRIMARY KEY` / `UNIQUE` constraints are intentionally protected in the current prototype and sidecar manifests are removed together with the standalone index |
 | REINDEX | `test_reindex`, `cli_supports_reindex_index_and_table_statements`, `cli_protocols_support_reindex_index_and_table` | Current prototype rebuilds local managed-table sidecar snapshots for `REINDEX INDEX [CONCURRENTLY] <name>` and `REINDEX TABLE [CONCURRENTLY] <name>`; broader PostgreSQL `REINDEX` targets/options and non-managed storage backends remain unsupported |
 | RESET | `test_reset` |  |
 | SET | `test_set` |  |
@@ -81,7 +89,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | ALTER EXTENSION | - |  |
 | ALTER FOREIGN DATA WRAPPER | - |  |
 | ALTER FOREIGN TABLE | - |  |
-| ALTER GROUP | - |  |
 | ALTER LANGUAGE | - |  |
 | ALTER LARGE OBJECT | - |  |
 | ALTER MATERIALIZED VIEW | - |  |
@@ -91,7 +98,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | ALTER POLICY | - |  |
 | ALTER PROCEDURE | - |  |
 | ALTER PUBLICATION | - |  |
-| ALTER ROLE | - |  |
 | ALTER ROUTINE | - |  |
 | ALTER RULE | - |  |
 | ALTER SEQUENCE | - |  |
@@ -123,7 +129,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | CREATE EXTENSION | - |  |
 | CREATE FOREIGN DATA WRAPPER | - |  |
 | CREATE FOREIGN TABLE | - |  |
-| CREATE GROUP | - |  |
 | CREATE LANGUAGE | - |  |
 | CREATE MATERIALIZED VIEW | - |  |
 | CREATE OPERATOR | - |  |
@@ -132,7 +137,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | CREATE POLICY | - |  |
 | CREATE PROCEDURE | - |  |
 | CREATE PUBLICATION | - |  |
-| CREATE ROLE | - |  |
 | CREATE RULE | - |  |
 | CREATE SEQUENCE | - |  |
 | CREATE SERVER | - |  |
@@ -146,7 +150,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | CREATE TRANSFORM | - |  |
 | CREATE TRIGGER | - |  |
 | CREATE TYPE | - |  |
-| CREATE USER | - |  |
 | CREATE USER MAPPING | - |  |
 | DEALLOCATE | - |  |
 | DECLARE | - |  |
@@ -162,7 +165,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | DROP EXTENSION | - |  |
 | DROP FOREIGN DATA WRAPPER | - |  |
 | DROP FOREIGN TABLE | - |  |
-| DROP GROUP | - |  |
 | DROP LANGUAGE | - |  |
 | DROP MATERIALIZED VIEW | - |  |
 | DROP OPERATOR | - |  |
@@ -172,7 +174,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | DROP POLICY | - |  |
 | DROP PROCEDURE | - |  |
 | DROP PUBLICATION | - |  |
-| DROP ROLE | - |  |
 | DROP ROUTINE | - |  |
 | DROP RULE | - |  |
 | DROP SEQUENCE | - |  |
@@ -187,7 +188,6 @@ Commands are grouped by their current coverage status. Status values are unchang
 | DROP TRANSFORM | - |  |
 | DROP TRIGGER | - |  |
 | DROP TYPE | - |  |
-| DROP USER | - |  |
 | DROP USER MAPPING | - |  |
 | EXECUTE | - |  |
 | FETCH | - |  |

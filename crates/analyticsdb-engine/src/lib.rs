@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use object_store::path::Path as OPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use analyticsdb_control::{
     parse_metadata_statement, AlterDatabaseOperation, AlterObjectOperation, AlterTableOperation,
@@ -773,6 +773,81 @@ impl PrototypeEngine {
         Ok(())
     }
 
+    async fn physical_migrate_relation(
+        &self,
+        _session: &SessionContext,
+        relation: &analyticsdb_control::CatalogRelation,
+    ) -> Result<()> {
+        let Some(storage_path) = &relation.storage_path else {
+            return Ok(());
+        };
+
+        let (store, prefix) = storage::store_for_location(storage_path)?;
+        let files = storage::list_parquet_files(&store, &prefix).await?;
+
+        for file_path in files {
+            let ctx = DfSessionContext::new_with_config(base_session_config());
+            let df = ctx
+                .read_parquet(vec![file_path.as_str()], ParquetReadOptions::default())
+                .await
+                .map_err(sanitize_error)?;
+
+            // When reading with default options, DataFusion infers the schema from the file.
+            // We want to write it back with the NEW schema from the catalog.
+            let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
+            
+            // Collect existing data and write it back with the new schema.
+            // DataFusion will handle missing columns by filling with NULLs.
+            let batches = df.collect().await.map_err(sanitize_error)?;
+            let bytes = storage::encode_parquet_batches(full_schema, &batches)?;
+            let key = OPath::parse(file_path.trim_start_matches('/'))?;
+            store.put(&key, bytes.into()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn physical_migrate_rename_column(
+        &self,
+        _session: &SessionContext,
+        relation: &analyticsdb_control::CatalogRelation,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let Some(storage_path) = &relation.storage_path else {
+            return Ok(());
+        };
+
+        let (store, prefix) = storage::store_for_location(storage_path)?;
+        let files = storage::list_parquet_files(&store, &prefix).await?;
+
+        for file_path in files {
+            let ctx = DfSessionContext::new_with_config(base_session_config());
+            let df = ctx
+                .read_parquet(vec![file_path.as_str()], ParquetReadOptions::default())
+                .await
+                .map_err(sanitize_error)?;
+
+            let mut projection = Vec::new();
+            for field in df.schema().fields() {
+                if field.name() == old_name {
+                    projection.push(datafusion::prelude::col(field.name()).alias(new_name));
+                } else {
+                    projection.push(datafusion::prelude::col(field.name()));
+                }
+            }
+            let renamed_df = df.select(projection).map_err(sanitize_error)?;
+            let schema = Arc::new(renamed_df.schema().as_arrow().as_ref().clone());
+            let batches = renamed_df.collect().await.map_err(sanitize_error)?;
+
+            let bytes = storage::encode_parquet_batches(schema, &batches)?;
+            let key = OPath::parse(file_path.trim_start_matches('/'))?;
+            store.put(&key, bytes.into()).await?;
+        }
+
+        Ok(())
+    }
+
     async fn build_index_snapshot_for_relation(
         &self,
         session: &SessionContext,
@@ -1282,7 +1357,10 @@ impl PrototypeEngine {
             let worker_sql = aggregate_plan
                 .as_ref()
                 .map(|(worker_sql, _)| worker_sql.clone())
-                .unwrap_or_else(|| "SELECT * FROM __partition__".to_string());
+                .unwrap_or_else(|| {
+                    rewrite_sql_for_partition(&request.sql, &table_name)
+                        .unwrap_or_else(|| "SELECT * FROM __partition__".to_string())
+                });
 
             // Build tasks.
             let worker_tasks: Vec<_> = chunks
@@ -1773,44 +1851,15 @@ impl PrototypeEngine {
         Ok(None)
     }
 
-    pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
+    async fn prepare_query_request(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<(QueryRequest, QueryAdmission, Instant)> {
         let started = Instant::now();
         self.control_plane
             .validate_session(&request.session)
             .await?;
         let admission = self.control_plane.admit_query(&request.session).await?;
-
-        if let Some(statement) = parse_insert_select_statement(&request.sql)? {
-            return self
-                .execute_insert_select(request, statement, admission, started)
-                .await;
-        }
-
-        if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
-            if let Some(result) = self
-                .try_execute_indexed_select(request, statement, &admission, started)
-                .await?
-            {
-                return Ok(result);
-            }
-        }
-
-        if let Some(statement) = parse_metadata_statement(&request.sql) {
-            let result = self
-                .execute_metadata_query(request, statement, admission, started)
-                .await?;
-            if matches!(result.outcome, StatementOutcome::Command { .. }) {
-                self.invalidate_session_contexts().await;
-            }
-            return Ok(result);
-        }
-
-        if let Some(result) = self
-            .try_execute_distributed_select(request, &admission, started)
-            .await?
-        {
-            return Ok(result);
-        }
 
         let control_plane = Arc::clone(&self.control_plane);
         let sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
@@ -1819,10 +1868,49 @@ impl PrototypeEngine {
             &request.session,
         )
         .await?;
-        let session = request.session.clone();
+        let mut request = request.clone();
+        request.sql = sql;
+        Ok((request, admission, started))
+    }
 
+    pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
+        let (request, admission, started) = self.prepare_query_request(request).await?;
+
+        if let Some(statement) = parse_insert_select_statement(&request.sql)? {
+            return self
+                .execute_insert_select(&request, statement, admission, started)
+                .await;
+        }
+
+        if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
+            if let Some(result) = self
+                .try_execute_indexed_select(&request, statement, &admission, started)
+                .await?
+            {
+                return Ok(result);
+            }
+        }
+
+        if let Some(statement) = parse_metadata_statement(&request.sql) {
+            let result = self
+                .execute_metadata_query(&request, statement, admission, started)
+                .await?;
+            if matches!(result.outcome, StatementOutcome::Command { .. }) {
+                self.invalidate_session_contexts().await;
+            }
+            return Ok(result);
+        }
+
+        if let Some(result) = self
+            .try_execute_distributed_select(&request, &admission, started)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        let session = request.session.clone();
         let context = self.create_session_context(&session).await?;
-        let dataframe = context.sql(&sql).await.map_err(sanitize_error)?;
+        let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
         let batches = dataframe.collect().await.map_err(sanitize_error)?;
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -1851,12 +1939,11 @@ impl PrototypeEngine {
         &self,
         request: &QueryRequest,
     ) -> Result<QueryExecutionStream> {
-        let started = Instant::now();
-        let admission = self.control_plane.admit_query(&request.session).await?;
+        let (request, admission, started) = self.prepare_query_request(request).await?;
 
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             let execution = self
-                .execute_insert_select(request, statement, admission, started)
+                .execute_insert_select(&request, statement, admission, started)
                 .await?;
             let schema = Arc::new(Schema::empty());
             let batch_stream =
@@ -1876,7 +1963,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
             if let Some(execution) = self
-                .try_execute_indexed_select(request, statement, &admission, started)
+                .try_execute_indexed_select(&request, statement, &admission, started)
                 .await?
             {
                 let schema = Arc::clone(&execution.schema);
@@ -1902,7 +1989,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
             let execution = self
-                .execute_metadata_query(request, statement, admission, started)
+                .execute_metadata_query(&request, statement, admission, started)
                 .await?;
             if matches!(execution.outcome, StatementOutcome::Command { .. }) {
                 self.invalidate_session_contexts().await;
@@ -1928,23 +2015,16 @@ impl PrototypeEngine {
         }
 
         if let Some(result) = self
-            .try_execute_distributed_select_stream(request, &admission, started)
+            .try_execute_distributed_select_stream(&request, &admission, started)
             .await?
         {
             return Ok(result);
         }
 
-        let control_plane = Arc::clone(&self.control_plane);
-        let sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
-            &request.sql,
-            &control_plane,
-            &request.session,
-        )
-        .await?;
         let session = request.session.clone();
 
         let context = self.create_session_context(&session).await?;
-        let dataframe = context.sql(&sql).await.map_err(sanitize_error)?;
+        let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
 
         let stream = dataframe.execute_stream().await.map_err(sanitize_error)?;
@@ -2216,6 +2296,11 @@ impl PrototypeEngine {
             | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
             | MetadataStatement::InformationSchemaReferentialConstraints { .. }
+            | MetadataStatement::CreateUser { .. }
+            | MetadataStatement::DropUser { .. }
+            | MetadataStatement::CreateGroup { .. }
+            | MetadataStatement::AlterGroup { .. }
+            | MetadataStatement::DropGroup { .. }
             | MetadataStatement::AlterUserPassword { .. } => match statement {
                 MetadataStatement::InformationSchemaSchemata { sql } => {
                     let columns = [
@@ -2606,12 +2691,19 @@ impl PrototypeEngine {
                     .await?;
                 write_index_snapshot(&idx_store, &idx_prefix, &snapshot, &version).await?;
 
-                let (message, _new_session) = match self
+                let message = match self
                     .control_plane
-                    .execute_metadata_statement(&request.session, &statement)
+                    .rename_index(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &relation.name,
+                        name,
+                        &new_name,
+                    )
                     .await
                 {
-                    Ok(result) => result,
+                    Ok(msg) => msg,
                     Err(error) => {
                         let _ = remove_index_snapshot(&idx_store, &idx_prefix, &new_name).await;
                         return Err(error);
@@ -3330,7 +3422,7 @@ impl PrototypeEngine {
 
                 match operation {
                     AlterTableOperation::AddColumn { column } => {
-                        self.control_plane
+                        let result = self.control_plane
                             .add_column(
                                 &request.session,
                                 database.as_deref(),
@@ -3343,7 +3435,14 @@ impl PrototypeEngine {
                                     default_value: column.default_value.clone(),
                                 },
                             )
-                            .await?;
+                            .await;
+
+                        if result.is_ok() {
+                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
+                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                        }
+                        
+                        let _ = result?;
 
                         (
                             Arc::new(Schema::empty()),
@@ -3357,6 +3456,7 @@ impl PrototypeEngine {
                         )
                     }
                     AlterTableOperation::AddConstraint { constraint } => {
+                        // ...
                         let relation_lock = self.relation_lock(&relation).await;
                         let _write_guard = relation_lock.write().await;
                         let catalog_constraints = catalog_constraints_from_definitions(
@@ -3495,7 +3595,7 @@ impl PrototypeEngine {
                         if_exists,
                         cascade: _,
                     } => {
-                        let message = self
+                        let result = self
                             .control_plane
                             .drop_column(
                                 &request.session,
@@ -3505,7 +3605,14 @@ impl PrototypeEngine {
                                 &column_name,
                                 if_exists,
                             )
-                            .await?;
+                            .await;
+                        
+                        if result.is_ok() {
+                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
+                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                        }
+
+                        let message = result?;
 
                         (
                             Arc::new(Schema::empty()),
@@ -3516,6 +3623,9 @@ impl PrototypeEngine {
                         )
                     }
                     AlterTableOperation::RenameColumn { old_name, new_name } => {
+                        let relation_lock = self.relation_lock(&relation).await;
+                        let _write_guard = relation_lock.write().await;
+
                         let message = self
                             .control_plane
                             .rename_column(
@@ -3527,6 +3637,10 @@ impl PrototypeEngine {
                                 &new_name,
                             )
                             .await?;
+
+                        // Physically rewrite the table to apply the rename
+                        let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
+                        let _ = self.physical_migrate_rename_column(&request.session, &updated_relation, &old_name, &new_name).await;
 
                         (
                             Arc::new(Schema::empty()),
@@ -3541,7 +3655,7 @@ impl PrototypeEngine {
                         if_exists,
                         cascade,
                     } => {
-                        // 1. Identify sidecar indexes that will be dropped
+                        // ...
                         let preview_result = self
                             .control_plane
                             .preview_drop_constraint(
@@ -3624,7 +3738,7 @@ impl PrototypeEngine {
                         column_name,
                         operation,
                     } => {
-                        let message = self
+                        let result = self
                             .control_plane
                             .alter_column(
                                 &request.session,
@@ -3634,7 +3748,14 @@ impl PrototypeEngine {
                                 &column_name,
                                 operation,
                             )
-                            .await?;
+                            .await;
+
+                        if result.is_ok() {
+                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
+                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                        }
+
+                        let message = result?;
 
                         (
                             Arc::new(Schema::empty()),
@@ -5361,7 +5482,18 @@ fn parse_indexed_select_statement(sql: &str) -> Result<Option<IndexedSelectState
         _ => return Ok(None),
     };
 
-    let projection = select_projection_columns(&select.projection)?;
+    let projection = match select_projection_columns(&select.projection)? {
+        Some(p) => Some(p),
+        None => {
+            // If select_projection_columns returns None, it might be a wildcard (*)
+            // or a complex projection. We only support wildcards in indexed select
+            // if all columns are simple.
+            if select.projection.iter().any(|item| !matches!(item, SelectItem::Wildcard(_))) {
+                return Ok(None);
+            }
+            None
+        }
+    };
     let Some(selection) = &select.selection else {
         return Ok(None);
     };

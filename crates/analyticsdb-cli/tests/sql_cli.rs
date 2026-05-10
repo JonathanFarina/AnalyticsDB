@@ -5422,3 +5422,516 @@ async fn cli_supports_multi_endpoint_failover() {
 
     cleanup_catalog_artifacts(&catalog_path);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_create_alter_and_drop_index_statements() {
+    let catalog_path = temp_catalog_path();
+
+    for sql in [
+        "CREATE TABLE table_index_test (id BIGINT PRIMARY KEY, name TEXT)",
+        "INSERT INTO table_index_test VALUES (1, 'alice'), (2, 'bob')",
+        "CREATE INDEX test_idx ON table_index_test (name)",
+    ] {
+        Command::cargo_bin("analyticsdb")
+            .expect("binary should build")
+            .args(["query", "--catalog-path", &catalog_path, "--sql", sql])
+            .assert()
+            .success();
+    }
+
+    // Verify index usage
+    let lookup = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM table_index_test WHERE name = 'bob'",
+        ]);
+        command
+    });
+    assert_eq!(lookup.rows, vec![vec!["2".to_string()]]);
+    assert!(lookup.message.contains("'test_idx'"));
+
+    // ALTER INDEX RENAME TO
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "ALTER INDEX test_idx RENAME TO test_idx_renamed",
+        ])
+        .assert()
+        .success();
+
+    // Verify rename worked (message should show new index name with quotes)
+    let lookup_renamed = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM table_index_test WHERE name = 'alice'",
+        ]);
+        command
+    });
+    assert_eq!(lookup_renamed.rows, vec![vec!["1".to_string()]]);
+    assert!(lookup_renamed.message.contains("'test_idx_renamed'"));
+
+    // DROP INDEX
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "DROP INDEX test_idx_renamed",
+        ])
+        .assert()
+        .success();
+
+    // Verify index is gone (message should not contain index name)
+    let lookup_dropped = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT id FROM table_index_test WHERE name = 'alice'",
+        ]);
+        command
+    });
+    assert_eq!(lookup_dropped.rows, vec![vec!["1".to_string()]]);
+    assert!(!lookup_dropped.message.contains("'test_idx_renamed'"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_index_lifecycle_across_postgres_and_flight_sql() {
+    let pg_catalog_path = temp_catalog_path();
+    let fl_catalog_path = temp_catalog_path();
+    let (_pg_server, pg_addr) = start_postgres_server(&pg_catalog_path).await;
+    let (_flight_server, flight_addr) = start_flight_sql_server(&fl_catalog_path).await;
+
+    for (protocol, addr, catalog_path) in [
+        ("postgres", pg_addr, &pg_catalog_path),
+        ("flight-sql", flight_addr, &fl_catalog_path),
+    ] {
+        // 1. CREATE INDEX
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "CREATE TABLE protocol_idx_test (id INT, val TEXT)",
+        );
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "INSERT INTO protocol_idx_test VALUES (1, 'p1'), (2, 'p2')",
+        );
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "CREATE INDEX p_idx ON protocol_idx_test (val)",
+        );
+
+        // Verify manifest exists on disk
+        let manifest_path = index_snapshot_root(
+            catalog_path,
+            "postgres",
+            "public",
+            "protocol_idx_test",
+            "p_idx",
+        ).join("manifest.json");
+        assert!(manifest_path.exists(), "Index manifest should exist after CREATE INDEX via {}", protocol);
+
+        // 2. RENAME INDEX
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "ALTER INDEX p_idx RENAME TO renamed_idx",
+        );
+
+        // Verify old manifest is gone, new one exists
+        assert!(!manifest_path.exists(), "Old index manifest should be gone after RENAME via {}", protocol);
+        let new_manifest_path = index_snapshot_root(
+            catalog_path,
+            "postgres",
+            "public",
+            "protocol_idx_test",
+            "renamed_idx",
+        ).join("manifest.json");
+        assert!(new_manifest_path.exists(), "New index manifest should exist after RENAME via {}", protocol);
+
+        // 3. DROP INDEX
+        run_sql_via_protocol(protocol, &addr, "DROP INDEX renamed_idx");
+
+        // Verify manifest is gone
+        assert!(!new_manifest_path.exists(), "Index manifest should be gone after DROP INDEX via {}", protocol);
+    }
+
+    cleanup_catalog_artifacts(&pg_catalog_path);
+    cleanup_catalog_artifacts(&fl_catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_create_unique_index_failure_is_atomic() {
+    let catalog_path = temp_catalog_path();
+
+    // 1. Setup table with duplicates
+    for sql in [
+        "CREATE TABLE atomic_idx_test (id INT, val TEXT)",
+        "INSERT INTO atomic_idx_test VALUES (1, 'dup'), (2, 'unique'), (3, 'dup')",
+    ] {
+        Command::cargo_bin("analyticsdb")
+            .expect("binary should build")
+            .args(["query", "--catalog-path", &catalog_path, "--sql", sql])
+            .assert()
+            .success();
+    }
+
+    // 2. Try to create UNIQUE index (should fail)
+    let stderr = cli_stderr_failure({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "CREATE UNIQUE INDEX atomic_idx ON atomic_idx_test (val)",
+        ]);
+        command
+    });
+    assert!(stderr.contains("duplicate keys"));
+
+    // 3. Verify index is NOT in catalog (using pg_catalog.pg_class)
+    let show_idx = cli_json_response({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--format",
+            "json",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'i' AND relname = 'atomic_idx'",
+        ]);
+        command
+    });
+    assert_eq!(show_idx.rows.len(), 0);
+
+    // 4. Verify no manifest on disk
+    let manifest_path = index_snapshot_root(
+        &catalog_path,
+        "postgres",
+        "public",
+        "atomic_idx_test",
+        "atomic_idx",
+    ).join("manifest.json");
+    assert!(!manifest_path.exists());
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_rejects_duplicate_index_names_within_schema() {
+    let catalog_path = temp_catalog_path();
+
+    for sql in [
+        "CREATE TABLE table1 (id INT)",
+        "CREATE TABLE table2 (id INT)",
+        "CREATE INDEX shared_idx_name ON table1 (id)",
+    ] {
+        Command::cargo_bin("analyticsdb")
+            .expect("binary should build")
+            .args(["query", "--catalog-path", &catalog_path, "--sql", sql])
+            .assert()
+            .success();
+    }
+
+    // Attempt to use the same index name on a different table
+    let stderr = cli_stderr_failure({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "CREATE INDEX shared_idx_name ON table2 (id)",
+        ]);
+        command
+    });
+    assert!(stderr.contains("already exists"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_index_manifests_and_broader_predicates() {
+    let catalog_path = temp_catalog_path();
+
+    for sql in [
+        "CREATE TABLE predicate_test (id INT, score DOUBLE PRECISION, tag TEXT)",
+        "INSERT INTO predicate_test VALUES (1, 10.5, 'a'), (2, 20.0, 'b'), (3, 30.5, 'c')",
+        "CREATE INDEX score_idx ON predicate_test (score)",
+        "CREATE INDEX tag_idx ON predicate_test (tag)",
+    ] {
+        Command::cargo_bin("analyticsdb")
+            .expect("binary should build")
+            .args(["query", "--catalog-path", &catalog_path, "--sql", sql])
+            .assert()
+            .success();
+    }
+
+    let test_cases = [
+        // 1. Equality
+        ("SELECT id FROM predicate_test WHERE tag = 'b'", "2", "tag_idx"),
+        // 2. IN list
+        ("SELECT id FROM predicate_test WHERE tag IN ('a', 'c')", "1", "tag_idx"),
+        // 3. Bounded range
+        ("SELECT id FROM predicate_test WHERE score > 15.0 AND score < 25.0", "2", "score_idx"),
+        // 4. Greater than or equal
+        ("SELECT id FROM predicate_test WHERE score >= 30.0", "3", "score_idx"),
+    ];
+
+    for (sql, expected_id, expected_idx) in test_cases {
+        let res = cli_json_response({
+            let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+            command.args([
+                "query",
+                "--format",
+                "json",
+                "--catalog-path",
+                &catalog_path,
+                "--sql",
+                sql,
+            ]);
+            command
+        });
+        assert!(res.rows.iter().any(|r| r[0] == expected_id), "Query '{}' should return id {}", sql, expected_id);
+        assert!(res.message.contains(expected_idx), "Query '{}' should use index {}", sql, expected_idx);
+    }
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_broader_index_predicates_across_postgres_and_flight_sql() {
+    let pg_catalog_path = temp_catalog_path();
+    let fl_catalog_path = temp_catalog_path();
+    let (_pg_server, pg_addr) = start_postgres_server(&pg_catalog_path).await;
+    let (_flight_server, flight_addr) = start_flight_sql_server(&fl_catalog_path).await;
+
+    for (protocol, addr) in [("postgres", pg_addr), ("flight-sql", flight_addr)] {
+        // Setup
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "CREATE TABLE protocol_predicate_test (id INT, score DOUBLE PRECISION, tag TEXT)",
+        );
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "INSERT INTO protocol_predicate_test VALUES (1, 10.5, 'a'), (2, 20.0, 'b'), (3, 30.5, 'c')",
+        );
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "CREATE INDEX p_score_idx ON protocol_predicate_test (score)",
+        );
+        run_sql_via_protocol(
+            protocol,
+            &addr,
+            "CREATE INDEX p_tag_idx ON protocol_predicate_test (tag)",
+        );
+
+        let test_cases = [
+            ("SELECT id FROM protocol_predicate_test WHERE tag = 'b'", "2"),
+            ("SELECT id FROM protocol_predicate_test WHERE score >= 30.0", "3"),
+            ("SELECT id FROM protocol_predicate_test WHERE tag IN ('a', 'c')", "1"),
+            ("SELECT id FROM protocol_predicate_test WHERE score > 15.0 AND score < 25.0", "2"),
+        ];
+
+        for (sql, expected_id) in test_cases {
+            let res = protocol_json_response(protocol, &addr, None, sql);
+            assert!(res.rows.iter().any(|r| r[0] == expected_id), "{} lookup with {} failed", protocol, sql);
+        }
+    }
+
+    cleanup_catalog_artifacts(&pg_catalog_path);
+    cleanup_catalog_artifacts(&fl_catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_rejects_dropping_primary_key_backing_index() {
+    let catalog_path = temp_catalog_path();
+
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "CREATE TABLE pk_test (id INT PRIMARY KEY)",
+        ])
+        .assert()
+        .success();
+
+    // Attempt to drop the auto-generated PK index
+    let stderr = cli_stderr_failure({
+        let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+        command.args([
+            "query",
+            "--catalog-path",
+            &catalog_path,
+            "--sql",
+            "DROP INDEX pk_test_id_idx",
+        ]);
+        command
+    });
+    assert!(stderr.contains("backing a constraint"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+fn cli_stderr_failure(mut command: Command) -> String {
+    let output = command.assert().failure().get_output().clone();
+    String::from_utf8(output.stderr).expect("stderr should be valid utf-8")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
+    let pg_catalog_path = temp_catalog_path();
+    let fl_catalog_path = temp_catalog_path();
+    let (_pg_server, pg_addr) = start_postgres_server(&pg_catalog_path).await;
+    let (_flight_server, flight_addr) = start_flight_sql_server(&fl_catalog_path).await;
+
+    for (protocol, addr, _path) in [
+        ("postgres", &pg_addr, &pg_catalog_path),
+        ("flight-sql", &flight_addr, &fl_catalog_path),
+    ] {
+        // 1. CREATE USER
+        run_sql_via_protocol(protocol, addr, "CREATE USER app_user PASSWORD 'initial_pass'");
+
+        // 2. Verify authentication
+        let res = protocol_json_response_with_auth_context(
+            protocol,
+            addr,
+            None,
+            None,
+            "app_user",
+            None,
+            Some("initial_pass"),
+            "SELECT 1",
+        );
+        assert_eq!(res.rows[0][0], "1", "Authentication failed for {} with initial password", protocol);
+
+        // 3. ALTER USER PASSWORD
+        run_sql_via_protocol(protocol, addr, "ALTER USER app_user PASSWORD 'rotated_pass'");
+
+        // 4. Verify old password FAILS
+        let stderr_old = protocol_stderr_failure_with_auth_context(
+            protocol,
+            addr,
+            None,
+            None,
+            "app_user",
+            None,
+            Some("initial_pass"),
+            "SELECT 1",
+        );
+        assert!(stderr_old.contains("Invalid password") || stderr_old.contains("authentication failed") || stderr_old.contains("Can't handshake"), 
+                "{} should have rejected the OLD password. Stderr: {}", protocol, stderr_old);
+
+        // 5. Verify NEW password WORKS
+        let res_new = protocol_json_response_with_auth_context(
+            protocol,
+            addr,
+            None,
+            None,
+            "app_user",
+            None,
+            Some("rotated_pass"),
+            "SELECT 1",
+        );
+        assert_eq!(res_new.rows[0][0], "1", "Authentication failed for {} with rotated password", protocol);
+
+        // 6. DROP USER
+        run_sql_via_protocol(protocol, addr, "DROP USER app_user");
+
+        // 7. Verify user is GONE
+        let stderr_gone = protocol_stderr_failure_with_auth_context(
+            protocol,
+            addr,
+            None,
+            None,
+            "app_user",
+            None,
+            Some("rotated_pass"),
+            "SELECT 1",
+        );
+        assert!(stderr_gone.contains("Unknown user") || stderr_gone.contains("does not exist") || stderr_gone.contains("authentication failed"),
+                "{} should have rejected the dropped user. Stderr: {}", protocol, stderr_gone);
+    }
+
+    cleanup_catalog_artifacts(&pg_catalog_path);
+    cleanup_catalog_artifacts(&fl_catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_supports_group_lifecycle_across_postgres_and_flight_sql() {
+    let pg_catalog_path = temp_catalog_path();
+    let fl_catalog_path = temp_catalog_path();
+    let (_pg_server, pg_addr) = start_postgres_server(&pg_catalog_path).await;
+    let (_flight_server, flight_addr) = start_flight_sql_server(&fl_catalog_path).await;
+
+    for (protocol, addr) in [("postgres", &pg_addr), ("flight-sql", &flight_addr)] {
+        // 1. CREATE GROUP
+        run_sql_via_protocol(protocol, addr, "CREATE GROUP ds_group");
+
+        // 2. CREATE USER and ADD to GROUP
+        run_sql_via_protocol(protocol, addr, "CREATE USER ds_user PASSWORD 'p1'");
+        run_sql_via_protocol(protocol, addr, "ALTER GROUP ds_group ADD USER ds_user");
+
+        // 3. ALTER GROUP DROP USER
+        run_sql_via_protocol(protocol, addr, "ALTER GROUP ds_group DROP USER ds_user");
+
+        // 4. Cleanup
+        run_sql_via_protocol(protocol, addr, "DROP USER ds_user");
+        run_sql_via_protocol(protocol, addr, "DROP GROUP ds_group");
+    }
+
+    cleanup_catalog_artifacts(&pg_catalog_path);
+    cleanup_catalog_artifacts(&fl_catalog_path);
+}
+
+fn run_sql_via_protocol(protocol: &str, endpoint: &str, sql: &str) {
+    let mut command = Command::cargo_bin("analyticsdb").expect("binary should build");
+    command.args([
+        "query",
+        "--protocol",
+        protocol,
+        "--endpoint",
+        endpoint,
+        "--user",
+        "postgres",
+        "--password",
+        "postgres",
+        "--sql",
+        sql,
+    ]);
+    command.assert().success();
+}

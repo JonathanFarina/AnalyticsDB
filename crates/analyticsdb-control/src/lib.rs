@@ -93,6 +93,8 @@ pub struct CatalogUser {
     pub password_version: u64,
     #[serde(default)]
     pub password_rotated_at_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub members: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -304,6 +306,13 @@ pub enum ReindexTarget {
         name: String,
         concurrently: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterGroupOperation {
+    AddUser(String),
+    DropUser(String),
+    Rename(String),
 }
 
 #[derive(Debug, Clone)]
@@ -537,6 +546,25 @@ pub enum MetadataStatement {
     AlterUserPassword {
         name: String,
         password: String,
+    },
+    CreateUser {
+        name: String,
+        password: Option<String>,
+    },
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    CreateGroup {
+        name: String,
+    },
+    AlterGroup {
+        name: String,
+        operation: AlterGroupOperation,
+    },
+    DropGroup {
+        name: String,
+        if_exists: bool,
     },
     Begin,
     Commit,
@@ -806,6 +834,21 @@ impl ControlPlane {
             }
             MetadataStatement::AlterUserPassword { name, password } => {
                 self.rotate_user_password(session, name, password).await?
+            }
+            MetadataStatement::CreateUser { name, password } => {
+                self.create_user(session, name, password.clone()).await?
+            }
+            MetadataStatement::DropUser { name, if_exists } => {
+                self.drop_user(session, name, *if_exists).await?
+            }
+            MetadataStatement::CreateGroup { name } => {
+                self.create_group(session, name).await?
+            }
+            MetadataStatement::AlterGroup { name, operation } => {
+                self.alter_group(session, name, operation).await?
+            }
+            MetadataStatement::DropGroup { name, if_exists } => {
+                self.drop_group(session, name, *if_exists).await?
             }
             MetadataStatement::Begin => {
                 self.validate_session(session).await?;
@@ -1162,7 +1205,13 @@ impl ControlPlane {
             let mut found = false;
             for relation in state.relations.values_mut() {
                 if relation.database == database_name && relation.schema == schema_name {
-                    if let Some(pos) = relation.indexes.iter().position(|i| i.name == name) {
+                    if let Some(index) = relation.indexes.iter().find(|i| i.name == name) {
+                        // Protect constraint-backed indexes
+                        if index.is_primary || relation.constraints.iter().any(|c| c.name == name) {
+                            bail!("Index '{}' is backing a constraint and cannot be dropped directly. Use ALTER TABLE ... DROP CONSTRAINT instead.", name);
+                        }
+                        
+                        let pos = relation.indexes.iter().position(|i| i.name == name).unwrap();
                         relation.indexes.remove(pos);
                         found = true;
                         break;
@@ -2467,6 +2516,53 @@ impl ControlPlane {
         ))
     }
 
+    pub async fn rename_index(
+        &self,
+        session: &SessionContext,
+        database: Option<&str>,
+        schema: Option<&str>,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_identifier(new_name)?;
+        let database_name = database.unwrap_or(&session.database);
+        let schema_name = schema.unwrap_or(&session.schema);
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            let relation_key = relation_key(database_name, schema_name, table_name);
+            let relation = state.relations.get_mut(&relation_key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table '{}.{}.{}' not found",
+                    database_name,
+                    schema_name,
+                    table_name
+                )
+            })?;
+
+            if relation.indexes.iter().any(|i| i.name == new_name) {
+                bail!("Index '{}' already exists", new_name);
+            }
+
+            let index = relation
+                .indexes
+                .iter_mut()
+                .find(|i| i.name == old_name)
+                .ok_or_else(|| anyhow::anyhow!("Index '{}' not found", old_name))?;
+
+            index.name = new_name.to_string();
+        }
+
+        self.persist().await?;
+        Ok(format!(
+            "Index '{}' renamed to '{}' in '{}.{}.{}'.",
+            old_name, new_name, database_name, schema_name, table_name
+        ))
+    }
+
     pub async fn rename_relation(
         &self,
         session: &SessionContext,
@@ -2974,6 +3070,194 @@ impl ControlPlane {
             user_name
         ))
     }
+
+    async fn create_user(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        password: Option<String>,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can create users");
+            }
+
+            if state.users.contains_key(name) {
+                bail!("User '{}' already exists", name);
+            }
+
+            let user = CatalogUser {
+                name: name.to_string(),
+                is_admin: false,
+                password,
+                password_version: 1,
+                password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+                members: BTreeSet::new(),
+            };
+
+            state.users.insert(name.to_string(), user);
+        }
+
+        self.persist().await?;
+        Ok(format!("User '{}' created successfully.", name))
+    }
+
+    async fn drop_user(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can drop users");
+            }
+
+            if name == "postgres" {
+                bail!("Cannot drop internal user 'postgres'");
+            }
+
+            if name == session.user {
+                bail!("Cannot drop current user '{}'", name);
+            }
+
+            if state.users.remove(name).is_none() {
+                if if_exists {
+                    return Ok(format!("User '{}' does not exist, skipping.", name));
+                } else {
+                    bail!("User '{}' not found", name);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("User '{}' dropped successfully.", name))
+    }
+
+    async fn create_group(
+        &self,
+        session: &SessionContext,
+        name: &str,
+    ) -> Result<String> {
+        validate_identifier(name)?;
+
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can create groups");
+            }
+
+            if state.users.contains_key(name) {
+                bail!("Role/User '{}' already exists", name);
+            }
+
+            let group = CatalogUser {
+                name: name.to_string(),
+                is_admin: false,
+                password: None,
+                password_version: 1,
+                password_rotated_at_epoch_ms: None,
+                members: BTreeSet::new(),
+            };
+
+            state.users.insert(name.to_string(), group);
+        }
+
+        self.persist().await?;
+        Ok(format!("Group '{}' created successfully.", name))
+    }
+
+    async fn alter_group(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        operation: &AlterGroupOperation,
+    ) -> Result<String> {
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can alter groups");
+            }
+
+            if !state.users.contains_key(name) {
+                bail!("Group '{}' not found", name);
+            }
+
+            match operation {
+                AlterGroupOperation::AddUser(user_name) => {
+                    if !state.users.contains_key(user_name) {
+                        bail!("User '{}' not found", user_name);
+                    }
+                    let group = state.users.get_mut(name).unwrap();
+                    group.members.insert(user_name.clone());
+                    Ok(format!("User '{}' added to group '{}'.", user_name, name))
+                }
+                AlterGroupOperation::DropUser(user_name) => {
+                    let group = state.users.get_mut(name).unwrap();
+                    if !group.members.remove(user_name) {
+                        bail!("User '{}' is not a member of group '{}'", user_name, name);
+                    }
+                    Ok(format!("User '{}' removed from group '{}'.", user_name, name))
+                }
+                AlterGroupOperation::Rename(new_name) => {
+                    validate_identifier(new_name)?;
+                    if state.users.contains_key(new_name) {
+                        bail!("Role/User '{}' already exists", new_name);
+                    }
+                    let mut group = state.users.remove(name).unwrap();
+                    group.name = new_name.clone();
+                    state.users.insert(new_name.clone(), group);
+                    Ok(format!("Group '{}' renamed to '{}'.", name, new_name))
+                }
+            }
+        }
+    }
+
+    async fn drop_group(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        {
+            let mut state = self.state.write().await;
+            self._validate_session(&state, session)?;
+
+            if !state.users.get(&session.user).unwrap().is_admin {
+                bail!("Only administrators can drop groups");
+            }
+
+            if let Some(user) = state.users.get(name) {
+                if !user.members.is_empty() {
+                    // In a real DB we might cascade or block. Let's block for safety in prototype.
+                    bail!("Group '{}' is not empty and cannot be dropped", name);
+                }
+            }
+
+            if state.users.remove(name).is_none() {
+                if if_exists {
+                    return Ok(format!("Group '{}' does not exist, skipping.", name));
+                } else {
+                    bail!("Group '{}' not found", name);
+                }
+            }
+        }
+
+        self.persist().await?;
+        Ok(format!("Group '{}' dropped successfully.", name))
+    }
 }
 
 fn bootstrap_state() -> CatalogState {
@@ -2997,6 +3281,7 @@ fn bootstrap_state() -> CatalogState {
             password: Some("postgres".to_string()),
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
         },
     );
     users.insert(
@@ -3007,6 +3292,7 @@ fn bootstrap_state() -> CatalogState {
             password: Some("analytics_reader".to_string()),
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
         },
     );
     users.insert(
@@ -3017,6 +3303,7 @@ fn bootstrap_state() -> CatalogState {
             password: Some("analyticsdb_admin".to_string()),
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
         },
     );
 
@@ -3699,6 +3986,28 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 _ => None,
             }
         }
+        sqlparser::ast::Statement::AlterIndex { name, operation } => {
+            let idents: Vec<String> = name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, index_name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+
+            match operation {
+                sqlparser::ast::AlterIndexOperation::RenameIndex {
+                    index_name: new_index_name,
+                } => Some(MetadataStatement::AlterIndex {
+                    database,
+                    schema,
+                    name: index_name,
+                    operation: AlterObjectOperation::Rename {
+                        new_name: new_index_name.to_string(),
+                    },
+                }),
+            }
+        }
         sqlparser::ast::Statement::AlterSchema(alter) => {
             let idents: Vec<String> = alter.name.0.iter().map(|i| i.to_string()).collect();
             let (database, schema_name) = match idents.as_slice() {
@@ -3787,6 +4096,27 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         name: schema_name,
                         if_exists: *if_exists,
                         cascade: *cascade,
+                    })
+                }
+                sqlparser::ast::ObjectType::Index => {
+                    let (database, schema, obj_name) = match idents.as_slice() {
+                        [n] => (None, None, n.clone()),
+                        [s, n] => (None, Some(s.clone()), n.clone()),
+                        [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                        _ => return None,
+                    };
+                    Some(MetadataStatement::DropIndex {
+                        database,
+                        schema,
+                        name: obj_name,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    })
+                }
+                sqlparser::ast::ObjectType::User | sqlparser::ast::ObjectType::Role => {
+                    Some(MetadataStatement::DropUser {
+                        name: names[0].to_string(),
+                        if_exists: *if_exists,
                     })
                 }
                 _ => None,
@@ -4343,6 +4673,97 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         return Some(MetadataStatement::AlterUserPassword {
             name: user_name.to_string(),
             password,
+        });
+    }
+
+    if upper.starts_with("CREATE USER ") {
+        let remainder = trimmed["CREATE USER ".len()..].trim();
+        let upper_remainder = remainder.to_ascii_uppercase();
+
+        if let Some(pass_idx) = upper_remainder.find(" PASSWORD ") {
+            let user_name = remainder[..pass_idx].trim();
+            let pass_val = remainder[pass_idx + " PASSWORD ".len()..].trim();
+
+            let Ok(password) = parse_sql_single_quoted_literal(pass_val) else {
+                return None;
+            };
+
+            return Some(MetadataStatement::CreateUser {
+                name: user_name.to_string(),
+                password: Some(password),
+            });
+        } else {
+            return Some(MetadataStatement::CreateUser {
+                name: remainder.to_string(),
+                password: None,
+            });
+        }
+    }
+
+    if upper.starts_with("DROP USER ") {
+        let mut remainder = trimmed["DROP USER ".len()..].trim();
+        let mut if_exists = false;
+
+        if remainder.to_ascii_uppercase().starts_with("IF EXISTS ") {
+            if_exists = true;
+            remainder = remainder["IF EXISTS ".len()..].trim();
+        }
+
+        return Some(MetadataStatement::DropUser {
+            name: remainder.to_string(),
+            if_exists,
+        });
+    }
+
+    if upper.starts_with("CREATE GROUP ") || upper.starts_with("CREATE ROLE ") {
+        let keyword = if upper.starts_with("CREATE GROUP ") { "CREATE GROUP " } else { "CREATE ROLE " };
+        let name = trimmed[keyword.len()..].trim();
+        return Some(MetadataStatement::CreateGroup {
+            name: name.to_string(),
+        });
+    }
+
+    if upper.starts_with("ALTER GROUP ") || upper.starts_with("ALTER ROLE ") {
+        let keyword = if upper.starts_with("ALTER GROUP ") { "ALTER GROUP " } else { "ALTER ROLE " };
+        let remainder = trimmed[keyword.len()..].trim();
+        let upper_remainder = remainder.to_ascii_uppercase();
+        if let Some(add_idx) = upper_remainder.find(" ADD USER ") {
+            let group_name = remainder[..add_idx].trim();
+            let user_name = remainder[add_idx + " ADD USER ".len()..].trim();
+            return Some(MetadataStatement::AlterGroup {
+                name: group_name.to_string(),
+                operation: AlterGroupOperation::AddUser(user_name.to_string()),
+            });
+        }
+        if let Some(drop_idx) = upper_remainder.find(" DROP USER ") {
+            let group_name = remainder[..drop_idx].trim();
+            let user_name = remainder[drop_idx + " DROP USER ".len()..].trim();
+            return Some(MetadataStatement::AlterGroup {
+                name: group_name.to_string(),
+                operation: AlterGroupOperation::DropUser(user_name.to_string()),
+            });
+        }
+        if let Some(rename_idx) = upper_remainder.find(" RENAME TO ") {
+            let group_name = remainder[..rename_idx].trim();
+            let new_name = remainder[rename_idx + " RENAME TO ".len()..].trim();
+            return Some(MetadataStatement::AlterGroup {
+                name: group_name.to_string(),
+                operation: AlterGroupOperation::Rename(new_name.to_string()),
+            });
+        }
+    }
+
+    if upper.starts_with("DROP GROUP ") || upper.starts_with("DROP ROLE ") {
+        let keyword = if upper.starts_with("DROP GROUP ") { "DROP GROUP " } else { "DROP ROLE " };
+        let mut remainder = trimmed[keyword.len()..].trim();
+        let mut if_exists = false;
+        if remainder.to_ascii_uppercase().starts_with("IF EXISTS ") {
+            if_exists = true;
+            remainder = remainder["IF EXISTS ".len()..].trim();
+        }
+        return Some(MetadataStatement::DropGroup {
+            name: remainder.to_string(),
+            if_exists,
         });
     }
 

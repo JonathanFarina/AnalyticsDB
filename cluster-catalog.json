@@ -1,5 +1,13 @@
 {
   "databases": {
+    "my_database": {
+      "name": "my_database",
+      "schemas": [
+        "public"
+      ],
+      "owner": "postgres",
+      "parameters": {}
+    },
     "postgres": {
       "name": "postgres",
       "schemas": [
@@ -43,34 +51,10 @@
     "node-4": {
       "id": "node-4",
       "role": "Compute",
-      "endpoint": "https://127.0.0.1:50099",
-      "internal_endpoint": "http://127.0.0.1:60099",
+      "endpoint": "https://127.0.0.1:50111",
+      "internal_endpoint": "http://127.0.0.1:60111",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778349842395
-    },
-    "node-5": {
-      "id": "node-5",
-      "role": "Compute",
-      "endpoint": "https://127.0.0.1:50100",
-      "internal_endpoint": "http://127.0.0.1:60100",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778349858234
-    },
-    "node-6": {
-      "id": "node-6",
-      "role": "Compute",
-      "endpoint": "https://127.0.0.1:50101",
-      "internal_endpoint": "http://127.0.0.1:60101",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778349861607
-    },
-    "node-7": {
-      "id": "node-7",
-      "role": "Compute",
-      "endpoint": "https://127.0.0.1:50102",
-      "internal_endpoint": "http://127.0.0.1:60102",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778349925616
+      "last_heartbeat_at_epoch_ms": 1778360419361
     },
     "node1": {
       "id": "node1",
@@ -78,7 +62,7 @@
       "endpoint": "https://127.0.0.1:50051",
       "internal_endpoint": "http://127.0.0.1:60051",
       "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778349842261
+      "last_heartbeat_at_epoch_ms": 1778360413343
     },
     "node2": {
       "id": "node2",
@@ -89,6 +73,76 @@
     }
   },
   "relations": {
+    "my_database.public.customers": {
+      "database": "my_database",
+      "schema": "public",
+      "name": "customers",
+      "kind": "Table",
+      "definition_sql": null,
+      "storage_path": "cluster-catalog.managed/my_database__public__customers.table.parquet",
+      "external_format": null,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "Int32",
+          "nullable": true,
+          "default_value": null
+        },
+        {
+          "name": "first_name",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "last_name",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "email",
+          "data_type": "Utf8",
+          "nullable": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "data_type": "Utf8",
+          "nullable": true,
+          "default_value": null
+        },
+        {
+          "name": "_row_id",
+          "data_type": "Utf8",
+          "nullable": true,
+          "default_value": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "auto_constraint",
+          "kind": "PrimaryKey",
+          "columns": [
+            "id"
+          ],
+          "referenced_database": null,
+          "referenced_schema": null,
+          "referenced_table": null,
+          "referenced_columns": []
+        }
+      ],
+      "indexes": [
+        {
+          "name": "customers_id_idx",
+          "columns": [
+            "id"
+          ],
+          "is_unique": true,
+          "is_primary": true
+        }
+      ]
+    },
     "postgres.public.customers": {
       "database": "postgres",
       "schema": "public",
@@ -143,6 +197,40 @@
         }
       ],
       "indexes": []
+    },
+    "postgres.public.explain_idx_test": {
+      "database": "postgres",
+      "schema": "public",
+      "name": "explain_idx_test",
+      "kind": "Table",
+      "definition_sql": null,
+      "storage_path": "cluster-catalog.managed/postgres__public__explain_idx_test.table.parquet",
+      "external_format": null,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "Int32",
+          "nullable": true,
+          "default_value": null
+        },
+        {
+          "name": "_row_id",
+          "data_type": "Utf8",
+          "nullable": true,
+          "default_value": null
+        }
+      ],
+      "constraints": [],
+      "indexes": [
+        {
+          "name": "explain_idx",
+          "columns": [
+            "id"
+          ],
+          "is_unique": false,
+          "is_primary": false
+        }
+      ]
     },
     "postgres.public.orders": {
       "database": "postgres",
@@ -220,6 +308,6 @@
     "catalog_path": "analyticsdb-catalog.json",
     "tls_cert_path": "certs/server.crt",
     "tls_key_path": "certs/server.key",
-    "next_available_port_offset": 51
+    "next_available_port_offset": 60
   }
 }

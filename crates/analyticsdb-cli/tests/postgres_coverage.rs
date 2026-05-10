@@ -449,6 +449,298 @@ async fn test_alter_database_and_shims_coverage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_alter_table() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. Setup table
+    run_sql(
+        &endpoint,
+        "CREATE TABLE alter_test (id INT PRIMARY KEY, name TEXT)",
+    );
+    run_sql(&endpoint, "INSERT INTO alter_test VALUES (1, 'initial')");
+
+    // 2. ALTER TABLE alter_test ADD COLUMN age INT DEFAULT 30
+    run_sql(&endpoint, "ALTER TABLE alter_test ADD COLUMN age INT DEFAULT 30");
+    let select_add = run_sql(&endpoint, "SELECT age FROM alter_test WHERE id = 1");
+    if !select_add.contains("30") {
+        panic!("SELECT age output does not contain 30. Output:\n{}", select_add);
+    }
+
+    // 3. ALTER TABLE RENAME COLUMN
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test RENAME COLUMN name TO full_name",
+    );
+    let select_rename_col = run_sql(&endpoint, "SELECT full_name FROM alter_test WHERE id = 1");
+    assert!(select_rename_col.contains("initial"));
+
+    // 4. ALTER TABLE ALTER COLUMN TYPE
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ALTER COLUMN full_name TYPE VARCHAR(100)",
+    );
+    // (Type change is mostly metadata in the prototype but we verify it doesn't fail)
+
+    // 5. ALTER TABLE ALTER COLUMN SET/DROP NOT NULL
+    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age SET NOT NULL");
+    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age DROP NOT NULL");
+
+    // 6. ALTER TABLE ALTER COLUMN SET/DROP DEFAULT
+    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age SET DEFAULT 40");
+    run_sql(&endpoint, "INSERT INTO alter_test (id, full_name) VALUES (2, 'second')");
+    let select_default = run_sql(&endpoint, "SELECT age FROM alter_test WHERE id = 2");
+    assert!(select_default.contains("40"));
+    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age DROP DEFAULT");
+
+    // 7. ALTER TABLE ADD/DROP CONSTRAINT
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ADD CONSTRAINT unique_id UNIQUE (id)",
+    );
+    run_sql(&endpoint, "ALTER TABLE alter_test DROP CONSTRAINT unique_id");
+
+    // 8. ALTER TABLE alter_test RENAME TO table_renamed
+    run_sql(&endpoint, "ALTER TABLE alter_test RENAME TO table_renamed");
+    let show_tables = run_sql(&endpoint, "SHOW TABLES");
+    assert!(show_tables.contains("table_renamed"));
+    assert!(!show_tables.contains("alter_test"));
+
+    // 9. ALTER TABLE table_renamed DROP COLUMN age
+    run_sql(&endpoint, "ALTER TABLE table_renamed DROP COLUMN age");
+    let select_drop = run_sql_failure(&endpoint, "SELECT age FROM table_renamed");
+    if !select_drop.contains("not found") && !select_drop.contains("column") && !select_drop.contains("Schema error") {
+        panic!("SELECT age should have failed with a clear error. Actual output:\n{}", select_drop);
+    }
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_alter_index() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    run_sql(&endpoint, "CREATE TABLE idx_test (id INT, val TEXT)");
+    run_sql(&endpoint, "CREATE INDEX my_idx ON idx_test (val)");
+
+    // Test ALTER INDEX RENAME TO
+    let alter = run_sql(&endpoint, "ALTER INDEX my_idx RENAME TO renamed_idx");
+    assert!(alter.contains("Command completed"));
+
+    // Verify rename via REINDEX (should work with new name)
+    let reindex = run_sql(&endpoint, "REINDEX INDEX renamed_idx");
+    assert!(reindex.contains("Command completed"));
+
+    // Old name should fail
+    let reindex_fail = run_sql_failure(&endpoint, "REINDEX INDEX my_idx");
+    assert!(reindex_fail.contains("not found"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_alter_schema() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    run_sql(&endpoint, "CREATE SCHEMA s1");
+    run_sql(&endpoint, "CREATE TABLE s1.t1 (id INT)");
+
+    // Test ALTER SCHEMA RENAME TO
+    let alter = run_sql(&endpoint, "ALTER SCHEMA s1 RENAME TO s2");
+    assert!(alter.contains("Command completed"));
+
+    let show_schemas = run_sql(&endpoint, "SHOW SCHEMAS");
+    assert!(show_schemas.contains("s2"));
+    assert!(!show_schemas.contains("s1"));
+
+    // Verify table moved
+    let show_tables = run_sql(&endpoint, "SHOW TABLES FROM s2");
+    assert!(show_tables.contains("t1"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_index() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    run_sql(&endpoint, "CREATE TABLE idx_test (id INT, val TEXT)");
+    run_sql(&endpoint, "INSERT INTO idx_test VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+    // 1. Simple index
+    run_sql(&endpoint, "CREATE INDEX simple_idx ON idx_test (val)");
+    let select_simple = run_sql(&endpoint, "SELECT id FROM idx_test WHERE val = 'b'");
+    assert!(select_simple.contains("2"));
+    // (We can't easily verify 'using index' via postgres wire yet without EXPLAIN ANALYZE)
+
+    // 2. Multi-column index
+    run_sql(&endpoint, "CREATE INDEX multi_idx ON idx_test (id, val)");
+    let select_multi = run_sql(&endpoint, "SELECT id FROM idx_test WHERE id = 3 AND val = 'c'");
+    assert!(select_multi.contains("3"));
+
+    // 3. Unique index
+    run_sql(&endpoint, "CREATE UNIQUE INDEX unique_idx ON idx_test (id)");
+    let insert_fail = run_sql_failure(&endpoint, "INSERT INTO idx_test VALUES (1, 'dup')");
+    assert!(insert_fail.contains("unique") || insert_fail.contains("violation") || insert_fail.contains("exists"));
+
+    // 4. Index on missing table
+    let create_fail = run_sql_failure(&endpoint, "CREATE INDEX missing_idx ON missing_table (col)");
+    assert!(create_fail.contains("not found"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_index() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    run_sql(&endpoint, "CREATE TABLE drop_idx_test (id INT, val TEXT)");
+    run_sql(&endpoint, "CREATE INDEX to_drop_idx ON drop_idx_test (val)");
+
+    // Verify index exists (via REINDEX)
+    run_sql(&endpoint, "REINDEX INDEX to_drop_idx");
+
+    // 1. DROP INDEX
+    run_sql(&endpoint, "DROP INDEX to_drop_idx");
+
+    // Verify index is gone
+    let reindex_fail = run_sql_failure(&endpoint, "REINDEX INDEX to_drop_idx");
+    assert!(reindex_fail.contains("not found"));
+
+    // 2. DROP INDEX IF EXISTS
+    run_sql(&endpoint, "DROP INDEX IF EXISTS to_drop_idx"); // Should not fail
+
+    // 4. Try to drop a constraint-backed index (should fail or be protected)
+    run_sql(&endpoint, "CREATE TABLE const_test (id INT PRIMARY KEY)");
+    let drop_const_fail = run_sql_failure(&endpoint, "DROP INDEX const_test_id_idx");
+    assert!(drop_const_fail.contains("constraint") || drop_const_fail.contains("protected") || drop_const_fail.contains("primary key"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_user_management() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. CREATE USER
+    run_sql(&endpoint, "CREATE USER alice PASSWORD 'secret'");
+    
+    // 2. ALTER USER (Password rotation)
+    run_sql(&endpoint, "ALTER USER alice PASSWORD 'new_secret'");
+
+    // 3. DROP USER
+    run_sql(&endpoint, "DROP USER alice");
+
+    // 4. DROP USER IF EXISTS
+    run_sql(&endpoint, "DROP USER IF EXISTS alice");
+
+    // 5. CREATE USER without password
+    run_sql(&endpoint, "CREATE USER bob");
+    run_sql(&endpoint, "DROP USER bob");
+
+    // 6. Errors
+    let create_fail = run_sql_failure(&endpoint, "CREATE USER postgres");
+    assert!(create_fail.contains("already exists"));
+
+    let drop_fail = run_sql_failure(&endpoint, "DROP USER missing_user");
+    assert!(drop_fail.contains("not found"));
+
+    let drop_postgres_fail = run_sql_failure(&endpoint, "DROP USER postgres");
+    assert!(drop_postgres_fail.contains("internal user"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_projection_collisions() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. Duplicate identical expressions (db.oid)
+    let sql = "SELECT db.oid, db.oid FROM pg_catalog.pg_database db LIMIT 1";
+    let res = run_sql(&endpoint, sql);
+    // Should have unique names in header (oid, oid_1)
+    assert!(res.contains("oid") && res.contains("oid_1"));
+
+    // 2. Wildcard expansion with overlapping names
+    // This query will expand to many columns, including multiple 'oid's
+    let sql_wildcard = "SELECT db.*, ns.* FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
+    let res_wildcard = run_sql(&endpoint, sql_wildcard);
+    // Should not fail planning
+    assert!(res_wildcard.contains("datname"));
+    assert!(res_wildcard.contains("nspname"));
+
+    // 3. Duplicate unnamed expressions
+    let sql_dup = "SELECT count(*), count(*) FROM idx_test";
+    run_sql(&endpoint, "CREATE TABLE idx_test (id INT)");
+    let res_dup = run_sql(&endpoint, sql_dup);
+    assert!(res_dup.contains("count(*)"));
+
+    // 4. Wildcard expansion with explicit column collision (e.g., SELECT *, oid)
+    let sql_wc_coll = "SELECT *, oid FROM pg_catalog.pg_database LIMIT 1";
+    let res_wc_coll = run_sql(&endpoint, sql_wc_coll);
+    assert!(res_wc_coll.contains("oid"));
+    assert!(res_wc_coll.contains("oid_1"));
+
+    // 5. Join with same column names (oid) from different tables
+    let sql_join = "SELECT db.oid, ns.oid FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
+    let res_join = run_sql(&endpoint, sql_join);
+    // Should have unique names in header (oid, oid_1)
+    assert!(res_join.contains("oid"));
+    assert!(res_join.contains("oid_1"));
+    
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_group_management() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. CREATE GROUP
+    run_sql(&endpoint, "CREATE GROUP analytics_team");
+
+    // 2. ALTER GROUP ADD USER
+    run_sql(&endpoint, "CREATE USER carol PASSWORD 'p1'");
+    run_sql(&endpoint, "ALTER GROUP analytics_team ADD USER carol");
+
+    // 3. Verify membership (via pg_catalog.pg_user)
+    // Actually, membership is in pg_auth_members usually.
+    // For prototype, we verify it doesn't fail and we can drop user.
+
+    // 4. ALTER GROUP DROP USER
+    run_sql(&endpoint, "ALTER GROUP analytics_team DROP USER carol");
+
+    // 4.1 ALTER GROUP RENAME TO
+    run_sql(&endpoint, "ALTER GROUP analytics_team RENAME TO analytics_group");
+    let show_roles = run_sql(&endpoint, "SELECT rolname FROM pg_catalog.pg_roles");
+    assert!(show_roles.contains("analytics_group"));
+    assert!(!show_roles.contains("analytics_team"));
+
+    // 5. DROP GROUP
+    run_sql(&endpoint, "DROP GROUP analytics_group");
+
+    // 6. Errors
+    let create_fail = run_sql_failure(&endpoint, "CREATE GROUP postgres");
+    assert!(create_fail.contains("already exists"));
+
+    let drop_fail = run_sql_failure(&endpoint, "DROP GROUP missing_group");
+    assert!(drop_fail.contains("not found"));
+
+    run_sql(&endpoint, "CREATE GROUP non_empty");
+    run_sql(&endpoint, "ALTER GROUP non_empty ADD USER carol");
+    let drop_non_empty_fail = run_sql_failure(&endpoint, "DROP GROUP non_empty");
+    assert!(drop_non_empty_fail.contains("not empty"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_reindex() {
     let catalog_path = temp_catalog_path();
     let (_server, endpoint) = start_postgres_server(&catalog_path).await;

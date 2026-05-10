@@ -18,7 +18,10 @@ pub async fn rewrite_sql_for_postgres_compatibility(
     session: &SessionContext,
 ) -> Result<String> {
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, sql)?;
+    let mut statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(sql.to_string()),
+    };
 
     for stmt in statements.iter_mut() {
         rewrite_statement_recursive(stmt, control_plane, session).await?;
@@ -69,12 +72,20 @@ fn rewrite_query_recursive<'a>(
         if let Some(order_by) = &mut query.order_by {
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind {
                 for order_by_expr in exprs {
-                    rewrite_expr_recursive(&mut order_by_expr.expr, control_plane, session).await?;
+                    let dummy_schemas = HashMap::new();
+                    rewrite_expr_recursive(
+                        &mut order_by_expr.expr,
+                        control_plane,
+                        session,
+                        &dummy_schemas,
+                    )
+                    .await?;
                 }
             }
         }
 
         if let Some(limit_clause) = &mut query.limit_clause {
+            let dummy_schemas = HashMap::new();
             match limit_clause {
                 sqlparser::ast::LimitClause::LimitOffset {
                     limit,
@@ -82,19 +93,25 @@ fn rewrite_query_recursive<'a>(
                     limit_by,
                 } => {
                     if let Some(limit_expr) = limit {
-                        rewrite_expr_recursive(limit_expr, control_plane, session).await?;
-                    }
-                    if let Some(offset_struct) = offset {
-                        rewrite_expr_recursive(&mut offset_struct.value, control_plane, session)
+                        rewrite_expr_recursive(limit_expr, control_plane, session, &dummy_schemas)
                             .await?;
                     }
+                    if let Some(offset_struct) = offset {
+                        rewrite_expr_recursive(
+                            &mut offset_struct.value,
+                            control_plane,
+                            session,
+                            &dummy_schemas,
+                        )
+                        .await?;
+                    }
                     for e in limit_by {
-                        rewrite_expr_recursive(e, control_plane, session).await?;
+                        rewrite_expr_recursive(e, control_plane, session, &dummy_schemas).await?;
                     }
                 }
                 sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                    rewrite_expr_recursive(offset, control_plane, session).await?;
-                    rewrite_expr_recursive(limit, control_plane, session).await?;
+                    rewrite_expr_recursive(offset, control_plane, session, &dummy_schemas).await?;
+                    rewrite_expr_recursive(limit, control_plane, session, &dummy_schemas).await?;
                 }
             }
         }
@@ -130,7 +147,6 @@ fn rewrite_select_recursive<'a>(
     session: &'a SessionContext,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        // 1. Resolve table aliases and schemas in FROM clause
         let mut table_schemas = HashMap::new();
         for table_with_joins in select.from.iter_mut() {
             resolve_table_schemas_recursive(
@@ -155,7 +171,8 @@ fn rewrite_select_recursive<'a>(
                     | sqlparser::ast::JoinOperator::RightOuter(constraint)
                     | sqlparser::ast::JoinOperator::FullOuter(constraint) => {
                         if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
-                            rewrite_expr_recursive(expr, control_plane, session).await?;
+                            rewrite_expr_recursive(expr, control_plane, session, &table_schemas)
+                                .await?;
                         }
                     }
                     _ => {}
@@ -163,18 +180,32 @@ fn rewrite_select_recursive<'a>(
             }
         }
 
-        // 2. Expand wildcards and collect initial projection names
         let mut new_projection = Vec::new();
         for item in select.projection.iter() {
             match item {
                 SelectItem::Wildcard(_) => {
-                    // Expand all tables
-                    for (_alias, columns) in table_schemas.iter() {
-                        for col in columns {
+                    for (alias, columns) in table_schemas.iter() {
+                        for (col, default_val) in columns {
                             if col != "_row_id" {
-                                new_projection.push(SelectItem::UnnamedExpr(Expr::Identifier(
-                                    Ident::new(col.clone()),
-                                )));
+                                let ident_expr = if table_schemas.len() > 1 {
+                                    Expr::CompoundIdentifier(vec![
+                                        Ident::new(alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])
+                                } else {
+                                    Expr::Identifier(Ident::new(col.clone()))
+                                };
+
+                                let expr = if let Some(dv) = default_val {
+                                    wrap_with_coalesce(ident_expr, dv)
+                                } else {
+                                    ident_expr
+                                };
+
+                                new_projection.push(SelectItem::ExprWithAlias {
+                                    expr,
+                                    alias: Ident::new(col.clone()),
+                                });
                             }
                         }
                     }
@@ -193,14 +224,23 @@ fn rewrite_select_recursive<'a>(
                     };
 
                     if let Some(columns) = table_schemas.get(&alias) {
-                        for col in columns {
+                        for (col, default_val) in columns {
                             if col != "_row_id" {
-                                new_projection.push(SelectItem::UnnamedExpr(
-                                    Expr::CompoundIdentifier(vec![
-                                        Ident::new(alias.clone()),
-                                        Ident::new(col.clone()),
-                                    ]),
-                                ));
+                                let ident_expr = Expr::CompoundIdentifier(vec![
+                                    Ident::new(alias.clone()),
+                                    Ident::new(col.clone()),
+                                ]);
+
+                                let expr = if let Some(dv) = default_val {
+                                    wrap_with_coalesce(ident_expr, dv)
+                                } else {
+                                    ident_expr
+                                };
+
+                                new_projection.push(SelectItem::ExprWithAlias {
+                                    expr,
+                                    alias: Ident::new(col.clone()),
+                                });
                             }
                         }
                     } else {
@@ -212,56 +252,66 @@ fn rewrite_select_recursive<'a>(
         }
         select.projection = new_projection;
 
-        // 3. De-duplicate names by aliasing and rewrite expressions
         let mut seen_names = HashSet::new();
         for item in select.projection.iter_mut() {
-            let (current_name, is_unnamed) = match item {
-                SelectItem::UnnamedExpr(expr) => (get_canonical_name(expr), true),
-                SelectItem::ExprWithAlias { alias, .. } => (alias.value.clone(), false),
+            // 1. Rewrite and potentially alias if rewritten
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    let original_name = get_canonical_name(expr);
+                    let old_expr_str = expr.to_string();
+                    rewrite_expr_recursive(expr, control_plane, session, &table_schemas).await?;
+                    if expr.to_string() != old_expr_str {
+                        *item = SelectItem::ExprWithAlias {
+                            expr: expr.clone(),
+                            alias: Ident::new(original_name),
+                        };
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    rewrite_expr_recursive(expr, control_plane, session, &table_schemas).await?;
+                }
+                _ => {}
+            }
+
+            // 2. Determine current name and uniquely alias if needed
+            let current_name = match item {
+                SelectItem::UnnamedExpr(expr) => get_canonical_name(expr),
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                 _ => continue,
             };
 
-            if seen_names.contains(&current_name) && is_unnamed {
-                let alias_name = make_unique_alias(&current_name, &seen_names);
+            if seen_names.contains(&current_name) {
+                let unique_name = make_unique_alias(&current_name, &seen_names);
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         *item = SelectItem::ExprWithAlias {
                             expr: expr.clone(),
-                            alias: Ident::new(alias_name.clone()),
+                            alias: Ident::new(unique_name.clone()),
                         };
+                    }
+                    SelectItem::ExprWithAlias { alias, .. } => {
+                        *alias = Ident::new(unique_name.clone());
                     }
                     _ => unreachable!(),
                 }
-                seen_names.insert(alias_name);
+                seen_names.insert(unique_name);
             } else {
                 seen_names.insert(current_name);
             }
-
-            // Recurse into expressions
-            match item {
-                SelectItem::UnnamedExpr(expr) => {
-                    rewrite_expr_recursive(expr, control_plane, session).await?
-                }
-                SelectItem::ExprWithAlias { expr, .. } => {
-                    rewrite_expr_recursive(expr, control_plane, session).await?
-                }
-                _ => {}
-            }
         }
 
-        // 4. Process WHERE, GROUP BY, HAVING clause
         if let Some(selection) = &mut select.selection {
-            rewrite_expr_recursive(selection, control_plane, session).await?;
+            rewrite_expr_recursive(selection, control_plane, session, &table_schemas).await?;
         }
 
         if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
             for expr in exprs {
-                rewrite_expr_recursive(expr, control_plane, session).await?;
+                rewrite_expr_recursive(expr, control_plane, session, &table_schemas).await?;
             }
         }
 
         if let Some(having) = &mut select.having {
-            rewrite_expr_recursive(having, control_plane, session).await?;
+            rewrite_expr_recursive(having, control_plane, session, &table_schemas).await?;
         }
 
         Ok(())
@@ -272,7 +322,7 @@ fn resolve_table_schemas_recursive<'a>(
     tf: &'a mut TableFactor,
     control_plane: &'a ControlPlane,
     session: &'a SessionContext,
-    schemas: &'a mut HashMap<String, Vec<String>>,
+    schemas: &'a mut HashMap<String, Vec<(String, Option<String>)>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         match tf {
@@ -293,11 +343,9 @@ fn resolve_table_schemas_recursive<'a>(
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| idents.last().cloned().unwrap_or_default());
 
-                // Standard PostgreSQL system catalog schemas for JDBC parity
                 let matched_pg_catalog = match idents.as_slice() {
                     [s, n] if s == "pg_catalog" => Some(n.as_str()),
                     [n] if n.starts_with("pg_") => {
-                        // Qualify unqualified pg_ tables to pg_catalog for DataFusion
                         *name = sqlparser::ast::ObjectName(vec![
                             ObjectNamePart::Identifier(Ident::new("pg_catalog")),
                             ObjectNamePart::Identifier(Ident::new(n.clone())),
@@ -313,20 +361,20 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "datname".to_string(),
-                                    "datdba".to_string(),
-                                    "encoding".to_string(),
-                                    "datcollate".to_string(),
-                                    "datctype".to_string(),
-                                    "datistemplate".to_string(),
-                                    "datallowconn".to_string(),
-                                    "datconnlimit".to_string(),
-                                    "datlastsysoid".to_string(),
-                                    "datfrozenxid".to_string(),
-                                    "datminmxid".to_string(),
-                                    "dattablespace".to_string(),
-                                    "datacl".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("datname".to_string(), None),
+                                    ("datdba".to_string(), None),
+                                    ("encoding".to_string(), None),
+                                    ("datcollate".to_string(), None),
+                                    ("datctype".to_string(), None),
+                                    ("datistemplate".to_string(), None),
+                                    ("datallowconn".to_string(), None),
+                                    ("datconnlimit".to_string(), None),
+                                    ("datlastsysoid".to_string(), None),
+                                    ("datfrozenxid".to_string(), None),
+                                    ("datminmxid".to_string(), None),
+                                    ("dattablespace".to_string(), None),
+                                    ("datacl".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -335,10 +383,10 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "nspname".to_string(),
-                                    "nspowner".to_string(),
-                                    "nspacl".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("nspname".to_string(), None),
+                                    ("nspowner".to_string(), None),
+                                    ("nspacl".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -347,14 +395,14 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "schemaname".to_string(),
-                                    "tablename".to_string(),
-                                    "tableowner".to_string(),
-                                    "tablespace".to_string(),
-                                    "hasindexes".to_string(),
-                                    "hasrules".to_string(),
-                                    "hastriggers".to_string(),
-                                    "rowsecurity".to_string(),
+                                    ("schemaname".to_string(), None),
+                                    ("tablename".to_string(), None),
+                                    ("tableowner".to_string(), None),
+                                    ("tablespace".to_string(), None),
+                                    ("hasindexes".to_string(), None),
+                                    ("hasrules".to_string(), None),
+                                    ("hastriggers".to_string(), None),
+                                    ("rowsecurity".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -363,10 +411,10 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "schemaname".to_string(),
-                                    "viewname".to_string(),
-                                    "viewowner".to_string(),
-                                    "definition".to_string(),
+                                    ("schemaname".to_string(), None),
+                                    ("viewname".to_string(), None),
+                                    ("viewowner".to_string(), None),
+                                    ("definition".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -375,18 +423,18 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "rolname".to_string(),
-                                    "rolsuper".to_string(),
-                                    "rolinherit".to_string(),
-                                    "rolcreaterole".to_string(),
-                                    "rolcreatedb".to_string(),
-                                    "rolcanlogin".to_string(),
-                                    "rolreplication".to_string(),
-                                    "rolbypassrls".to_string(),
-                                    "rolconnlimit".to_string(),
-                                    "rolpassword".to_string(),
-                                    "rolvaliduntil".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("rolname".to_string(), None),
+                                    ("rolsuper".to_string(), None),
+                                    ("rolinherit".to_string(), None),
+                                    ("rolcreaterole".to_string(), None),
+                                    ("rolcreatedb".to_string(), None),
+                                    ("rolcanlogin".to_string(), None),
+                                    ("rolreplication".to_string(), None),
+                                    ("rolbypassrls".to_string(), None),
+                                    ("rolconnlimit".to_string(), None),
+                                    ("rolpassword".to_string(), None),
+                                    ("rolvaliduntil".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -395,25 +443,25 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "typname".to_string(),
-                                    "typnamespace".to_string(),
-                                    "typowner".to_string(),
-                                    "typlen".to_string(),
-                                    "typbyval".to_string(),
-                                    "typtype".to_string(),
-                                    "typcategory".to_string(),
-                                    "typispreferred".to_string(),
-                                    "typisdefined".to_string(),
-                                    "typdelim".to_string(),
-                                    "typrelid".to_string(),
-                                    "typelem".to_string(),
-                                    "typarray".to_string(),
-                                    "typinput".to_string(),
-                                    "typbasetype".to_string(),
-                                    "typtypmod".to_string(),
-                                    "typndims".to_string(),
-                                    "typcollation".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("typname".to_string(), None),
+                                    ("typnamespace".to_string(), None),
+                                    ("typowner".to_string(), None),
+                                    ("typlen".to_string(), None),
+                                    ("typbyval".to_string(), None),
+                                    ("typtype".to_string(), None),
+                                    ("typcategory".to_string(), None),
+                                    ("typispreferred".to_string(), None),
+                                    ("typisdefined".to_string(), None),
+                                    ("typdelim".to_string(), None),
+                                    ("typrelid".to_string(), None),
+                                    ("typelem".to_string(), None),
+                                    ("typarray".to_string(), None),
+                                    ("typinput".to_string(), None),
+                                    ("typbasetype".to_string(), None),
+                                    ("typtypmod".to_string(), None),
+                                    ("typndims".to_string(), None),
+                                    ("typcollation".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -422,37 +470,37 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "relname".to_string(),
-                                    "relnamespace".to_string(),
-                                    "reltype".to_string(),
-                                    "reloftype".to_string(),
-                                    "relowner".to_string(),
-                                    "relam".to_string(),
-                                    "relfilenode".to_string(),
-                                    "reltablespace".to_string(),
-                                    "relpages".to_string(),
-                                    "reltuples".to_string(),
-                                    "relallvisible".to_string(),
-                                    "reltoastrelid".to_string(),
-                                    "relhasindex".to_string(),
-                                    "relisshared".to_string(),
-                                    "relpersistence".to_string(),
-                                    "relkind".to_string(),
-                                    "relnatts".to_string(),
-                                    "relchecks".to_string(),
-                                    "relhasrules".to_string(),
-                                    "relhastriggers".to_string(),
-                                    "relhassubclass".to_string(),
-                                    "relrowsecurity".to_string(),
-                                    "relforcerowsecurity".to_string(),
-                                    "relispartition".to_string(),
-                                    "relrewrite".to_string(),
-                                    "relfrozenxid".to_string(),
-                                    "relminmxid".to_string(),
-                                    "relacl".to_string(),
-                                    "reloptions".to_string(),
-                                    "relpartbound".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("relname".to_string(), None),
+                                    ("relnamespace".to_string(), None),
+                                    ("reltype".to_string(), None),
+                                    ("reloftype".to_string(), None),
+                                    ("relowner".to_string(), None),
+                                    ("relam".to_string(), None),
+                                    ("relfilenode".to_string(), None),
+                                    ("reltablespace".to_string(), None),
+                                    ("relpages".to_string(), None),
+                                    ("reltuples".to_string(), None),
+                                    ("relallvisible".to_string(), None),
+                                    ("reltoastrelid".to_string(), None),
+                                    ("relhasindex".to_string(), None),
+                                    ("relisshared".to_string(), None),
+                                    ("relpersistence".to_string(), None),
+                                    ("relkind".to_string(), None),
+                                    ("relnatts".to_string(), None),
+                                    ("relchecks".to_string(), None),
+                                    ("relhasrules".to_string(), None),
+                                    ("relhastriggers".to_string(), None),
+                                    ("relhassubclass".to_string(), None),
+                                    ("relrowsecurity".to_string(), None),
+                                    ("relforcerowsecurity".to_string(), None),
+                                    ("relispartition".to_string(), None),
+                                    ("relrewrite".to_string(), None),
+                                    ("relfrozenxid".to_string(), None),
+                                    ("relminmxid".to_string(), None),
+                                    ("relacl".to_string(), None),
+                                    ("reloptions".to_string(), None),
+                                    ("relpartbound".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -461,20 +509,20 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "attrelid".to_string(),
-                                    "attname".to_string(),
-                                    "atttypid".to_string(),
-                                    "attnum".to_string(),
-                                    "attnotnull".to_string(),
-                                    "atttypmod".to_string(),
-                                    "attndims".to_string(),
-                                    "atthasdef".to_string(),
-                                    "attidentity".to_string(),
-                                    "attgenerated".to_string(),
-                                    "attisdropped".to_string(),
-                                    "attislocal".to_string(),
-                                    "attinhcount".to_string(),
-                                    "attcollation".to_string(),
+                                    ("attrelid".to_string(), None),
+                                    ("attname".to_string(), None),
+                                    ("atttypid".to_string(), None),
+                                    ("attnum".to_string(), None),
+                                    ("attnotnull".to_string(), None),
+                                    ("atttypmod".to_string(), None),
+                                    ("attndims".to_string(), None),
+                                    ("atthasdef".to_string(), None),
+                                    ("attidentity".to_string(), None),
+                                    ("attgenerated".to_string(), None),
+                                    ("attisdropped".to_string(), None),
+                                    ("attislocal".to_string(), None),
+                                    ("attinhcount".to_string(), None),
+                                    ("attcollation".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -483,10 +531,10 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "objoid".to_string(),
-                                    "classoid".to_string(),
-                                    "objsubid".to_string(),
-                                    "description".to_string(),
+                                    ("objoid".to_string(), None),
+                                    ("classoid".to_string(), None),
+                                    ("objsubid".to_string(), None),
+                                    ("description".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -495,10 +543,10 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "adrelid".to_string(),
-                                    "adnum".to_string(),
-                                    "adbin".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("adrelid".to_string(), None),
+                                    ("adnum".to_string(), None),
+                                    ("adbin".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -507,13 +555,13 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "classid".to_string(),
-                                    "objid".to_string(),
-                                    "objsubid".to_string(),
-                                    "refclassid".to_string(),
-                                    "refobjid".to_string(),
-                                    "refobjsubid".to_string(),
-                                    "deptype".to_string(),
+                                    ("classid".to_string(), None),
+                                    ("objid".to_string(), None),
+                                    ("objsubid".to_string(), None),
+                                    ("refclassid".to_string(), None),
+                                    ("refobjid".to_string(), None),
+                                    ("refobjsubid".to_string(), None),
+                                    ("deptype".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -522,25 +570,25 @@ fn resolve_table_schemas_recursive<'a>(
                             schemas.insert(
                                 effective_alias,
                                 vec![
-                                    "oid".to_string(),
-                                    "conname".to_string(),
-                                    "connamespace".to_string(),
-                                    "contype".to_string(),
-                                    "condeferrable".to_string(),
-                                    "condeferred".to_string(),
-                                    "convalidated".to_string(),
-                                    "conrelid".to_string(),
-                                    "contypid".to_string(),
-                                    "conindid".to_string(),
-                                    "confrelid".to_string(),
-                                    "confupdtype".to_string(),
-                                    "confdeltype".to_string(),
-                                    "confmatchtype".to_string(),
-                                    "conislocal".to_string(),
-                                    "coninhcount".to_string(),
-                                    "connoinherit".to_string(),
-                                    "conkey".to_string(),
-                                    "confkey".to_string(),
+                                    ("oid".to_string(), None),
+                                    ("conname".to_string(), None),
+                                    ("connamespace".to_string(), None),
+                                    ("contype".to_string(), None),
+                                    ("condeferrable".to_string(), None),
+                                    ("condeferred".to_string(), None),
+                                    ("convalidated".to_string(), None),
+                                    ("conrelid".to_string(), None),
+                                    ("contypid".to_string(), None),
+                                    ("conindid".to_string(), None),
+                                    ("confrelid".to_string(), None),
+                                    ("confupdtype".to_string(), None),
+                                    ("confdeltype".to_string(), None),
+                                    ("confmatchtype".to_string(), None),
+                                    ("conislocal".to_string(), None),
+                                    ("coninhcount".to_string(), None),
+                                    ("connoinherit".to_string(), None),
+                                    ("conkey".to_string(), None),
+                                    ("confkey".to_string(), None),
                                 ],
                             );
                             return Ok(());
@@ -549,7 +597,6 @@ fn resolve_table_schemas_recursive<'a>(
                     }
                 }
 
-                // Attempt to fetch columns from ControlPlane
                 let db_name = if idents.len() == 3 {
                     Some(idents[0].as_str())
                 } else {
@@ -566,12 +613,12 @@ fn resolve_table_schemas_recursive<'a>(
                     .find_relation(session, db_name, schema_name, table_name)
                     .await
                 {
-                    let col_names = relation
+                    let col_info = relation
                         .columns
                         .iter()
-                        .map(|c| c.name.clone())
+                        .map(|c| (c.name.clone(), c.default_value.clone()))
                         .collect::<Vec<_>>();
-                    schemas.insert(effective_alias.clone(), col_names);
+                    schemas.insert(effective_alias.clone(), col_info);
 
                     if relation.kind == analyticsdb_control::CatalogRelationKind::View {
                         let Some(definition_sql) = relation.definition_sql else {
@@ -613,21 +660,11 @@ fn resolve_table_schemas_recursive<'a>(
 }
 
 fn make_unique_alias(base: &str, seen: &HashSet<String>) -> String {
-    let base = base.split('.').next_back().unwrap_or(base);
-    let safe_base = if !base.is_empty()
-        && base
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_alphabetic() || c == '_')
-            .unwrap_or(false)
-    {
-        base.to_string()
-    } else {
-        format!(
-            "col_{}",
-            base.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-        )
-    };
+    let mut safe_base = base.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    
+    if safe_base.is_empty() || (!safe_base.chars().next().unwrap().is_ascii_alphabetic() && safe_base.chars().next().unwrap() != '_') {
+        safe_base = format!("col_{}", safe_base);
+    }
 
     let mut i = 1;
     let mut name = format!("{}_{}", safe_base, i);
@@ -642,6 +679,7 @@ fn rewrite_expr_recursive<'a>(
     expr: &'a mut Expr,
     control_plane: &'a ControlPlane,
     session: &'a SessionContext,
+    table_schemas: &'a HashMap<String, Vec<(String, Option<String>)>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
@@ -654,7 +692,7 @@ fn rewrite_expr_recursive<'a>(
                 subquery,
                 ..
             } => {
-                rewrite_expr_recursive(inner, control_plane, session).await?;
+                rewrite_expr_recursive(inner, control_plane, session, table_schemas).await?;
                 rewrite_query_recursive(subquery, control_plane, session).await?;
             }
             Expr::Cast {
@@ -662,11 +700,9 @@ fn rewrite_expr_recursive<'a>(
                 data_type,
                 ..
             } => {
-                rewrite_expr_recursive(inner, control_plane, session).await?;
+                rewrite_expr_recursive(inner, control_plane, session, table_schemas).await?;
                 let type_name = data_type.to_string().to_uppercase();
                 if type_name == "REGCLASS" {
-                    // JDBC often uses 'table_name'::regclass. We rewrite to OID.
-                    // If the inner is a string literal, we can hash it and REPLACE the whole cast.
                     match inner.as_mut() {
                         Expr::Value(v) => match &mut v.value {
                             sqlparser::ast::Value::SingleQuotedString(s) => {
@@ -681,17 +717,35 @@ fn rewrite_expr_recursive<'a>(
                             }
                         },
                         _ => {
-                            // General fallback to TEXT if we can't OID it
                             *data_type = sqlparser::ast::DataType::Text;
                         }
                     }
                 }
             }
-            Expr::Identifier(_) => {}
-            Expr::CompoundIdentifier(_) => {}
+            Expr::Identifier(ident) => {
+                let col_name = ident.value.clone();
+                for columns in table_schemas.values() {
+                    if let Some((_, Some(default_val))) = columns.iter().find(|(c, _)| c == &col_name) {
+                        *expr = wrap_with_coalesce(expr.clone(), default_val);
+                        return Ok(());
+                    }
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if parts.len() >= 2 {
+                    let alias = parts[parts.len() - 2].to_string();
+                    let col_name = parts.last().unwrap().to_string();
+                    if let Some(columns) = table_schemas.get(&alias) {
+                        if let Some((_, Some(default_val))) = columns.iter().find(|(c, _)| c == &col_name) {
+                            *expr = wrap_with_coalesce(expr.clone(), default_val);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             Expr::BinaryOp { left, op, right } => {
-                rewrite_expr_recursive(left, control_plane, session).await?;
-                rewrite_expr_recursive(right, control_plane, session).await?;
+                rewrite_expr_recursive(left, control_plane, session, table_schemas).await?;
+                rewrite_expr_recursive(right, control_plane, session, table_schemas).await?;
 
                 if let sqlparser::ast::BinaryOperator::Multiply = op {
                     let left_is_interval = matches!(**left, Expr::Interval(_));
@@ -769,13 +823,12 @@ fn rewrite_expr_recursive<'a>(
                 }
             }
             Expr::UnaryOp { expr: inner, .. } => {
-                rewrite_expr_recursive(inner, control_plane, session).await?;
+                rewrite_expr_recursive(inner, control_plane, session, table_schemas).await?;
             }
             Expr::Nested(inner) => {
-                rewrite_expr_recursive(inner, control_plane, session).await?;
+                rewrite_expr_recursive(inner, control_plane, session, table_schemas).await?;
             }
             Expr::Function(f) => {
-                // Strip pg_catalog. prefix from functions for easier resolution
                 if f.name.0.len() == 2 && f.name.0[0].to_string().to_lowercase() == "pg_catalog" {
                     f.name.0.remove(0);
                 }
@@ -784,13 +837,13 @@ fn rewrite_expr_recursive<'a>(
                     for arg in &mut arg_list.args {
                         match arg {
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                rewrite_expr_recursive(e, control_plane, session).await?;
+                                rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
                             }
                             FunctionArg::Named {
                                 arg: FunctionArgExpr::Expr(e),
                                 ..
                             } => {
-                                rewrite_expr_recursive(e, control_plane, session).await?;
+                                rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
                             }
                             _ => {}
                         }
@@ -800,9 +853,9 @@ fn rewrite_expr_recursive<'a>(
             Expr::InList {
                 expr: inner, list, ..
             } => {
-                rewrite_expr_recursive(inner, control_plane, session).await?;
+                rewrite_expr_recursive(inner, control_plane, session, table_schemas).await?;
                 for e in list {
-                    rewrite_expr_recursive(e, control_plane, session).await?;
+                    rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
                 }
             }
             Expr::Case {
@@ -812,15 +865,15 @@ fn rewrite_expr_recursive<'a>(
                 ..
             } => {
                 if let Some(o) = operand {
-                    rewrite_expr_recursive(o, control_plane, session).await?;
+                    rewrite_expr_recursive(o, control_plane, session, table_schemas).await?;
                 }
                 for condition in conditions {
-                    rewrite_expr_recursive(&mut condition.condition, control_plane, session)
+                    rewrite_expr_recursive(&mut condition.condition, control_plane, session, table_schemas)
                         .await?;
-                    rewrite_expr_recursive(&mut condition.result, control_plane, session).await?;
+                    rewrite_expr_recursive(&mut condition.result, control_plane, session, table_schemas).await?;
                 }
                 if let Some(e) = else_result {
-                    rewrite_expr_recursive(e, control_plane, session).await?;
+                    rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
                 }
             }
             _ => {}
@@ -829,23 +882,67 @@ fn rewrite_expr_recursive<'a>(
     })
 }
 
+fn wrap_with_coalesce(expr: Expr, default_val: &str) -> Expr {
+    let dialect = PostgreSqlDialect {};
+    let default_expr = Parser::parse_sql(&dialect, &format!("SELECT {}", default_val))
+        .ok()
+        .and_then(|mut stmts| {
+            if stmts.len() == 1 {
+                if let Statement::Query(q) = stmts.remove(0) {
+                    if let SetExpr::Select(s) = *q.body {
+                        if s.projection.len() == 1 {
+                            if let SelectItem::UnnamedExpr(e) = s.projection[0].clone() {
+                                return Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or(Expr::Value(
+            sqlparser::ast::Value::SingleQuotedString(default_val.to_string()).into(),
+        ));
+
+    Expr::Function(sqlparser::ast::Function {
+        name: sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+            Ident::new("COALESCE"),
+        )]),
+        uses_odbc_syntax: false,
+        parameters: sqlparser::ast::FunctionArguments::None,
+        args: sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+            args: vec![
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)),
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    default_expr,
+                )),
+            ],
+            duplicate_treatment: None,
+            clauses: Vec::new(),
+        }),
+        over: None,
+        filter: None,
+        null_treatment: None,
+        within_group: Vec::new(),
+    })
+}
+
 fn get_canonical_name(expr: &Expr) -> String {
-    match expr {
+    let name = match expr {
         Expr::Identifier(ident) => ident.value.clone(),
         Expr::CompoundIdentifier(parts) => parts
-            .iter()
+            .last()
             .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join("."),
+            .unwrap_or_else(|| expr.to_string()),
         _ => expr.to_string(),
-    }
+    };
+    name.to_lowercase()
 }
 
 fn synthetic_relation_oid_from_name(name: &str) -> u32 {
     let lower_name = name.to_lowercase();
     let parts: Vec<&str> = lower_name.split('.').collect();
 
-    // If unqualified and starts with pg_, assume postgres.pg_catalog
     let qualified_name = if parts.len() == 1 && parts[0].starts_with("pg_") {
         format!("postgres.pg_catalog.{}", parts[0])
     } else if parts.len() == 2 && parts[0].starts_with("pg_") {
