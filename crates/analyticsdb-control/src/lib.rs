@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7,10 +7,12 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
+
+use crate::catalog_store::CatalogStore;
 use uuid::Uuid;
 
+pub(crate) mod catalog_store;
 pub mod raft;
 pub mod raft_store;
 
@@ -193,6 +195,10 @@ pub enum TableConstraintDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterSnapshot {
     pub coordinator_node_id: String,
+    /// Monotonic version of the catalogue this snapshot reflects. Compute
+    /// nodes can compare against their cached value to skip a refetch.
+    #[serde(default)]
+    pub catalogue_version: u64,
     pub nodes: Vec<ClusterNode>,
     pub databases: Vec<CatalogDatabase>,
     pub users: Vec<CatalogUser>,
@@ -221,21 +227,26 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct CatalogState {
-    databases: BTreeMap<String, CatalogDatabase>,
-    users: BTreeMap<String, CatalogUser>,
-    nodes: BTreeMap<String, ClusterNode>,
-    relations: BTreeMap<String, CatalogRelation>,
+pub(crate) struct CatalogState {
+    pub(crate) databases: BTreeMap<String, CatalogDatabase>,
+    pub(crate) users: BTreeMap<String, CatalogUser>,
+    pub(crate) nodes: BTreeMap<String, ClusterNode>,
+    pub(crate) relations: BTreeMap<String, CatalogRelation>,
     #[serde(default)]
-    aggregates: BTreeMap<String, CatalogAggregate>,
+    pub(crate) aggregates: BTreeMap<String, CatalogAggregate>,
     #[serde(default)]
-    collations: BTreeMap<String, CatalogCollation>,
+    pub(crate) collations: BTreeMap<String, CatalogCollation>,
     #[serde(default)]
-    conversions: BTreeMap<String, CatalogConversion>,
+    pub(crate) conversions: BTreeMap<String, CatalogConversion>,
     #[serde(default)]
-    functions: BTreeMap<String, CatalogFunction>,
+    pub(crate) functions: BTreeMap<String, CatalogFunction>,
     #[serde(default)]
-    config: Option<ClusterConfig>,
+    pub(crate) config: Option<ClusterConfig>,
+    /// Monotonically increasing version of the catalogue. Bumped on every
+    /// successful persisted write. Compute nodes use this to detect that
+    /// their cached snapshot is stale.
+    #[serde(default)]
+    pub(crate) catalogue_version: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -573,11 +584,31 @@ pub enum MetadataStatement {
 
 pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.json";
 
+/// Ephemeral, in-memory liveness tracking for cluster nodes.
+///
+/// Keeping this separate from `CatalogState` ensures that frequent heartbeat
+/// traffic does not trigger catalogue persistence and does not contend with
+/// DDL writers on the catalogue write lock. After a control-plane restart this
+/// map starts empty: nodes prove they are alive by heartbeating again.
+#[derive(Debug, Clone, Default)]
+struct NodeLiveness {
+    status: NodeStatus,
+    last_heartbeat_at_epoch_ms: u128,
+}
+
 #[derive(Debug)]
 pub struct ControlPlane {
     coordinator_node_id: String,
     catalog_path: Option<PathBuf>,
     state: RwLock<CatalogState>,
+    liveness: RwLock<HashMap<String, NodeLiveness>>,
+    /// Latest-value channel that emits the catalogue version after every
+    /// persisted write. Subscribers (compute-node push notifier, in-process
+    /// caches) can `await` `changed()` to learn about new versions without
+    /// polling. Using `watch` rather than `broadcast` is intentional: receivers
+    /// only need the most recent version, so coalescing many rapid bumps into
+    /// one notification is the correct semantics.
+    version_tx: watch::Sender<u64>,
     next_round_robin_index: AtomicUsize,
 }
 
@@ -588,27 +619,65 @@ impl ControlPlane {
 
     pub async fn from_catalog_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let store = catalog_store::open_store(path)?;
         if path.exists() {
-            let raw = fs::read_to_string(path).await?;
-            let state: CatalogState = serde_json::from_str(&raw)?;
+            let state = store.load().await?;
             Ok(Self::from_state(Some(path.to_path_buf()), state))
         } else {
             let control_plane = Self::from_state(Some(path.to_path_buf()), bootstrap_state());
             control_plane.persist().await?;
-
             Ok(control_plane)
         }
     }
 
     fn from_state(catalog_path: Option<PathBuf>, state: CatalogState) -> Self {
         let coordinator_node_id = "control-1".to_string();
+        let (version_tx, _) = watch::channel(state.catalogue_version);
 
         Self {
             coordinator_node_id,
             catalog_path,
             state: RwLock::new(state),
+            liveness: RwLock::new(HashMap::new()),
+            version_tx,
             next_round_robin_index: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns the current persisted catalogue version. Compute nodes compare
+    /// this against their cached value to decide whether to refetch.
+    pub async fn catalogue_version(&self) -> u64 {
+        self.state.read().await.catalogue_version
+    }
+
+    /// Subscribe to catalogue version changes. Each `Receiver` observes only
+    /// the latest version; multiple bumps in quick succession may be coalesced
+    /// into one notification. This is the hook the server/engine layer should
+    /// use to push invalidations to compute nodes over the existing internal
+    /// transport (Arrow Flight / gRPC).
+    pub fn subscribe_catalogue_version(&self) -> watch::Receiver<u64> {
+        self.version_tx.subscribe()
+    }
+
+    /// Overlay ephemeral liveness onto a persisted node identity. Nodes that
+    /// have not heartbeated since the last control-plane restart are reported
+    /// as `Unavailable` regardless of the stale persisted timestamp.
+    fn apply_liveness(
+        node: &ClusterNode,
+        liveness: &HashMap<String, NodeLiveness>,
+    ) -> ClusterNode {
+        let mut out = node.clone();
+        match liveness.get(&node.id) {
+            Some(live) => {
+                out.status = live.status.clone();
+                out.last_heartbeat_at_epoch_ms = live.last_heartbeat_at_epoch_ms;
+            }
+            None => {
+                out.status = NodeStatus::Unavailable;
+                out.last_heartbeat_at_epoch_ms = 0;
+            }
+        }
+        out
     }
 
     pub async fn local_node(&self) -> Option<ClusterNode> {
@@ -686,10 +755,16 @@ impl ControlPlane {
 
     pub async fn cluster_snapshot(&self) -> ClusterSnapshot {
         let state = self.state.read().await;
+        let liveness = self.liveness.read().await;
 
         ClusterSnapshot {
             coordinator_node_id: self.coordinator_node_id.clone(),
-            nodes: state.nodes.values().cloned().collect(),
+            catalogue_version: state.catalogue_version,
+            nodes: state
+                .nodes
+                .values()
+                .map(|n| Self::apply_liveness(n, &liveness))
+                .collect(),
             databases: state.databases.values().cloned().collect(),
             users: state.users.values().cloned().collect(),
             relations: state.relations.values().cloned().collect(),
@@ -946,72 +1021,78 @@ impl ControlPlane {
         Ok((message, new_session))
     }
 
-    pub async fn register_node(&self, mut node: ClusterNode) -> Result<()> {
-        node.last_heartbeat_at_epoch_ms = current_epoch_millis();
+    pub async fn register_node(&self, node: ClusterNode) -> Result<()> {
+        let now = current_epoch_millis();
+        let node_id = node.id.clone();
         {
             let mut state = self.state.write().await;
-            state.nodes.insert(node.id.clone(), node);
+            state.nodes.insert(node_id.clone(), node);
+        }
+        {
+            let mut liveness = self.liveness.write().await;
+            liveness.insert(
+                node_id,
+                NodeLiveness {
+                    status: NodeStatus::Ready,
+                    last_heartbeat_at_epoch_ms: now,
+                },
+            );
         }
         self.persist().await?;
         Ok(())
     }
 
+    /// Records a heartbeat from `node_id`. This intentionally only mutates the
+    /// in-memory liveness map — it never acquires the catalogue write lock and
+    /// never triggers persistence. That removes the largest source of write
+    /// amplification on the catalogue file.
     pub async fn heartbeat(&self, node_id: &str) -> Result<()> {
+        // Verify the node is registered without holding a write lock.
         {
-            let mut state = self.state.write().await;
-            let node = state
-                .nodes
-                .get_mut(node_id)
-                .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", node_id))?;
-            node.last_heartbeat_at_epoch_ms = current_epoch_millis();
-            node.status = NodeStatus::Ready;
+            let state = self.state.read().await;
+            if !state.nodes.contains_key(node_id) {
+                bail!("Node '{}' not found", node_id);
+            }
         }
-        // Heartbeats don't necessarily need to be persisted every time for the prototype
-        // but we'll do it for now to keep it simple and consistent.
-        self.persist().await?;
+        let mut liveness = self.liveness.write().await;
+        liveness.insert(
+            node_id.to_string(),
+            NodeLiveness {
+                status: NodeStatus::Ready,
+                last_heartbeat_at_epoch_ms: current_epoch_millis(),
+            },
+        );
         Ok(())
     }
 
     pub async fn mark_node_unavailable(&self, node_id: &str) -> Result<()> {
-        let mut changed = false;
-        {
-            let mut state = self.state.write().await;
-            if let Some(node) = state.nodes.get_mut(node_id) {
-                if node.status != NodeStatus::Unavailable {
-                    node.status = NodeStatus::Unavailable;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.persist().await?;
-        }
+        let mut liveness = self.liveness.write().await;
+        let entry = liveness.entry(node_id.to_string()).or_default();
+        entry.status = NodeStatus::Unavailable;
         Ok(())
     }
 
     pub async fn prune_unhealthy_nodes(&self, threshold_ms: u128) -> Result<()> {
         let now = current_epoch_millis();
-        let mut changed = false;
-        {
-            let mut state = self.state.write().await;
-            for node in state.nodes.values_mut() {
-                if node.status == NodeStatus::Ready
-                    && now - node.last_heartbeat_at_epoch_ms > threshold_ms
-                {
-                    node.status = NodeStatus::Unavailable;
-                    changed = true;
-                }
+        let mut liveness = self.liveness.write().await;
+        for entry in liveness.values_mut() {
+            if entry.status == NodeStatus::Ready
+                && now.saturating_sub(entry.last_heartbeat_at_epoch_ms) > threshold_ms
+            {
+                entry.status = NodeStatus::Unavailable;
             }
-        }
-        if changed {
-            self.persist().await?;
         }
         Ok(())
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<ClusterNode>> {
         let state = self.state.read().await;
-        Ok(state.nodes.values().cloned().collect())
+        let liveness = self.liveness.read().await;
+        Ok(state
+            .nodes
+            .values()
+            .map(|n| Self::apply_liveness(n, &liveness))
+            .collect())
     }
 
     /// Removes all Compute nodes from the catalog.
@@ -1020,9 +1101,24 @@ impl ControlPlane {
     /// don't cause dispatch attempts to non-running workers.  Compute nodes
     /// re-register by calling `join_cluster` when they start.
     pub async fn clear_compute_nodes(&self) -> Result<()> {
-        {
+        let removed: Vec<String> = {
             let mut state = self.state.write().await;
-            state.nodes.retain(|_, n| n.role != NodeRole::Compute);
+            let to_remove: Vec<String> = state
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.role == NodeRole::Compute)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &to_remove {
+                state.nodes.remove(id);
+            }
+            to_remove
+        };
+        if !removed.is_empty() {
+            let mut liveness = self.liveness.write().await;
+            for id in &removed {
+                liveness.remove(id);
+            }
         }
         self.persist().await?;
         Ok(())
@@ -1096,6 +1192,17 @@ impl ControlPlane {
                 new_config,
             )
         };
+
+        {
+            let mut liveness = self.liveness.write().await;
+            liveness.insert(
+                node_id.clone(),
+                NodeLiveness {
+                    status: NodeStatus::Ready,
+                    last_heartbeat_at_epoch_ms: current_epoch_millis(),
+                },
+            );
+        }
 
         self.persist().await?;
 
@@ -2958,22 +3065,58 @@ impl ControlPlane {
     }
 
     async fn persist(&self) -> Result<()> {
-        let state = self.state.read().await;
-        self.persist_state(&state).await
+        // Bump the version first so the persisted snapshot and the broadcast
+        // value agree. We do this inside an exclusive write lock so concurrent
+        // persists serialize and each get a unique, increasing version.
+        let new_version = {
+            let mut state = self.state.write().await;
+            state.catalogue_version = state.catalogue_version.saturating_add(1);
+            state.catalogue_version
+        };
+
+        // Persist with a read lock — multiple persisters could race here in
+        // theory, but each holds the latest version they bumped to, so the
+        // last-writer-wins outcome on disk is still monotonic.
+        {
+            let state = self.state.read().await;
+            self.persist_state(&state).await?;
+        }
+
+        // Notify subscribers. `send` returns Err only when there are no
+        // receivers, which is fine — the latest value is still cached on the
+        // sender for late subscribers.
+        let _ = self.version_tx.send(new_version);
+        Ok(())
     }
 
     async fn persist_state(&self, state: &CatalogState) -> Result<()> {
         let Some(path) = &self.catalog_path else {
             return Ok(());
         };
+        let store = catalog_store::open_store(path)?;
+        store.save_state(state).await
+    }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+    /// Export the current catalogue state as pretty-printed JSON to `path`.
+    ///
+    /// Useful for debugging and disaster-recovery snapshots, regardless of
+    /// which on-disk backend is in use. This does not change the live store.
+    pub async fn export_json(&self, path: impl AsRef<Path>) -> Result<()> {
+        let state = self.state.read().await;
+        let exporter = catalog_store::JsonCatalogStore::new(path.as_ref().to_path_buf());
+        exporter.save_state(&state).await
+    }
 
-        let raw = serde_json::to_string_pretty(state)?;
-        fs::write(path, raw).await?;
-        Ok(())
+    /// One-shot migration helper: read a legacy JSON catalogue at `json_path`
+    /// and write it to a SQLite catalogue at `sqlite_path`. The source file is
+    /// not modified. After a successful migration, point the server's
+    /// `--catalog-path` at the SQLite file and the JSON file becomes a backup
+    /// you can archive or delete.
+    pub async fn migrate_json_to_sqlite(
+        json_path: impl AsRef<Path>,
+        sqlite_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        catalog_store::migrate_json_to_sqlite(json_path.as_ref(), sqlite_path.as_ref()).await
     }
 
     pub async fn catalog_user(&self, user: &str) -> Result<CatalogUser> {
@@ -3330,6 +3473,7 @@ fn bootstrap_state() -> CatalogState {
         conversions: BTreeMap::new(),
         functions: BTreeMap::new(),
         config,
+        catalogue_version: 0,
     }
 }
 
@@ -3400,6 +3544,192 @@ mod tests {
                 worker.internal_endpoint.as_deref(),
                 Some("http://10.0.0.2:60052")
             );
+        });
+    }
+
+    #[test]
+    fn heartbeat_does_not_rewrite_catalog_file() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-heartbeat-test-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+
+            control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let mtime_before = std::fs::metadata(&catalog_path)
+                .expect("catalog metadata")
+                .modified()
+                .expect("modified time");
+
+            // Sleep just enough for filesystem mtime resolution to advance.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            for _ in 0..50 {
+                control_plane
+                    .heartbeat("worker-1")
+                    .await
+                    .expect("heartbeat");
+            }
+
+            let mtime_after = std::fs::metadata(&catalog_path)
+                .expect("catalog metadata")
+                .modified()
+                .expect("modified time");
+
+            assert_eq!(
+                mtime_before, mtime_after,
+                "heartbeats must not rewrite the catalogue file"
+            );
+
+            // The node should still report Ready via list_nodes, sourced from
+            // the in-memory liveness map.
+            let nodes = control_plane.list_nodes().await.expect("list nodes");
+            let worker = nodes
+                .iter()
+                .find(|n| n.id == "worker-1")
+                .expect("worker registered");
+            assert_eq!(worker.status, NodeStatus::Ready);
+            assert!(worker.last_heartbeat_at_epoch_ms > 0);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn catalogue_version_increments_on_persisted_writes() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-version-test-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+
+            // Bootstrap itself performs one persist (creating the file), so
+            // the version should be at least 1.
+            let v0 = control_plane.catalogue_version().await;
+            assert!(v0 >= 1, "bootstrap should have bumped version, got {v0}");
+
+            // Subscribe before further writes so we can confirm we receive a
+            // notification.
+            let mut rx = control_plane.subscribe_catalogue_version();
+
+            control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+
+            let v1 = control_plane.catalogue_version().await;
+            assert!(v1 > v0, "join_cluster should bump version: {v0} -> {v1}");
+
+            // Receiver should observe the new version (latest-value semantics).
+            rx.changed().await.expect("notification");
+            assert_eq!(*rx.borrow(), v1);
+
+            // Heartbeats must NOT bump the version (they don't persist).
+            for _ in 0..10 {
+                control_plane.heartbeat("worker-1").await.expect("hb");
+            }
+            let v2 = control_plane.catalogue_version().await;
+            assert_eq!(v2, v1, "heartbeats must not bump catalogue version");
+
+            // Snapshot exposes the version.
+            let snap = control_plane.cluster_snapshot().await;
+            assert_eq!(snap.catalogue_version, v1);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn migrate_json_to_sqlite_preserves_state() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-migrate-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let json_path = dir.join("catalog.json");
+            let sqlite_path = dir.join("catalog.db");
+
+            // Build a JSON catalogue with some content.
+            let cp_json = ControlPlane::from_catalog_path(&json_path)
+                .await
+                .expect("bootstrap json");
+            cp_json
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let snap_before = cp_json.cluster_snapshot().await;
+            drop(cp_json);
+
+            // Migrate.
+            ControlPlane::migrate_json_to_sqlite(&json_path, &sqlite_path)
+                .await
+                .expect("migration");
+
+            // Reopen on the SQLite path and compare.
+            let cp_sql = ControlPlane::from_catalog_path(&sqlite_path)
+                .await
+                .expect("bootstrap sqlite");
+            let snap_after = cp_sql.cluster_snapshot().await;
+
+            assert_eq!(snap_before.databases, snap_after.databases);
+            assert_eq!(snap_before.users, snap_after.users);
+            assert_eq!(snap_before.relations, snap_after.relations);
+            // Node identity preserved (statuses differ because liveness map
+            // resets on reload — that's expected per Phase 1 design).
+            let ids_before: Vec<&str> =
+                snap_before.nodes.iter().map(|n| n.id.as_str()).collect();
+            let ids_after: Vec<&str> =
+                snap_after.nodes.iter().map(|n| n.id.as_str()).collect();
+            assert_eq!(ids_before, ids_after);
+            assert_eq!(snap_before.catalogue_version, snap_after.catalogue_version);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn catalogue_version_survives_reload() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-version-reload-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let cp1 = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+            cp1.join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let v_before = cp1.catalogue_version().await;
+            drop(cp1);
+
+            let cp2 = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("reload");
+            let v_after = cp2.catalogue_version().await;
+            assert_eq!(v_after, v_before, "version must survive reload");
+
+            std::fs::remove_dir_all(&dir).ok();
         });
     }
 }
