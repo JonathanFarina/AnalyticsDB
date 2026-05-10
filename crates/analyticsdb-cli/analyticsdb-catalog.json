@@ -41,7 +41,7 @@
   "config": {
     "base_postgres_port": 5432,
     "base_flight_sql_port": 50051,
-    "catalog_path": "analyticsdb-catalog.json",
+    "catalog_path": "analyticsdb-catalog.db",
     "tls_cert_path": null,
     "tls_key_path": null,
     "next_available_port_offset": 0
