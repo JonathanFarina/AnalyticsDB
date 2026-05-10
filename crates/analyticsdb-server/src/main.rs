@@ -455,7 +455,7 @@ struct Cli {
     /// Set to your network IP or DNS name for multi-host deployments.
     #[arg(long, default_value = "127.0.0.1")]
     advertise_host: String,
-    #[arg(long, default_value = "analyticsdb-catalog.json")]
+    #[arg(long, default_value = "analyticsdb-catalog.db")]
     catalog_path: String,
     #[arg(long)]
     tls_cert: Option<String>,

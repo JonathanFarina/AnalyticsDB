@@ -582,7 +582,7 @@ pub enum MetadataStatement {
     Rollback,
 }
 
-pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.json";
+pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
 
 /// Ephemeral, in-memory liveness tracking for cluster nodes.
 ///
@@ -620,14 +620,29 @@ impl ControlPlane {
     pub async fn from_catalog_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let store = catalog_store::open_store(path)?;
+
         if path.exists() {
+            // Normal load — file (JSON or SQLite) already exists.
             let state = store.load().await?;
-            Ok(Self::from_state(Some(path.to_path_buf()), state))
-        } else {
-            let control_plane = Self::from_state(Some(path.to_path_buf()), bootstrap_state());
-            control_plane.persist().await?;
-            Ok(control_plane)
+            return Ok(Self::from_state(Some(path.to_path_buf()), state));
         }
+
+        // File doesn't exist yet. If the requested path is SQLite and a
+        // legacy JSON file with the same stem is present, auto-migrate so
+        // existing deployments upgrade seamlessly on first start.
+        if catalog_store::is_sqlite_path(path) {
+            let legacy_json = path.with_extension("json");
+            if legacy_json.exists() {
+                catalog_store::migrate_json_to_sqlite(&legacy_json, path).await?;
+                let state = store.load().await?;
+                return Ok(Self::from_state(Some(path.to_path_buf()), state));
+            }
+        }
+
+        // Fresh install — bootstrap default state and persist immediately.
+        let control_plane = Self::from_state(Some(path.to_path_buf()), bootstrap_state());
+        control_plane.persist().await?;
+        Ok(control_plane)
     }
 
     fn from_state(catalog_path: Option<PathBuf>, state: CatalogState) -> Self {
@@ -3728,6 +3743,82 @@ mod tests {
                 .expect("reload");
             let v_after = cp2.catalogue_version().await;
             assert_eq!(v_after, v_before, "version must survive reload");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn first_install_creates_sqlite_file() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-firstinstall-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("analyticsdb-catalog.db");
+
+            assert!(!db_path.exists(), "should start with no catalog file");
+
+            let cp = ControlPlane::from_catalog_path(&db_path)
+                .await
+                .expect("first-install bootstrap");
+
+            assert!(db_path.exists(), "SQLite catalog must be created on first start");
+
+            // Default database and users should be present.
+            let snap = cp.cluster_snapshot().await;
+            assert!(snap.databases.iter().any(|d| d.name == "postgres"),
+                "default postgres database should exist");
+            assert!(snap.users.iter().any(|u| u.name == "postgres"),
+                "default postgres user should exist");
+            assert!(snap.catalogue_version >= 1,
+                "version should be > 0 after bootstrap");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn startup_auto_migrates_legacy_json_to_sqlite() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!(
+                "adb-automigrate-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+
+            // Simulate an existing JSON deployment by bootstrapping with the
+            // JSON path first.
+            let json_path = dir.join("analyticsdb-catalog.json");
+            let cp_json = ControlPlane::from_catalog_path(&json_path)
+                .await
+                .expect("json bootstrap");
+            cp_json
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let snap_json = cp_json.cluster_snapshot().await;
+            drop(cp_json);
+
+            // Now start with the new default SQLite path (same stem). The
+            // engine should auto-migrate — no manual intervention required.
+            let db_path = dir.join("analyticsdb-catalog.db");
+            assert!(!db_path.exists(), "db must not exist before auto-migration");
+
+            let cp_db = ControlPlane::from_catalog_path(&db_path)
+                .await
+                .expect("auto-migrate + load");
+
+            assert!(db_path.exists(), "SQLite file must be created by auto-migration");
+
+            let snap_db = cp_db.cluster_snapshot().await;
+            assert_eq!(snap_json.databases, snap_db.databases,
+                "databases must survive auto-migration");
+            assert_eq!(snap_json.users, snap_db.users,
+                "users must survive auto-migration");
+            assert_eq!(snap_json.catalogue_version, snap_db.catalogue_version,
+                "version must survive auto-migration");
 
             std::fs::remove_dir_all(&dir).ok();
         });
