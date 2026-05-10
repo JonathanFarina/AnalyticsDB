@@ -13,6 +13,7 @@ openraft = { workspace = true, features = ["serde"] }
 openraft-rocksstore = "0.9.21"
 prost.workspace = true
 rocksdb = "0.22.0"
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
