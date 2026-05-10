@@ -1007,7 +1007,7 @@ struct QueryOptions {
     schema: String,
     #[arg(long, default_value = "postgres")]
     user: String,
-    #[arg(long, default_value = "analyticsdb-catalog.json")]
+    #[arg(long, default_value = "analyticsdb-catalog.db")]
     catalog_path: String,
     #[arg(long)]
     endpoint: Option<String>,
@@ -1037,7 +1037,7 @@ struct InteractiveOptions {
     schema: String,
     #[arg(long, default_value = "postgres")]
     user: String,
-    #[arg(long, default_value = "analyticsdb-catalog.json")]
+    #[arg(long, default_value = "analyticsdb-catalog.db")]
     catalog_path: String,
     #[arg(long)]
     endpoint: Option<String>,
@@ -1200,7 +1200,7 @@ mod tests {
             password: None,
             schema: "public".to_string(),
             user: "postgres".to_string(),
-            catalog_path: "analyticsdb-catalog.json".to_string(),
+            catalog_path: "analyticsdb-catalog.db".to_string(),
             endpoint: None,
             tls_ca_cert: None,
             tls_domain: None,
@@ -1228,7 +1228,7 @@ mod tests {
             password: None,
             schema: "public".to_string(),
             user: "postgres".to_string(),
-            catalog_path: "analyticsdb-catalog.json".to_string(),
+            catalog_path: "analyticsdb-catalog.db".to_string(),
             endpoint: None,
             tls_ca_cert: None,
             tls_domain: None,
