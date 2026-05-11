@@ -5554,32 +5554,46 @@ async fn cli_supports_index_lifecycle_across_postgres_and_flight_sql() {
             "public",
             "protocol_idx_test",
             "p_idx",
-        ).join("manifest.json");
-        assert!(manifest_path.exists(), "Index manifest should exist after CREATE INDEX via {}", protocol);
-
-        // 2. RENAME INDEX
-        run_sql_via_protocol(
-            protocol,
-            &addr,
-            "ALTER INDEX p_idx RENAME TO renamed_idx",
+        )
+        .join("manifest.json");
+        assert!(
+            manifest_path.exists(),
+            "Index manifest should exist after CREATE INDEX via {}",
+            protocol
         );
 
+        // 2. RENAME INDEX
+        run_sql_via_protocol(protocol, &addr, "ALTER INDEX p_idx RENAME TO renamed_idx");
+
         // Verify old manifest is gone, new one exists
-        assert!(!manifest_path.exists(), "Old index manifest should be gone after RENAME via {}", protocol);
+        assert!(
+            !manifest_path.exists(),
+            "Old index manifest should be gone after RENAME via {}",
+            protocol
+        );
         let new_manifest_path = index_snapshot_root(
             catalog_path,
             "postgres",
             "public",
             "protocol_idx_test",
             "renamed_idx",
-        ).join("manifest.json");
-        assert!(new_manifest_path.exists(), "New index manifest should exist after RENAME via {}", protocol);
+        )
+        .join("manifest.json");
+        assert!(
+            new_manifest_path.exists(),
+            "New index manifest should exist after RENAME via {}",
+            protocol
+        );
 
         // 3. DROP INDEX
         run_sql_via_protocol(protocol, &addr, "DROP INDEX renamed_idx");
 
         // Verify manifest is gone
-        assert!(!new_manifest_path.exists(), "Index manifest should be gone after DROP INDEX via {}", protocol);
+        assert!(
+            !new_manifest_path.exists(),
+            "Index manifest should be gone after DROP INDEX via {}",
+            protocol
+        );
     }
 
     cleanup_catalog_artifacts(&pg_catalog_path);
@@ -5639,7 +5653,8 @@ async fn cli_create_unique_index_failure_is_atomic() {
         "public",
         "atomic_idx_test",
         "atomic_idx",
-    ).join("manifest.json");
+    )
+    .join("manifest.json");
     assert!(!manifest_path.exists());
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -5697,13 +5712,29 @@ async fn cli_supports_index_manifests_and_broader_predicates() {
 
     let test_cases = [
         // 1. Equality
-        ("SELECT id FROM predicate_test WHERE tag = 'b'", "2", "tag_idx"),
+        (
+            "SELECT id FROM predicate_test WHERE tag = 'b'",
+            "2",
+            "tag_idx",
+        ),
         // 2. IN list
-        ("SELECT id FROM predicate_test WHERE tag IN ('a', 'c')", "1", "tag_idx"),
+        (
+            "SELECT id FROM predicate_test WHERE tag IN ('a', 'c')",
+            "1",
+            "tag_idx",
+        ),
         // 3. Bounded range
-        ("SELECT id FROM predicate_test WHERE score > 15.0 AND score < 25.0", "2", "score_idx"),
+        (
+            "SELECT id FROM predicate_test WHERE score > 15.0 AND score < 25.0",
+            "2",
+            "score_idx",
+        ),
         // 4. Greater than or equal
-        ("SELECT id FROM predicate_test WHERE score >= 30.0", "3", "score_idx"),
+        (
+            "SELECT id FROM predicate_test WHERE score >= 30.0",
+            "3",
+            "score_idx",
+        ),
     ];
 
     for (sql, expected_id, expected_idx) in test_cases {
@@ -5720,8 +5751,18 @@ async fn cli_supports_index_manifests_and_broader_predicates() {
             ]);
             command
         });
-        assert!(res.rows.iter().any(|r| r[0] == expected_id), "Query '{}' should return id {}", sql, expected_id);
-        assert!(res.message.contains(expected_idx), "Query '{}' should use index {}", sql, expected_idx);
+        assert!(
+            res.rows.iter().any(|r| r[0] == expected_id),
+            "Query '{}' should return id {}",
+            sql,
+            expected_id
+        );
+        assert!(
+            res.message.contains(expected_idx),
+            "Query '{}' should use index {}",
+            sql,
+            expected_idx
+        );
     }
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -5758,15 +5799,32 @@ async fn cli_supports_broader_index_predicates_across_postgres_and_flight_sql() 
         );
 
         let test_cases = [
-            ("SELECT id FROM protocol_predicate_test WHERE tag = 'b'", "2"),
-            ("SELECT id FROM protocol_predicate_test WHERE score >= 30.0", "3"),
-            ("SELECT id FROM protocol_predicate_test WHERE tag IN ('a', 'c')", "1"),
-            ("SELECT id FROM protocol_predicate_test WHERE score > 15.0 AND score < 25.0", "2"),
+            (
+                "SELECT id FROM protocol_predicate_test WHERE tag = 'b'",
+                "2",
+            ),
+            (
+                "SELECT id FROM protocol_predicate_test WHERE score >= 30.0",
+                "3",
+            ),
+            (
+                "SELECT id FROM protocol_predicate_test WHERE tag IN ('a', 'c')",
+                "1",
+            ),
+            (
+                "SELECT id FROM protocol_predicate_test WHERE score > 15.0 AND score < 25.0",
+                "2",
+            ),
         ];
 
         for (sql, expected_id) in test_cases {
             let res = protocol_json_response(protocol, &addr, None, sql);
-            assert!(res.rows.iter().any(|r| r[0] == expected_id), "{} lookup with {} failed", protocol, sql);
+            assert!(
+                res.rows.iter().any(|r| r[0] == expected_id),
+                "{} lookup with {} failed",
+                protocol,
+                sql
+            );
         }
     }
 
@@ -5824,7 +5882,11 @@ async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
         ("flight-sql", &flight_addr, &fl_catalog_path),
     ] {
         // 1. CREATE USER
-        run_sql_via_protocol(protocol, addr, "CREATE USER app_user PASSWORD 'initial_pass'");
+        run_sql_via_protocol(
+            protocol,
+            addr,
+            "CREATE USER app_user PASSWORD 'initial_pass'",
+        );
 
         // 2. Verify authentication
         let res = protocol_json_response_with_auth_context(
@@ -5837,10 +5899,18 @@ async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
             Some("initial_pass"),
             "SELECT 1",
         );
-        assert_eq!(res.rows[0][0], "1", "Authentication failed for {} with initial password", protocol);
+        assert_eq!(
+            res.rows[0][0], "1",
+            "Authentication failed for {} with initial password",
+            protocol
+        );
 
         // 3. ALTER USER PASSWORD
-        run_sql_via_protocol(protocol, addr, "ALTER USER app_user PASSWORD 'rotated_pass'");
+        run_sql_via_protocol(
+            protocol,
+            addr,
+            "ALTER USER app_user PASSWORD 'rotated_pass'",
+        );
 
         // 4. Verify old password FAILS
         let stderr_old = protocol_stderr_failure_with_auth_context(
@@ -5853,8 +5923,14 @@ async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
             Some("initial_pass"),
             "SELECT 1",
         );
-        assert!(stderr_old.contains("Invalid password") || stderr_old.contains("authentication failed") || stderr_old.contains("Can't handshake"), 
-                "{} should have rejected the OLD password. Stderr: {}", protocol, stderr_old);
+        assert!(
+            stderr_old.contains("Invalid password")
+                || stderr_old.contains("authentication failed")
+                || stderr_old.contains("Can't handshake"),
+            "{} should have rejected the OLD password. Stderr: {}",
+            protocol,
+            stderr_old
+        );
 
         // 5. Verify NEW password WORKS
         let res_new = protocol_json_response_with_auth_context(
@@ -5867,7 +5943,11 @@ async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
             Some("rotated_pass"),
             "SELECT 1",
         );
-        assert_eq!(res_new.rows[0][0], "1", "Authentication failed for {} with rotated password", protocol);
+        assert_eq!(
+            res_new.rows[0][0], "1",
+            "Authentication failed for {} with rotated password",
+            protocol
+        );
 
         // 6. DROP USER
         run_sql_via_protocol(protocol, addr, "DROP USER app_user");
@@ -5883,8 +5963,14 @@ async fn cli_supports_user_lifecycle_across_postgres_and_flight_sql() {
             Some("rotated_pass"),
             "SELECT 1",
         );
-        assert!(stderr_gone.contains("Unknown user") || stderr_gone.contains("does not exist") || stderr_gone.contains("authentication failed"),
-                "{} should have rejected the dropped user. Stderr: {}", protocol, stderr_gone);
+        assert!(
+            stderr_gone.contains("Unknown user")
+                || stderr_gone.contains("does not exist")
+                || stderr_gone.contains("authentication failed"),
+            "{} should have rejected the dropped user. Stderr: {}",
+            protocol,
+            stderr_gone
+        );
     }
 
     cleanup_catalog_artifacts(&pg_catalog_path);

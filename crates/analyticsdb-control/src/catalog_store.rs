@@ -162,8 +162,7 @@ impl SqliteCatalogStore {
         let nodes = load_keyed::<ClusterNode>(&conn, "SELECT id, data FROM nodes")?;
         let relations = load_keyed::<CatalogRelation>(&conn, "SELECT key, data FROM relations")?;
         let functions = load_keyed::<CatalogFunction>(&conn, "SELECT key, data FROM functions")?;
-        let aggregates =
-            load_keyed::<CatalogAggregate>(&conn, "SELECT key, data FROM aggregates")?;
+        let aggregates = load_keyed::<CatalogAggregate>(&conn, "SELECT key, data FROM aggregates")?;
         let collations = load_keyed::<CatalogCollation>(&conn, "SELECT key, data FROM collations")?;
         let conversions =
             load_keyed::<CatalogConversion>(&conn, "SELECT key, data FROM conversions")?;
@@ -336,8 +335,7 @@ fn replace_keyed(
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
-        let delete_sql =
-            format!("DELETE FROM {table} WHERE {key_col} NOT IN ({placeholders})");
+        let delete_sql = format!("DELETE FROM {table} WHERE {key_col} NOT IN ({placeholders})");
         let params: Vec<&dyn rusqlite::ToSql> =
             keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
         tx.execute(&delete_sql, params.as_slice())?;

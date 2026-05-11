@@ -91,7 +91,7 @@ pub fn calculate_optimal_worker_count(
     // - Pick N such that each worker has ~128MB of data.
     // - Pick N such that each worker has at least 2 files.
     // - N must be between 1 and available_nodes.
-    
+
     // For very small datasets, just use 1 node (coordinator).
     if total_size < 10 * 1024 * 1024 && file_count < 4 {
         return 1;
@@ -99,7 +99,7 @@ pub fn calculate_optimal_worker_count(
 
     let by_size = (total_size as f64 / (128.0 * 1024.0 * 1024.0)).ceil() as usize;
     let by_file = (file_count as f64 / 2.0).ceil() as usize;
-    
+
     by_size.max(by_file).clamp(1, available_nodes)
 }
 

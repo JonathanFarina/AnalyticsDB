@@ -43,7 +43,10 @@ impl PartitionStream for PartitionStreamImpl {
         &self.schema
     }
     fn execute(&self, _ctx: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
-        let mut guard = self.stream.try_lock().expect("PartitionStream scanned twice");
+        let mut guard = self
+            .stream
+            .try_lock()
+            .expect("PartitionStream scanned twice");
         guard
             .take()
             .expect("PartitionStream can only be executed once")
@@ -82,19 +85,13 @@ impl TableProvider for StreamingTableProvider {
         _filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let schema = if let Some(p) = projection {
-            Arc::new(self.schema.project(p)?)
-        } else {
-            Arc::clone(&self.schema)
-        };
-
         let stream = PartitionStreamImpl {
             schema: Arc::clone(&self.schema),
             stream: Arc::clone(&self.stream),
         };
 
         Ok(Arc::new(StreamingTableExec::try_new(
-            schema,
+            Arc::clone(&self.schema),
             vec![Arc::new(stream) as Arc<dyn PartitionStream>],
             projection,
             None,
@@ -795,7 +792,7 @@ impl PrototypeEngine {
             // When reading with default options, DataFusion infers the schema from the file.
             // We want to write it back with the NEW schema from the catalog.
             let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
-            
+
             // Collect existing data and write it back with the new schema.
             // DataFusion will handle missing columns by filling with NULLs.
             let batches = df.collect().await.map_err(sanitize_error)?;
@@ -1314,8 +1311,8 @@ impl PrototypeEngine {
             // If heuristic says 1 node and it's just the coordinator, might as well run locally
             // unless we want to use the partition executor anyway. For now, if N=1 and we have
             // workers, we'll still pick one worker to keep the distributed path exercised.
-            
-            // Select a subset of nodes (round-robin selection could be added here, 
+
+            // Select a subset of nodes (round-robin selection could be added here,
             // but for now we just take the first N).
             compute_nodes.truncate(optimal_worker_count);
 
@@ -1337,7 +1334,8 @@ impl PrototypeEngine {
             }
 
             // Partition files across available workers (greedy size-aware).
-            let chunks = distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
+            let chunks =
+                distributed::partition_files_for_workers(files.clone(), compute_nodes.len());
 
             let node_list: Vec<&str> = compute_nodes
                 .iter()
@@ -1381,7 +1379,8 @@ impl PrototypeEngine {
             // Dispatch all concurrently.
             let mut dispatch_futures = Vec::new();
             for (node, req) in &worker_tasks {
-                let endpoint = distributed::PartitionClient::node_channel_endpoint(node).to_string();
+                let endpoint =
+                    distributed::PartitionClient::node_channel_endpoint(node).to_string();
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
                 dispatch_futures.push(async move {
@@ -1406,7 +1405,10 @@ impl PrototypeEngine {
                         }));
                     }
                     Err((node_id, e)) => {
-                        warn!("[coordinator] Failed to dispatch to node '{}': {}", node_id, e);
+                        warn!(
+                            "[coordinator] Failed to dispatch to node '{}': {}",
+                            node_id, e
+                        );
                         failed_node_id = Some(node_id);
                         break;
                     }
@@ -1414,7 +1416,10 @@ impl PrototypeEngine {
             }
 
             if let Some(node_id) = failed_node_id {
-                info!("[coordinator] Marking node '{}' as unavailable and retrying query...", node_id);
+                info!(
+                    "[coordinator] Marking node '{}' as unavailable and retrying query...",
+                    node_id
+                );
                 let _ = partition_client.mark_node_unavailable(&node_id).await;
                 continue;
             }
@@ -1432,7 +1437,10 @@ impl PrototypeEngine {
                     match batch_res {
                         Ok(batch) => all_batches.push(batch),
                         Err((node_id, e)) => {
-                            warn!("[coordinator] Node '{}' failed during streaming: {}", node_id, e);
+                            warn!(
+                                "[coordinator] Node '{}' failed during streaming: {}",
+                                node_id, e
+                            );
                             stream_failed_node_id = Some(node_id);
                             break;
                         }
@@ -1440,7 +1448,10 @@ impl PrototypeEngine {
                 }
 
                 if let Some(node_id) = stream_failed_node_id {
-                    info!("[coordinator] Marking node '{}' as unavailable and retrying query...", node_id);
+                    info!(
+                        "[coordinator] Marking node '{}' as unavailable and retrying query...",
+                        node_id
+                    );
                     let _ = partition_client.mark_node_unavailable(&node_id).await;
                     continue;
                 }
@@ -1451,44 +1462,45 @@ impl PrototypeEngine {
                     .map(|batch| batch.schema())
                     .unwrap_or(Arc::clone(&base_schema));
 
-                return self.execute_coordinator_select_over_partition_batches(
-                    request,
-                    admission,
-                    started,
-                    &table_name,
-                    schema,
-                    all_batches,
-                    compute_nodes.len(),
-                    aggregate_plan.map(|(_, final_sql)| final_sql),
-                )
-                .await
-                .map(Some);
+                return self
+                    .execute_coordinator_select_over_partition_batches(
+                        request,
+                        admission,
+                        started,
+                        &table_name,
+                        schema,
+                        all_batches,
+                        compute_nodes.len(),
+                        aggregate_plan.map(|(_, final_sql)| final_sql),
+                    )
+                    .await
+                    .map(Some);
             } else {
                 // For plain SELECTs (large results), use the TRUE STREAMING path.
                 let df_stream = merged_stream.map(|res| match res {
                     Ok(batch) => Ok(batch),
-                    Err((node_id, e)) => {
-                        Err(DataFusionError::Execution(format!("Node {node_id} failed: {e}")))
-                    }
+                    Err((node_id, e)) => Err(DataFusionError::Execution(format!(
+                        "Node {node_id} failed: {e}"
+                    ))),
                 });
 
-                let partition_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&base_schema),
-                    df_stream,
-                ));
+                let partition_stream: SendableRecordBatchStream = Box::pin(
+                    RecordBatchStreamAdapter::new(Arc::clone(&base_schema), df_stream),
+                );
 
-                return self.execute_coordinator_select_over_partition_stream(
-                    request,
-                    admission,
-                    started,
-                    &table_name,
-                    base_schema,
-                    partition_stream,
-                    compute_nodes.len(),
-                    None,
-                )
-                .await
-                .map(Some);
+                return self
+                    .execute_coordinator_select_over_partition_stream(
+                        request,
+                        admission,
+                        started,
+                        &table_name,
+                        base_schema,
+                        partition_stream,
+                        compute_nodes.len(),
+                        None,
+                    )
+                    .await
+                    .map(Some);
             }
         }
 
@@ -1753,7 +1765,8 @@ impl PrototypeEngine {
             compute_nodes.truncate(optimal_worker_count);
 
             // Partition source files across workers (greedy size-aware).
-            let chunks = distributed::partition_files_for_workers(source_files.clone(), compute_nodes.len());
+            let chunks =
+                distributed::partition_files_for_workers(source_files.clone(), compute_nodes.len());
 
             // Acquire the write lock on the target relation.
             let relation_lock = self.relation_lock(&target_relation).await;
@@ -1780,7 +1793,8 @@ impl PrototypeEngine {
             // Dispatch all concurrently.
             let mut dispatch_futures = Vec::new();
             for (node, req) in &worker_tasks {
-                let endpoint = distributed::PartitionClient::node_channel_endpoint(node).to_string();
+                let endpoint =
+                    distributed::PartitionClient::node_channel_endpoint(node).to_string();
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
                 dispatch_futures.push(async move {
@@ -1799,7 +1813,10 @@ impl PrototypeEngine {
                 match res {
                     Ok((_, ack)) => all_acks.push(ack),
                     Err((node_id, e)) => {
-                        warn!("[coordinator] Node '{}' failed during distributed write: {}", node_id, e);
+                        warn!(
+                            "[coordinator] Node '{}' failed during distributed write: {}",
+                            node_id, e
+                        );
                         failed_node_id = Some(node_id);
                         break;
                     }
@@ -3422,7 +3439,8 @@ impl PrototypeEngine {
 
                 match operation {
                     AlterTableOperation::AddColumn { column } => {
-                        let result = self.control_plane
+                        let result = self
+                            .control_plane
                             .add_column(
                                 &request.session,
                                 database.as_deref(),
@@ -3438,10 +3456,20 @@ impl PrototypeEngine {
                             .await;
 
                         if result.is_ok() {
-                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
-                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                            let updated_relation = self
+                                .control_plane
+                                .find_relation(
+                                    &request.session,
+                                    database.as_deref(),
+                                    schema.as_deref(),
+                                    &name,
+                                )
+                                .await?;
+                            let _ = self
+                                .physical_migrate_relation(&request.session, &updated_relation)
+                                .await;
                         }
-                        
+
                         let _ = result?;
 
                         (
@@ -3606,10 +3634,20 @@ impl PrototypeEngine {
                                 if_exists,
                             )
                             .await;
-                        
+
                         if result.is_ok() {
-                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
-                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                            let updated_relation = self
+                                .control_plane
+                                .find_relation(
+                                    &request.session,
+                                    database.as_deref(),
+                                    schema.as_deref(),
+                                    &name,
+                                )
+                                .await?;
+                            let _ = self
+                                .physical_migrate_relation(&request.session, &updated_relation)
+                                .await;
                         }
 
                         let message = result?;
@@ -3639,8 +3677,23 @@ impl PrototypeEngine {
                             .await?;
 
                         // Physically rewrite the table to apply the rename
-                        let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
-                        let _ = self.physical_migrate_rename_column(&request.session, &updated_relation, &old_name, &new_name).await;
+                        let updated_relation = self
+                            .control_plane
+                            .find_relation(
+                                &request.session,
+                                database.as_deref(),
+                                schema.as_deref(),
+                                &name,
+                            )
+                            .await?;
+                        let _ = self
+                            .physical_migrate_rename_column(
+                                &request.session,
+                                &updated_relation,
+                                &old_name,
+                                &new_name,
+                            )
+                            .await;
 
                         (
                             Arc::new(Schema::empty()),
@@ -3751,8 +3804,18 @@ impl PrototypeEngine {
                             .await;
 
                         if result.is_ok() {
-                            let updated_relation = self.control_plane.find_relation(&request.session, database.as_deref(), schema.as_deref(), &name).await?;
-                            let _ = self.physical_migrate_relation(&request.session, &updated_relation).await;
+                            let updated_relation = self
+                                .control_plane
+                                .find_relation(
+                                    &request.session,
+                                    database.as_deref(),
+                                    schema.as_deref(),
+                                    &name,
+                                )
+                                .await?;
+                            let _ = self
+                                .physical_migrate_relation(&request.session, &updated_relation)
+                                .await;
                         }
 
                         let message = result?;
@@ -5488,7 +5551,11 @@ fn parse_indexed_select_statement(sql: &str) -> Result<Option<IndexedSelectState
             // If select_projection_columns returns None, it might be a wildcard (*)
             // or a complex projection. We only support wildcards in indexed select
             // if all columns are simple.
-            if select.projection.iter().any(|item| !matches!(item, SelectItem::Wildcard(_))) {
+            if select
+                .projection
+                .iter()
+                .any(|item| !matches!(item, SelectItem::Wildcard(_)))
+            {
                 return Ok(None);
             }
             None
@@ -6374,7 +6441,7 @@ SELECT
   'Customer ' || n,
   ROUND((10 + random() * 990)::numeric, 2),
   NOW() - (random() * INTERVAL '5 years')
-FROM generate_series(1, 1000000) AS s(n)";
+FROM generate_series(1, 1000) AS s(n)";
 
         let result = engine
             .execute_query(&QueryRequest {
@@ -6383,12 +6450,8 @@ FROM generate_series(1, 1000000) AS s(n)";
             })
             .await;
 
-        if let Err(e) = result {
-            println!("Error: {}", e);
-        } else {
-            println!("Success");
-        }
         cleanup_catalog_artifacts(&catalog_path);
+        result.expect("INSERT … SELECT with rewritten interval expression should succeed");
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn repro_datafusion_insert_error() {
@@ -7100,21 +7163,26 @@ FROM generate_series(1, 10) AS s(n)";
             .unwrap();
         engine
             .execute_query(&QueryRequest {
-                sql: "INSERT INTO fail_test SELECT * FROM generate_series(1, 10) AS s(id)".to_string(),
+                sql: "INSERT INTO fail_test SELECT * FROM generate_series(1, 10) AS s(id)"
+                    .to_string(),
                 session: session.clone(),
             })
             .await
             .unwrap();
 
         // Register a bogus compute node that will fail connection.
-        engine.control_plane().register_node(analyticsdb_control::ClusterNode {
-            id: "bogus-node".to_string(),
-            role: analyticsdb_control::NodeRole::Compute,
-            endpoint: "http://127.0.0.1:1".to_string(), // Invalid port
-            status: analyticsdb_control::NodeStatus::Ready,
-            last_heartbeat_at_epoch_ms: 0,
-            ..analyticsdb_control::ClusterNode::default()
-        }).await.unwrap();
+        engine
+            .control_plane()
+            .register_node(analyticsdb_control::ClusterNode {
+                id: "bogus-node".to_string(),
+                role: analyticsdb_control::NodeRole::Compute,
+                endpoint: "http://127.0.0.1:1".to_string(), // Invalid port
+                status: analyticsdb_control::NodeStatus::Ready,
+                last_heartbeat_at_epoch_ms: 0,
+                ..analyticsdb_control::ClusterNode::default()
+            })
+            .await
+            .unwrap();
 
         // Query should still succeed by retrying and eventually falling back to local.
         let result = engine
@@ -7138,23 +7206,70 @@ FROM generate_series(1, 10) AS s(n)";
         cleanup_catalog_artifacts(&catalog_path);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_table_provider_projects_batches_to_declared_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+            ],
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+        ));
+        let table = StreamingTableProvider {
+            schema: Arc::clone(&schema),
+            stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+        };
+        let context = DfSessionContext::new_with_config(base_session_config());
+        context
+            .register_table("__partition__", Arc::new(table))
+            .unwrap();
+
+        let dataframe = context.sql("SELECT name FROM __partition__").await.unwrap();
+        let stream = dataframe.execute_stream().await.unwrap();
+        let result = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].schema().fields().len(), 1);
+        assert_eq!(result[0].schema().field(0).name(), "name");
+    }
+
     #[test]
     fn optimal_worker_count_heuristic() {
         use crate::distributed::calculate_optimal_worker_count;
 
         // Small data, few files -> 1 node (coordinator)
         assert_eq!(calculate_optimal_worker_count(1024, 2, 10), 1);
-        
+
         // Large data, many files -> subset of nodes
         // 1GB / 128MB = 8 nodes
-        assert_eq!(calculate_optimal_worker_count(1024 * 1024 * 1024, 20, 20), 10); // file count / 2 is 10
-        
+        assert_eq!(
+            calculate_optimal_worker_count(1024 * 1024 * 1024, 20, 20),
+            10
+        ); // file count / 2 is 10
+
         // 10GB / 128MB = 80 nodes, clamped to available 20
-        assert_eq!(calculate_optimal_worker_count(10 * 1024 * 1024 * 1024, 100, 20), 20);
-        
+        assert_eq!(
+            calculate_optimal_worker_count(10 * 1024 * 1024 * 1024, 100, 20),
+            20
+        );
+
         // Moderate data, many files
         // 100MB / 128MB = 1 node, but 20 files / 2 = 10 nodes
-        assert_eq!(calculate_optimal_worker_count(100 * 1024 * 1024, 20, 20), 10);
+        assert_eq!(
+            calculate_optimal_worker_count(100 * 1024 * 1024, 20, 20),
+            10
+        );
     }
 }
 

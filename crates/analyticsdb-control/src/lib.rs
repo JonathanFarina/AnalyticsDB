@@ -677,10 +677,7 @@ impl ControlPlane {
     /// Overlay ephemeral liveness onto a persisted node identity. Nodes that
     /// have not heartbeated since the last control-plane restart are reported
     /// as `Unavailable` regardless of the stale persisted timestamp.
-    fn apply_liveness(
-        node: &ClusterNode,
-        liveness: &HashMap<String, NodeLiveness>,
-    ) -> ClusterNode {
+    fn apply_liveness(node: &ClusterNode, liveness: &HashMap<String, NodeLiveness>) -> ClusterNode {
         let mut out = node.clone();
         match liveness.get(&node.id) {
             Some(live) => {
@@ -931,9 +928,7 @@ impl ControlPlane {
             MetadataStatement::DropUser { name, if_exists } => {
                 self.drop_user(session, name, *if_exists).await?
             }
-            MetadataStatement::CreateGroup { name } => {
-                self.create_group(session, name).await?
-            }
+            MetadataStatement::CreateGroup { name } => self.create_group(session, name).await?,
             MetadataStatement::AlterGroup { name, operation } => {
                 self.alter_group(session, name, operation).await?
             }
@@ -1332,8 +1327,12 @@ impl ControlPlane {
                         if index.is_primary || relation.constraints.iter().any(|c| c.name == name) {
                             bail!("Index '{}' is backing a constraint and cannot be dropped directly. Use ALTER TABLE ... DROP CONSTRAINT instead.", name);
                         }
-                        
-                        let pos = relation.indexes.iter().position(|i| i.name == name).unwrap();
+
+                        let pos = relation
+                            .indexes
+                            .iter()
+                            .position(|i| i.name == name)
+                            .unwrap();
                         relation.indexes.remove(pos);
                         found = true;
                         break;
@@ -3300,11 +3299,7 @@ impl ControlPlane {
         Ok(format!("User '{}' dropped successfully.", name))
     }
 
-    async fn create_group(
-        &self,
-        session: &SessionContext,
-        name: &str,
-    ) -> Result<String> {
+    async fn create_group(&self, session: &SessionContext, name: &str) -> Result<String> {
         validate_identifier(name)?;
 
         {
@@ -3367,7 +3362,10 @@ impl ControlPlane {
                     if !group.members.remove(user_name) {
                         bail!("User '{}' is not a member of group '{}'", user_name, name);
                     }
-                    Ok(format!("User '{}' removed from group '{}'.", user_name, name))
+                    Ok(format!(
+                        "User '{}' removed from group '{}'.",
+                        user_name, name
+                    ))
                 }
                 AlterGroupOperation::Rename(new_name) => {
                     validate_identifier(new_name)?;
@@ -3565,10 +3563,7 @@ mod tests {
     #[test]
     fn heartbeat_does_not_rewrite_catalog_file() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-heartbeat-test-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-heartbeat-test-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let catalog_path = dir.join("catalog.json");
 
@@ -3623,10 +3618,7 @@ mod tests {
     #[test]
     fn catalogue_version_increments_on_persisted_writes() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-version-test-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-version-test-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let catalog_path = dir.join("catalog.json");
 
@@ -3673,10 +3665,7 @@ mod tests {
     #[test]
     fn migrate_json_to_sqlite_preserves_state() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-migrate-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-migrate-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let json_path = dir.join("catalog.json");
             let sqlite_path = dir.join("catalog.db");
@@ -3708,10 +3697,8 @@ mod tests {
             assert_eq!(snap_before.relations, snap_after.relations);
             // Node identity preserved (statuses differ because liveness map
             // resets on reload — that's expected per Phase 1 design).
-            let ids_before: Vec<&str> =
-                snap_before.nodes.iter().map(|n| n.id.as_str()).collect();
-            let ids_after: Vec<&str> =
-                snap_after.nodes.iter().map(|n| n.id.as_str()).collect();
+            let ids_before: Vec<&str> = snap_before.nodes.iter().map(|n| n.id.as_str()).collect();
+            let ids_after: Vec<&str> = snap_after.nodes.iter().map(|n| n.id.as_str()).collect();
             assert_eq!(ids_before, ids_after);
             assert_eq!(snap_before.catalogue_version, snap_after.catalogue_version);
 
@@ -3722,10 +3709,7 @@ mod tests {
     #[test]
     fn catalogue_version_survives_reload() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-version-reload-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-version-reload-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let catalog_path = dir.join("catalog.json");
 
@@ -3751,10 +3735,7 @@ mod tests {
     #[test]
     fn first_install_creates_sqlite_file() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-firstinstall-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-firstinstall-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let db_path = dir.join("analyticsdb-catalog.db");
 
@@ -3764,16 +3745,25 @@ mod tests {
                 .await
                 .expect("first-install bootstrap");
 
-            assert!(db_path.exists(), "SQLite catalog must be created on first start");
+            assert!(
+                db_path.exists(),
+                "SQLite catalog must be created on first start"
+            );
 
             // Default database and users should be present.
             let snap = cp.cluster_snapshot().await;
-            assert!(snap.databases.iter().any(|d| d.name == "postgres"),
-                "default postgres database should exist");
-            assert!(snap.users.iter().any(|u| u.name == "postgres"),
-                "default postgres user should exist");
-            assert!(snap.catalogue_version >= 1,
-                "version should be > 0 after bootstrap");
+            assert!(
+                snap.databases.iter().any(|d| d.name == "postgres"),
+                "default postgres database should exist"
+            );
+            assert!(
+                snap.users.iter().any(|u| u.name == "postgres"),
+                "default postgres user should exist"
+            );
+            assert!(
+                snap.catalogue_version >= 1,
+                "version should be > 0 after bootstrap"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         });
@@ -3782,10 +3772,7 @@ mod tests {
     #[test]
     fn startup_auto_migrates_legacy_json_to_sqlite() {
         run_async_test(async {
-            let dir = std::env::temp_dir().join(format!(
-                "adb-automigrate-{}",
-                Uuid::now_v7()
-            ));
+            let dir = std::env::temp_dir().join(format!("adb-automigrate-{}", Uuid::now_v7()));
             std::fs::create_dir_all(&dir).expect("temp dir");
 
             // Simulate an existing JSON deployment by bootstrapping with the
@@ -3810,15 +3797,24 @@ mod tests {
                 .await
                 .expect("auto-migrate + load");
 
-            assert!(db_path.exists(), "SQLite file must be created by auto-migration");
+            assert!(
+                db_path.exists(),
+                "SQLite file must be created by auto-migration"
+            );
 
             let snap_db = cp_db.cluster_snapshot().await;
-            assert_eq!(snap_json.databases, snap_db.databases,
-                "databases must survive auto-migration");
-            assert_eq!(snap_json.users, snap_db.users,
-                "users must survive auto-migration");
-            assert_eq!(snap_json.catalogue_version, snap_db.catalogue_version,
-                "version must survive auto-migration");
+            assert_eq!(
+                snap_json.databases, snap_db.databases,
+                "databases must survive auto-migration"
+            );
+            assert_eq!(
+                snap_json.users, snap_db.users,
+                "users must survive auto-migration"
+            );
+            assert_eq!(
+                snap_json.catalogue_version, snap_db.catalogue_version,
+                "version must survive auto-migration"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         });
@@ -5137,7 +5133,11 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
     }
 
     if upper.starts_with("CREATE GROUP ") || upper.starts_with("CREATE ROLE ") {
-        let keyword = if upper.starts_with("CREATE GROUP ") { "CREATE GROUP " } else { "CREATE ROLE " };
+        let keyword = if upper.starts_with("CREATE GROUP ") {
+            "CREATE GROUP "
+        } else {
+            "CREATE ROLE "
+        };
         let name = trimmed[keyword.len()..].trim();
         return Some(MetadataStatement::CreateGroup {
             name: name.to_string(),
@@ -5145,7 +5145,11 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
     }
 
     if upper.starts_with("ALTER GROUP ") || upper.starts_with("ALTER ROLE ") {
-        let keyword = if upper.starts_with("ALTER GROUP ") { "ALTER GROUP " } else { "ALTER ROLE " };
+        let keyword = if upper.starts_with("ALTER GROUP ") {
+            "ALTER GROUP "
+        } else {
+            "ALTER ROLE "
+        };
         let remainder = trimmed[keyword.len()..].trim();
         let upper_remainder = remainder.to_ascii_uppercase();
         if let Some(add_idx) = upper_remainder.find(" ADD USER ") {
@@ -5175,7 +5179,11 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
     }
 
     if upper.starts_with("DROP GROUP ") || upper.starts_with("DROP ROLE ") {
-        let keyword = if upper.starts_with("DROP GROUP ") { "DROP GROUP " } else { "DROP ROLE " };
+        let keyword = if upper.starts_with("DROP GROUP ") {
+            "DROP GROUP "
+        } else {
+            "DROP ROLE "
+        };
         let mut remainder = trimmed[keyword.len()..].trim();
         let mut if_exists = false;
         if remainder.to_ascii_uppercase().starts_with("IF EXISTS ") {

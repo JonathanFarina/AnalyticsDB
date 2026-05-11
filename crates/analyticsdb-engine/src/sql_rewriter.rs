@@ -260,7 +260,7 @@ fn rewrite_select_recursive<'a>(
                     let original_name = get_canonical_name(expr);
                     let old_expr_str = expr.to_string();
                     rewrite_expr_recursive(expr, control_plane, session, &table_schemas).await?;
-                    if expr.to_string() != old_expr_str {
+                    if expr.to_string() != old_expr_str && is_safe_bare_identifier(&original_name) {
                         *item = SelectItem::ExprWithAlias {
                             expr: expr.clone(),
                             alias: Ident::new(original_name),
@@ -659,10 +659,24 @@ fn resolve_table_schemas_recursive<'a>(
     })
 }
 
+fn is_safe_bare_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn make_unique_alias(base: &str, seen: &HashSet<String>) -> String {
     let mut safe_base = base.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
-    
-    if safe_base.is_empty() || (!safe_base.chars().next().unwrap().is_ascii_alphabetic() && safe_base.chars().next().unwrap() != '_') {
+
+    if safe_base.is_empty()
+        || (!safe_base.chars().next().unwrap().is_ascii_alphabetic()
+            && safe_base.chars().next().unwrap() != '_')
+    {
         safe_base = format!("col_{}", safe_base);
     }
 
@@ -725,7 +739,9 @@ fn rewrite_expr_recursive<'a>(
             Expr::Identifier(ident) => {
                 let col_name = ident.value.clone();
                 for columns in table_schemas.values() {
-                    if let Some((_, Some(default_val))) = columns.iter().find(|(c, _)| c == &col_name) {
+                    if let Some((_, Some(default_val))) =
+                        columns.iter().find(|(c, _)| c == &col_name)
+                    {
                         *expr = wrap_with_coalesce(expr.clone(), default_val);
                         return Ok(());
                     }
@@ -736,7 +752,9 @@ fn rewrite_expr_recursive<'a>(
                     let alias = parts[parts.len() - 2].to_string();
                     let col_name = parts.last().unwrap().to_string();
                     if let Some(columns) = table_schemas.get(&alias) {
-                        if let Some((_, Some(default_val))) = columns.iter().find(|(c, _)| c == &col_name) {
+                        if let Some((_, Some(default_val))) =
+                            columns.iter().find(|(c, _)| c == &col_name)
+                        {
                             *expr = wrap_with_coalesce(expr.clone(), default_val);
                             return Ok(());
                         }
@@ -837,13 +855,15 @@ fn rewrite_expr_recursive<'a>(
                     for arg in &mut arg_list.args {
                         match arg {
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
+                                rewrite_expr_recursive(e, control_plane, session, table_schemas)
+                                    .await?;
                             }
                             FunctionArg::Named {
                                 arg: FunctionArgExpr::Expr(e),
                                 ..
                             } => {
-                                rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
+                                rewrite_expr_recursive(e, control_plane, session, table_schemas)
+                                    .await?;
                             }
                             _ => {}
                         }
@@ -868,9 +888,20 @@ fn rewrite_expr_recursive<'a>(
                     rewrite_expr_recursive(o, control_plane, session, table_schemas).await?;
                 }
                 for condition in conditions {
-                    rewrite_expr_recursive(&mut condition.condition, control_plane, session, table_schemas)
-                        .await?;
-                    rewrite_expr_recursive(&mut condition.result, control_plane, session, table_schemas).await?;
+                    rewrite_expr_recursive(
+                        &mut condition.condition,
+                        control_plane,
+                        session,
+                        table_schemas,
+                    )
+                    .await?;
+                    rewrite_expr_recursive(
+                        &mut condition.result,
+                        control_plane,
+                        session,
+                        table_schemas,
+                    )
+                    .await?;
                 }
                 if let Some(e) = else_result {
                     rewrite_expr_recursive(e, control_plane, session, table_schemas).await?;
