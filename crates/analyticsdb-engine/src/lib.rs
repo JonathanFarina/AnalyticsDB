@@ -101,7 +101,9 @@ impl TableProvider for StreamingTableProvider {
     }
 }
 use datafusion::error::DataFusionError;
+use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::ExprSchemable;
+use datafusion::physical_plan::RecordBatchStream;
 use datafusion::prelude::{
     col, lit, ParquetReadOptions, SessionConfig, SessionContext as DfSessionContext,
 };
@@ -109,7 +111,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::SendableRecordBatchStream;
-use futures::{stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem,
     SetExpr, Statement, TableFactor,
@@ -297,6 +299,45 @@ impl QueryExecutionResult {
             message: self.message.clone(),
             execution_time_ms: self.execution_time_ms,
         }
+    }
+}
+
+struct QueryLogStreamWrapper {
+    inner: SendableRecordBatchStream,
+    probe: query_log::QueryProbe,
+    rows: i64,
+    bytes: i64,
+}
+
+impl Stream for QueryLogStreamWrapper {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                self.rows += batch.num_rows() as i64;
+                self.bytes += batch.get_array_memory_size() as i64;
+                std::task::Poll::Ready(Some(Ok(batch)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.probe.finish_stream_error(e.to_string());
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.probe.finish_stream_success(self.rows, self.bytes);
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for QueryLogStreamWrapper {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
     }
 }
 
@@ -556,6 +597,14 @@ fn projected_metadata_schema(sql: &str, base_schema: &SchemaRef) -> Result<Schem
 }
 
 impl PrototypeEngine {
+    pub async fn local_node_id(&self) -> String {
+        self.control_plane
+            .local_node()
+            .await
+            .map(|n| n.id)
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     pub fn new() -> Result<Self> {
         let control_plane = Arc::new(ControlPlane::new_bootstrap());
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
@@ -601,6 +650,33 @@ impl PrototypeEngine {
 
     /// Executes an `ExecutePartitionRequest` and returns a stream of `RecordBatch`es.
     pub async fn execute_partition_stream(
+        &self,
+        req: &distributed::ExecutePartitionRequest,
+    ) -> Result<SendableRecordBatchStream> {
+        let probe = self.query_log.start_probe_distributed(
+            &QueryRequest {
+                sql: req.sql.clone(),
+                session: req.session.clone(),
+            },
+            &req.query_id,
+            &req.initial_query_id,
+            false,
+            &req.coordinator_node_id,
+            Some(self.local_node_id().await),
+            None,
+            &req.sql,
+        );
+
+        let stream = self.execute_partition_stream_inner(req).await?;
+        Ok(Box::pin(QueryLogStreamWrapper {
+            inner: stream,
+            probe,
+            rows: 0,
+            bytes: 0,
+        }))
+    }
+
+    async fn execute_partition_stream_inner(
         &self,
         req: &distributed::ExecutePartitionRequest,
     ) -> Result<SendableRecordBatchStream> {
@@ -679,6 +755,34 @@ impl PrototypeEngine {
     /// Parquet file under `req.write_prefix` and the function returns an
     /// acknowledgment with the written file paths and total row count.
     pub async fn execute_distributed_write_partition(
+        &self,
+        req: &distributed::ExecutePartitionWriteRequest,
+    ) -> Result<distributed::ExecutePartitionWriteAck> {
+        let probe = self.query_log.start_probe_distributed(
+            &QueryRequest {
+                sql: req.sql.clone(),
+                session: req.session.clone(),
+            },
+            &req.query_id,
+            &req.initial_query_id,
+            false,
+            &req.coordinator_node_id,
+            Some(self.local_node_id().await),
+            None,
+            &req.sql,
+        );
+
+        let result = self.execute_distributed_write_partition_inner(req).await;
+
+        if let Ok(ack) = &result {
+            probe.observe_written(ack.row_count as i64, 0);
+        }
+        probe.finish_stream_success(0, 0); // result_rows is 0 for writes, usually
+
+        result
+    }
+
+    async fn execute_distributed_write_partition_inner(
         &self,
         req: &distributed::ExecutePartitionWriteRequest,
     ) -> Result<distributed::ExecutePartitionWriteAck> {
@@ -1004,29 +1108,12 @@ impl PrototypeEngine {
         &self,
         session: &SessionContext,
         relation: &analyticsdb_control::CatalogRelation,
-    ) {
+    ) -> Result<()> {
         if relation.indexes.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let engine = self.clone();
-        let session = session.clone();
-        let relation = relation.clone();
-
-        tokio::spawn(async move {
-            if let Err(rebuild_error) = engine
-                .rebuild_all_index_snapshots(&session, &relation)
-                .await
-            {
-                warn!(
-                    database = %relation.database,
-                    schema = %relation.schema,
-                    table = %relation.name,
-                    error = %rebuild_error,
-                    "failed to rebuild managed-table index sidecars in background; previous published snapshot remains active"
-                );
-            }
-        });
+        self.rebuild_all_index_snapshots(session, relation).await
     }
 
     fn validate_unique_indexes_for_rows(
@@ -1048,6 +1135,7 @@ impl PrototypeEngine {
         statement: IndexedSelectStatement,
         admission: &QueryAdmission,
         started: Instant,
+        _probe: &query_log::QueryProbe,
     ) -> Result<Option<QueryExecutionResult>> {
         let relation = match self
             .control_plane
@@ -1367,6 +1455,7 @@ impl PrototypeEngine {
         request: &QueryRequest,
         admission: &QueryAdmission,
         started: Instant,
+        _probe: &query_log::QueryProbe,
     ) -> Result<Option<QueryExecutionStream>> {
         // Only attempt distribution for plain SELECT statements.
         let Some((db, schema_name, table_name)) = parse_plain_select_table(&request.sql) else {
@@ -1492,6 +1581,7 @@ impl PrototypeEngine {
                     let req = distributed::ExecutePartitionRequest {
                         query_id: admission.query_id.clone(),
                         initial_query_id: admission.query_id.clone(),
+                        coordinator_node_id: admission.coordinator_node_id.clone(),
                         sql: worker_sql.clone(),
                         session: request.session.clone(),
                         partition_files: chunk_files,
@@ -1732,9 +1822,10 @@ impl PrototypeEngine {
         request: &QueryRequest,
         admission: &QueryAdmission,
         started: Instant,
+        _probe: &query_log::QueryProbe,
     ) -> Result<Option<QueryExecutionResult>> {
         let Some(exec_stream) = self
-            .try_execute_distributed_select_stream(request, admission, started)
+            .try_execute_distributed_select_stream(request, admission, started, _probe)
             .await?
         else {
             return Ok(None);
@@ -1780,6 +1871,7 @@ impl PrototypeEngine {
         statement: &InsertSelectStatement,
         admission: &QueryAdmission,
         started: Instant,
+        _probe: &query_log::QueryProbe,
     ) -> Result<Option<QueryExecutionResult>> {
         // Resolve the target relation first so we can describe it in logs.
         let target_relation = match self
@@ -1915,6 +2007,7 @@ impl PrototypeEngine {
                     let req = distributed::ExecutePartitionWriteRequest {
                         query_id: admission.query_id.clone(),
                         initial_query_id: admission.query_id.clone(),
+                        coordinator_node_id: admission.coordinator_node_id.clone(),
                         sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
                         session: request.session.clone(),
                         partition_files: chunk_files,
@@ -2089,7 +2182,7 @@ impl PrototypeEngine {
 
             // Commit: refresh index sidecars now that new Parquet files are visible.
             self.refresh_index_snapshots_after_mutation(&request.session, target_relation)
-                .await;
+                .await?;
 
             let table_key = format!(
                 "{}.{}.{}",
@@ -2186,6 +2279,7 @@ impl PrototypeEngine {
                     let req = distributed::ExecutePartitionWriteRequest {
                         query_id: admission.query_id.clone(),
                         initial_query_id: admission.query_id.clone(),
+                        coordinator_node_id: admission.coordinator_node_id.clone(),
                         sql: worker_sql,
                         session: request.session.clone(),
                         partition_files: Vec::new(),
@@ -2241,7 +2335,7 @@ impl PrototypeEngine {
         let probe = self
             .query_log
             .start_probe(&request, &admission, &original_sql);
-        let result = self.execute_query_inner(request, admission, started).await;
+        let result = self.execute_query_inner(request, admission, started, &probe).await;
         probe.finish_result(&result);
         result
     }
@@ -2251,16 +2345,17 @@ impl PrototypeEngine {
         request: QueryRequest,
         admission: QueryAdmission,
         started: Instant,
+        probe: &query_log::QueryProbe,
     ) -> Result<QueryExecutionResult> {
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             return self
-                .execute_insert_select(&request, statement, admission, started)
+                .execute_insert_select(&request, statement, admission, started, probe)
                 .await;
         }
 
         if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
             if let Some(result) = self
-                .try_execute_indexed_select(&request, statement, &admission, started)
+                .try_execute_indexed_select(&request, statement, &admission, started, probe)
                 .await?
             {
                 return Ok(result);
@@ -2269,7 +2364,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
             let result = self
-                .execute_metadata_query(&request, statement, admission, started)
+                .execute_metadata_query(&request, statement, admission, started, probe)
                 .await?;
             if matches!(result.outcome, StatementOutcome::Command { .. }) {
                 self.invalidate_session_contexts().await;
@@ -2278,7 +2373,7 @@ impl PrototypeEngine {
         }
 
         if let Some(result) = self
-            .try_execute_distributed_select(&request, &admission, started)
+            .try_execute_distributed_select(&request, &admission, started, probe)
             .await?
         {
             return Ok(result);
@@ -2288,7 +2383,12 @@ impl PrototypeEngine {
         let context = self.create_session_context(&session).await?;
         let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
-        let batches = dataframe.collect().await.map_err(sanitize_error)?;
+        let plan = dataframe.create_physical_plan().await.map_err(sanitize_error)?;
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), context.task_ctx())
+            .await
+            .map_err(sanitize_error)?;
+        probe.observe_plan(plan.as_ref());
+
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let outcome = if schema.fields().is_empty() {
             StatementOutcome::Command {
@@ -2315,11 +2415,34 @@ impl PrototypeEngine {
         &self,
         request: &QueryRequest,
     ) -> Result<QueryExecutionStream> {
+        let original_sql = request.sql.clone();
         let (request, admission, started) = self.prepare_query_request(request).await?;
+        let probe = self
+            .query_log
+            .start_probe(&request, &admission, &original_sql);
+
+        let mut execution = self.execute_query_stream_inner(&request, admission, started, &probe).await?;
+        execution.stream = Box::pin(QueryLogStreamWrapper {
+            inner: execution.stream,
+            probe,
+            rows: 0,
+            bytes: 0,
+        });
+
+        Ok(execution)
+    }
+
+    async fn execute_query_stream_inner(
+        &self,
+        request: &QueryRequest,
+        admission: QueryAdmission,
+        started: Instant,
+        probe: &query_log::QueryProbe,
+    ) -> Result<QueryExecutionStream> {
 
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             let execution = self
-                .execute_insert_select(&request, statement, admission, started)
+                .execute_insert_select(&request, statement, admission, started, probe)
                 .await?;
             let schema = Arc::new(Schema::empty());
             let batch_stream =
@@ -2339,7 +2462,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
             if let Some(execution) = self
-                .try_execute_indexed_select(&request, statement, &admission, started)
+                .try_execute_indexed_select(&request, statement, &admission, started, probe)
                 .await?
             {
                 let schema = Arc::clone(&execution.schema);
@@ -2365,7 +2488,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
             let execution = self
-                .execute_metadata_query(&request, statement, admission, started)
+                .execute_metadata_query(&request, statement, admission, started, probe)
                 .await?;
             if matches!(execution.outcome, StatementOutcome::Command { .. }) {
                 self.invalidate_session_contexts().await;
@@ -2391,7 +2514,7 @@ impl PrototypeEngine {
         }
 
         if let Some(result) = self
-            .try_execute_distributed_select_stream(&request, &admission, started)
+            .try_execute_distributed_select_stream(&request, &admission, started, probe)
             .await?
         {
             return Ok(result);
@@ -2403,7 +2526,9 @@ impl PrototypeEngine {
         let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
 
-        let stream = dataframe.execute_stream().await.map_err(sanitize_error)?;
+        let plan = dataframe.create_physical_plan().await.map_err(sanitize_error)?;
+        probe.observe_plan(plan.as_ref());
+        let stream = datafusion::physical_plan::execute_stream(plan, context.task_ctx()).map_err(sanitize_error)?;
         let outcome = if schema.fields().is_empty() {
             StatementOutcome::Command {
                 tag: "OK".to_string(),
@@ -2467,10 +2592,11 @@ impl PrototypeEngine {
         statement: InsertSelectStatement,
         admission: QueryAdmission,
         started: Instant,
+        probe: &query_log::QueryProbe,
     ) -> Result<QueryExecutionResult> {
         // Attempt distributed execution first; fall through on None.
         if let Some(result) = self
-            .try_execute_distributed_insert_select(request, &statement, &admission, started)
+            .try_execute_distributed_insert_select(request, &statement, &admission, started, probe)
             .await?
         {
             return Ok(result);
@@ -2495,7 +2621,9 @@ impl PrototypeEngine {
         })?;
         let (store, prefix) = storage::store_for_location(storage_location)?;
         let relation_lock = self.relation_lock(&relation).await;
+        println!("insert waiting for lock for {}", request.sql);
         let _write_guard = relation_lock.write().await;
+        println!("insert acquired lock for {}", request.sql);
 
         let context = self.create_session_context(&request.session).await?;
         let rewritten_query_sql = sql_rewriter::rewrite_sql_for_postgres_compatibility(
@@ -2617,14 +2745,14 @@ impl PrototypeEngine {
             storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
         }
 
-        self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-            .await;
-
         let table_key = format!(
             "{}.{}.{}",
             relation.database, relation.schema, relation.name
         );
         self.file_list_cache.invalidate(&table_key);
+
+        self.rebuild_all_index_snapshots(&request.session, &relation)
+            .await?;
 
         Ok(QueryExecutionResult {
             query_id: admission.query_id,
@@ -2650,6 +2778,7 @@ impl PrototypeEngine {
         statement: MetadataStatement,
         admission: QueryAdmission,
         started: Instant,
+        _probe: &query_log::QueryProbe,
     ) -> Result<QueryExecutionResult> {
         let (schema, batches, message, outcome, new_session) = match statement {
             MetadataStatement::CreateDatabase { .. }
@@ -3483,8 +3612,8 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-                    .await;
+                self.rebuild_all_index_snapshots(&request.session, &relation)
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -3564,7 +3693,7 @@ impl PrototypeEngine {
 
                 storage::append_parquet_batch(&store, &prefix, prepared_batch).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-                    .await;
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -3650,7 +3779,7 @@ impl PrototypeEngine {
                 let row_count =
                     write_dataframe_to_table_snapshot(updated_dataframe, &store, &prefix).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-                    .await;
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -3714,7 +3843,7 @@ impl PrototypeEngine {
                 let row_count =
                     write_dataframe_to_table_snapshot(remaining_dataframe, &store, &prefix).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-                    .await;
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -3767,7 +3896,7 @@ impl PrototypeEngine {
 
                 persist_empty_table_snapshot(&store, &prefix, &arrow_schema).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
-                    .await;
+                    .await?;
 
                 (
                     Arc::new(Schema::empty()),
@@ -6869,6 +6998,110 @@ FROM generate_series(1, 1000000) AS s(n)
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn query_log_production_features() {
+        let catalog_path = temp_catalog_path();
+        configure_fast_query_log(&catalog_path).await;
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        // 1. Test partitioned layout and metrics (read_rows)
+        engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT * FROM generate_series(1, 100)".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("query should execute");
+
+        // 2. Test streaming logging
+        let mut stream_exec = engine
+            .execute_query_stream(&QueryRequest {
+                sql: "SELECT * FROM generate_series(1, 50) AS t2".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("stream query should execute");
+        
+        use futures::StreamExt;
+        while let Some(batch) = stream_exec.stream.next().await {
+            batch.expect("batch should be ok");
+        }
+
+        // Wait for flush
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            let result = engine
+                .execute_query(&QueryRequest {
+                    sql: "SELECT query, read_rows, result_rows FROM system.query_log ORDER BY event_time_us".to_string(),
+                    session: session.clone(),
+                })
+                .await
+                .expect("query log should be readable");
+            rows = result.to_query_response().rows;
+            if rows.len() >= 2 && rows.iter().any(|r| r[0].contains("100")) && rows.iter().any(|r| r[0].contains("t2")) {
+                break;
+            }
+            if i % 10 == 0 {
+                println!("Waiting for logs... current count: {}", rows.len());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if rows.is_empty() {
+             let query_log_dir = std::path::Path::new(&catalog_path)
+                .with_extension("managed")
+                .join("system")
+                .join("query_log");
+             println!("Query log dir: {:?}", query_log_dir);
+             if query_log_dir.exists() {
+                 for entry in std::fs::read_dir(&query_log_dir).unwrap() {
+                     println!("  Entry: {:?}", entry.unwrap().path());
+                 }
+             } else {
+                 println!("Query log dir DOES NOT EXIST");
+             }
+        }
+
+        assert!(rows.len() >= 2, "Expected at least 2 log rows, found {}", rows.len());
+        
+        // Find generate_series(1, 100)
+        let row100 = rows.iter().find(|r| r[0].contains("100")).expect("row 100 not found");
+        // read_rows might be 100 if generate_series is correctly instrumented
+        assert!(row100[1].parse::<i64>().unwrap() >= 100, "read_rows should be >= 100, found {}", row100[1]);
+        assert_eq!(row100[2], "100");
+
+        // Find generate_series(1, 50) AS t2
+        let row50 = rows.iter().find(|r| r[0].contains("t2")).expect("row 50 not found");
+        assert!(row50[1].parse::<i64>().unwrap() >= 50, "read_rows should be >= 50, found {}", row50[1]);
+        assert_eq!(row50[2], "50");
+
+        // Verify partitioned files on disk
+        let query_log_dir = std::path::Path::new(&catalog_path)
+            .with_extension("managed")
+            .join("system")
+            .join("query_log");
+        
+        let mut found_partitioned = false;
+        for entry in std::fs::read_dir(query_log_dir).expect("should be able to read query log dir") {
+            let entry = entry.expect("valid entry");
+            if entry.file_type().expect("valid file type").is_dir() {
+                let name = entry.file_name();
+                if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+                    found_partitioned = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_partitioned, "should have created partitioned YYYY/ directories");
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_primary_key_inserts_keep_table_and_index_consistent() {
         let catalog_path = temp_catalog_path();
         let engine = PrototypeEngine::from_catalog_path(&catalog_path)
@@ -7113,6 +7346,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-q1".to_string(),
+            coordinator_node_id: "coordinator".to_string(),
             initial_query_id: "test-partition-q1".to_string(),
             sql: "SELECT 1 + 1 AS result".to_string(),
             session: SessionContext {
@@ -7181,6 +7415,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-orders-agg".to_string(),
+            coordinator_node_id: "coordinator".to_string(),
             initial_query_id: "test-partition-orders-agg".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session: session.clone(),
@@ -7210,6 +7445,7 @@ FROM generate_series(1, 10) AS s(n)";
             .collect::<Vec<_>>();
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-orders-agg-wrong-catalog".to_string(),
+            coordinator_node_id: "coordinator".to_string(),
             initial_query_id: "test-partition-orders-agg-wrong-catalog".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session: session.clone(),
@@ -7273,6 +7509,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-string-backed-orders-agg".to_string(),
+            coordinator_node_id: "coordinator".to_string(),
             initial_query_id: "test-partition-string-backed-orders-agg".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session,
@@ -7781,6 +8018,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionWriteRequest {
             query_id: "write-test-1".to_string(),
+            coordinator_node_id: "coordinator".to_string(),
             initial_query_id: "write-test-1".to_string(),
             sql: format!("SELECT * FROM partition ({} files)", src_files.len()),
             session: session.clone(),

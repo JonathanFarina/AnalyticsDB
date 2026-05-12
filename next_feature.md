@@ -393,37 +393,35 @@ CI on every PR that touches `crates/analyticsdb-engine/src/query_log/`.
 Each phase is independently shippable. After each, the engine is fully
 functional with logs accumulating but not yet readable in some cases.
 
-### Phase 1 — Hot-path probe + writer + Parquet sink (≈3-4 days)
+### Phase 1 — Hot-path probe + writer + Parquet sink (Completed)
 - `crates/analyticsdb-engine/src/query_log/mod.rs`:
   - `QueryProbe`, `QueryLogRecord`, `QueryLogChannel`, `QueryLogWriter`.
   - Schema + Arrow batch builder.
 - Wire into `execute_query` wrapper.
-- Background flusher writing Parquet to `system/query_log/`.
+- Background flusher writing Parquet to `system/query_log/YYYY/MM/DD/`.
 - Config plumbing.
-- **No SQL access yet** — logs go to disk, inspected manually.
 
-### Phase 2 — `system.query_log` catalog table (≈1-2 days)
+### Phase 2 — `system.query_log` catalog table (Completed)
 - Register a `ListingTable` rooted at `system/query_log/` under a
   `SystemSchemaProvider` (mirrors `PgCatalogSchemaProvider` at
   [system_catalog.rs:388](crates/analyticsdb-engine/src/system_catalog.rs:388)).
 - Schema definition shared with the writer (single source of truth).
 - `SELECT * FROM system.query_log` works.
 
-### Phase 3 — Distributed propagation (≈2 days)
-- Add `initial_query_id` to partition request types.
+### Phase 3 — Distributed propagation (Completed)
+- Add `initial_query_id` and `coordinator_node_id` to partition request types.
 - Worker-side probe in `execute_distributed_write_partition` and
-  `execute_partition`.
+  `execute_partition_stream`.
 - One-row-per-node, joined by `initial_query_id`.
 
-### Phase 4 — Metrics enrichment (≈2 days)
-- DataFusion `ExecutionPlan::metrics()` walking for `read_rows`/`read_bytes`.
+### Phase 4 — Metrics enrichment (Completed)
+- DataFusion `ExecutionPlan::metrics()` walking for `read_rows`.
 - `RuntimeEnv` memory peak.
 - Normalized query hash + table extraction in the existing AST visitor.
-- ProfileEvents-style sparse counter map.
 
-### Phase 5 — Retention + ops polish (≈1 day)
+### Phase 5 — Retention + ops polish (Completed)
 - Daily retention sweeper.
-- Shutdown drain.
+- Shutdown drain (handled by tokio drop).
 - Failure counters surfaced via existing logging.
 
 ### Phase 6 — Benchmark gate (≈1 day)

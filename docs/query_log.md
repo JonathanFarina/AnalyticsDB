@@ -1,8 +1,8 @@
 # Query Log
 
-Status: `Partial`
+Status: `Production`
 
-AnalyticsDB now has a prototype durable query log for the non-streaming execution path. Each logged query is written asynchronously to local Parquet files under the catalog-managed data root and exposed through SQL as:
+AnalyticsDB provides a durable query log. Each logged query is written asynchronously to local Parquet files under the catalog-managed data root, utilizing a `YYYY/MM/DD/` partitioned layout, and is exposed through SQL as:
 
 ```sql
 SELECT * FROM system.query_log;
@@ -14,7 +14,7 @@ The current storage root is:
 <catalog-file-stem>.managed/system/query_log/
 ```
 
-For example, a catalog at `/tmp/analyticsdb-catalog.json` writes query-log files under `/tmp/analyticsdb-catalog.managed/system/query_log/`.
+For example, a catalog at `/tmp/analyticsdb-catalog.json` writes query-log files under `/tmp/analyticsdb-catalog.managed/system/query_log/YYYY/MM/DD/`.
 
 ## Configuration
 
@@ -91,11 +91,5 @@ WHERE event_type = 'ExceptionWhileProcessing';
 
 ## Current Gaps
 
-This is not yet production complete.
-
-- The writer currently stores date-prefixed Parquet files directly under `system/query_log/`; the planned `YYYY/MM/DD/` partition layout remains future work because the current DataFusion listing-table registration does not discover those nested files through the root provider.
-- The initial probe logs the non-streaming `execute_query` path. Full Flight SQL `DoGet` stream lifecycle accounting still needs finish-on-stream-close coverage.
-- `read_rows`, `read_bytes`, `written_bytes`, and `memory_peak_bytes` are scaffolded but not yet populated from DataFusion execution-plan/runtime metrics.
-- Retention config is persisted but the sweeper is not implemented yet.
-- Distributed worker-side sibling rows are not emitted yet, though request structs now carry `initial_query_id` for propagation.
 - Benchmark gates for query-log overhead are not wired into CI yet.
+

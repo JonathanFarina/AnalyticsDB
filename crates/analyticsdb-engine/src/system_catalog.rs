@@ -101,17 +101,47 @@ impl TableProvider for QueryLogListingTable {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[datafusion::prelude::Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let table_path = ListingTableUrl::parse(&self.root_location)?;
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+        let local_path = self.root_location.strip_prefix("file://").unwrap_or(&self.root_location);
+        
+        let mut all_files = Vec::new();
+        fn collect_files(path: &std::path::Path, files: &mut Vec<String>) {
+            if path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            collect_files(&entry.path(), files);
+                        }
+                    }
+                }
+            } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+        collect_files(std::path::Path::new(local_path), &mut all_files);
+
+        if all_files.is_empty() {
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema))));
+        }
+
+        let mut table_paths = Vec::new();
+        for file in all_files {
+            let url = format!("file://{}", file);
+            table_paths.push(ListingTableUrl::parse(url)?);
+        }
+
+        let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        listing_options.file_extension = ".parquet".to_string();
+        
+        let config = ListingTableConfig::new_with_multi_paths(table_paths)
+            .with_listing_options(listing_options)
             .with_schema(Arc::clone(&self.schema));
         let table = ListingTable::try_new(config)?;
-        table.scan(state, projection, filters, limit).await
+        table.scan(_state, projection, filters, limit).await
     }
 }
 

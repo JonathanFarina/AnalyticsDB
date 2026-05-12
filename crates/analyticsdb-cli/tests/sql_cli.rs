@@ -945,7 +945,7 @@ async fn cli_can_query_postgres_wire_query_log() {
     let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
 
     let executed = protocol_json_response(
-        "postgresql",
+        "postgres",
         &postgres_endpoint,
         None,
         "SELECT 13 AS query_log_probe",
@@ -964,7 +964,7 @@ async fn cli_can_query_postgres_wire_query_log() {
 
     for _ in 0..20 {
         logged = protocol_json_response(
-            "postgresql",
+            "postgres",
             &postgres_endpoint,
             None,
             "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
@@ -4082,7 +4082,7 @@ async fn cli_protocols_cover_supported_sql_surface_with_matrix_parity() {
             user: "postgres",
             role: Some("postgres"),
             password: Some("postgres"),
-            sql: "ALTER USER analytics_reader PASSWORD reader_next",
+            sql: "ALTER USER analytics_reader PASSWORD @#$ malformed",
             expectation: CommandErrorExpectation::AnyKeyword(&[
                 "SQL", "Parser", "syntax", "ALTER", "PASSWORD",
             ]),

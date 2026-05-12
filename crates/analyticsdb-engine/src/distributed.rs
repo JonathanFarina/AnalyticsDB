@@ -29,6 +29,9 @@ pub struct ExecutePartitionRequest {
     /// Coordinator query id shared by all distributed sibling tasks.
     #[serde(default)]
     pub initial_query_id: String,
+    /// Node ID of the coordinator that admitted the query.
+    #[serde(default)]
+    pub coordinator_node_id: String,
     /// Complete SQL to execute on the worker node.
     pub sql: String,
     /// Session (user, role, database, schema) to run under.
@@ -133,6 +136,8 @@ pub struct ExecutePartitionWriteRequest {
     pub query_id: String,
     #[serde(default)]
     pub initial_query_id: String,
+    #[serde(default)]
+    pub coordinator_node_id: String,
     pub sql: String,
     pub session: SessionContext,
     pub partition_files: Vec<String>,
@@ -423,6 +428,7 @@ mod tests {
         let req = ExecutePartitionRequest {
             query_id: "q1".to_string(),
             initial_query_id: "q1".to_string(),
+            coordinator_node_id: "node-1".to_string(),
             sql: "SELECT 1".to_string(),
             session: SessionContext::default(),
             partition_files: vec!["/tmp/a.parquet".to_string()],
@@ -431,6 +437,7 @@ mod tests {
         let bytes = bincode::serialize(&req).unwrap();
         let decoded: ExecutePartitionRequest = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.query_id, "q1");
+        assert_eq!(decoded.coordinator_node_id, "node-1");
         assert_eq!(decoded.partition_files, vec!["/tmp/a.parquet"]);
         assert!(decoded.source_columns.is_empty());
     }

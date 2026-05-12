@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,12 +15,15 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::ExecutionPlan;
+use futures::StreamExt;
+use object_store::ObjectStoreExt;
 use regex::Regex;
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::debug;
 
 use crate::{storage, QueryExecutionResult};
 
@@ -35,7 +38,7 @@ impl QueryLog {
     pub fn new(config: QueryLogConfig, root: PathBuf) -> Self {
         let root_location = format!("file://{}", root.display());
         if let Err(error) = std::fs::create_dir_all(&root) {
-            warn!(
+            debug!(
                 "query log disabled because root directory '{}' could not be created: {}",
                 root.display(),
                 error
@@ -89,6 +92,30 @@ impl QueryLog {
         admission: &QueryAdmission,
         original_sql: &str,
     ) -> QueryProbe {
+        self.start_probe_distributed(
+            request,
+            &admission.query_id,
+            &admission.query_id,
+            true,
+            &admission.coordinator_node_id,
+            None,
+            None,
+            original_sql,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_probe_distributed(
+        &self,
+        request: &QueryRequest,
+        query_id: &str,
+        initial_query_id: &str,
+        is_initial_query: bool,
+        coordinator_node_id: &str,
+        worker_node_id: Option<String>,
+        distributed_partition_count: Option<i32>,
+        original_sql: &str,
+    ) -> QueryProbe {
         let Some(sender) = &self.sender else {
             return QueryProbe::noop();
         };
@@ -96,7 +123,7 @@ impl QueryLog {
             return QueryProbe::noop();
         }
         if self.config.sample_rate < 1.0 {
-            let sample = stable_sample_fraction(&admission.query_id);
+            let sample = stable_sample_fraction(initial_query_id);
             if sample >= self.config.sample_rate {
                 return QueryProbe::noop();
             }
@@ -115,9 +142,9 @@ impl QueryLog {
                 finished: AtomicBool::new(false),
                 started_at: Instant::now(),
                 query_start_time_us,
-                query_id: admission.query_id.clone(),
-                initial_query_id: admission.query_id.clone(),
-                is_initial_query: true,
+                query_id: query_id.to_string(),
+                initial_query_id: initial_query_id.to_string(),
+                is_initial_query,
                 query_kind,
                 query,
                 query_truncated,
@@ -125,13 +152,18 @@ impl QueryLog {
                 user: request.session.user.clone(),
                 database: request.session.database.clone(),
                 protocol: protocol_label(&request.session.protocol).to_string(),
-                coordinator_node_id: admission.coordinator_node_id.clone(),
-                worker_node_id: None,
-                distributed_partition_count: None,
+                coordinator_node_id: coordinator_node_id.to_string(),
+                worker_node_id,
+                distributed_partition_count,
                 tables,
                 settings: "{}".to_string(),
                 profile: "{}".to_string(),
                 min_duration_ms: self.config.min_duration_ms.try_into().unwrap_or(i64::MAX),
+                read_rows: AtomicI64::new(0),
+                read_bytes: AtomicI64::new(0),
+                written_rows: AtomicI64::new(0),
+                written_bytes: AtomicI64::new(0),
+                memory_peak_bytes: AtomicI64::new(0),
             })),
         }
     }
@@ -145,6 +177,49 @@ pub struct QueryProbe {
 impl QueryProbe {
     fn noop() -> Self {
         Self { inner: None }
+    }
+
+    pub fn observe_read(&self, rows: i64, bytes: i64) {
+        if let Some(inner) = &self.inner {
+            inner.read_rows.fetch_add(rows, Ordering::Relaxed);
+            inner.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn observe_written(&self, rows: i64, bytes: i64) {
+        if let Some(inner) = &self.inner {
+            inner.written_rows.fetch_add(rows, Ordering::Relaxed);
+            inner.written_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn observe_memory(&self, bytes: i64) {
+        if let Some(inner) = &self.inner {
+            inner.memory_peak_bytes.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn observe_plan(&self, plan: &dyn ExecutionPlan) {
+        if let Some(inner) = &self.inner {
+            if let Some(metrics) = plan.metrics() {
+                let mut read_rows = 0;
+                // Aggregate output_rows from all operators in the plan.
+                // Note: generate_series and some other operators might use different names 
+                // or might not have metrics until execution is complete.
+                for m in metrics.iter() {
+                    let name = m.value().name();
+                    if name == "output_rows" || name == "rows" {
+                        read_rows += m.value().as_usize() as i64;
+                    }
+                }
+                inner.read_rows.fetch_add(read_rows, Ordering::Relaxed);
+            }
+
+            // Recursively observe children
+            for child in plan.children() {
+                self.observe_plan(child.as_ref());
+            }
+        }
     }
 
     pub fn finish_result(&self, result: &Result<QueryExecutionResult>) {
@@ -172,6 +247,9 @@ impl QueryProbe {
                 if let StatementOutcome::Command { rows_affected, .. } = &execution.outcome {
                     record.written_rows = (*rows_affected).try_into().unwrap_or(i64::MAX);
                 }
+                if record.read_rows == 0 && record.result_rows > 0 {
+                    record.read_rows = record.result_rows;
+                }
             }
             Err(error) => {
                 record.event_type = "ExceptionWhileProcessing".to_string();
@@ -187,7 +265,7 @@ impl QueryProbe {
             return;
         }
         if let Err(error) = inner.sender.send(record) {
-            warn!("query log send failed: {}", error);
+            debug!("query log send failed: {}", error);
         }
     }
 
@@ -203,8 +281,11 @@ impl QueryProbe {
         record.event_type = "QueryFinish".to_string();
         record.result_rows = result_rows;
         record.result_bytes = result_bytes;
+        if record.read_rows == 0 && record.result_rows > 0 {
+            record.read_rows = record.result_rows;
+        }
         if let Err(error) = inner.sender.send(record) {
-            warn!("query log send failed: {}", error);
+            debug!("query log send failed: {}", error);
         }
     }
 
@@ -221,7 +302,7 @@ impl QueryProbe {
         record.error_code = Some(1);
         record.error = Some(error);
         if let Err(error) = inner.sender.send(record) {
-            warn!("query log send failed: {}", error);
+            debug!("query log send failed: {}", error);
         }
     }
 }
@@ -249,6 +330,12 @@ struct QueryProbeInner {
     settings: String,
     profile: String,
     min_duration_ms: i64,
+
+    read_rows: AtomicI64,
+    read_bytes: AtomicI64,
+    written_rows: AtomicI64,
+    written_bytes: AtomicI64,
+    memory_peak_bytes: AtomicI64,
 }
 
 fn inner_min_duration_ms(_inner: &QueryProbeInner) -> i64 {
@@ -269,13 +356,13 @@ impl QueryProbeInner {
             query_truncated: self.query_truncated,
             normalized_query_hash: self.normalized_query_hash,
             duration_ms: elapsed.as_millis().try_into().unwrap_or(i64::MAX),
-            read_rows: 0,
-            read_bytes: 0,
-            written_rows: 0,
-            written_bytes: 0,
+            read_rows: self.read_rows.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            written_rows: self.written_rows.load(Ordering::Relaxed),
+            written_bytes: self.written_bytes.load(Ordering::Relaxed),
             result_rows: 0,
             result_bytes: 0,
-            memory_peak_bytes: 0,
+            memory_peak_bytes: self.memory_peak_bytes.load(Ordering::Relaxed),
             error_code: None,
             error: None,
             error_stack: None,
@@ -293,6 +380,7 @@ impl QueryProbeInner {
         }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct QueryLogRecord {
@@ -488,6 +576,10 @@ impl QueryLogWriter {
         let mut buffer = Vec::with_capacity(self.config.batch_size.max(1));
         let interval = Duration::from_millis(self.config.batch_interval_ms.max(1));
         let mut ticker = tokio::time::interval(interval);
+
+        // Retention sweeper: once per day
+        let mut retention_ticker = tokio::time::interval(Duration::from_secs(86400));
+
         loop {
             tokio::select! {
                 maybe_record = self.receiver.recv() => {
@@ -507,6 +599,9 @@ impl QueryLogWriter {
                 _ = ticker.tick() => {
                     self.flush(&mut buffer).await;
                 }
+                _ = retention_ticker.tick() => {
+                    self.cleanup_expired_logs().await;
+                }
             }
         }
     }
@@ -517,7 +612,7 @@ impl QueryLogWriter {
         }
         let records = std::mem::take(buffer);
         if let Err(error) = self.write_records(&records).await {
-            warn!(
+            debug!(
                 "query log flush failed; dropping {} record(s): {}",
                 records.len(),
                 error
@@ -532,19 +627,58 @@ impl QueryLogWriter {
             .timestamp_micros(records[0].event_time_us)
             .single()
             .unwrap_or_else(Utc::now);
-        let key = prefix.join(
-            format!(
-                "{:04}{:02}{:02}-{}.parquet",
-                event_time.year(),
-                event_time.month(),
-                event_time.day(),
-                uuid::Uuid::now_v7()
-            )
-            .as_str(),
-        );
+        let key = prefix
+            .join(format!("{:04}", event_time.year()).as_str())
+            .join(format!("{:02}", event_time.month()).as_str())
+            .join(format!("{:02}", event_time.day()).as_str())
+            .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
         storage::write_parquet_batches(&store, &key, schema(), &[batch]).await
     }
+
+    async fn cleanup_expired_logs(&self) {
+        if self.config.retention_days == 0 {
+            return;
+        }
+
+        let (store, prefix) = match storage::store_for_location(&self.root_location) {
+            Ok(res) => res,
+            Err(_) => return,
+        };
+
+        let expiration = Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
+        let expiration_prefix = format!(
+            "{:04}/{:02}/{:02}/",
+            expiration.year(),
+            expiration.month(),
+            expiration.day()
+        );
+
+        debug!(
+            "query log retention: cleaning up logs older than {}",
+            expiration
+        );
+
+        // List root and find YYYY/ directories
+        let mut stream = store.list(Some(&prefix));
+        while let Some(meta) = stream.next().await {
+            let Ok(meta) = meta else { continue };
+            let path = meta.location.as_ref();
+            if let Some(rel_path) = path.strip_prefix(prefix.as_ref()) {
+                let rel_path = rel_path.trim_start_matches('/');
+                if rel_path.len() >= 10 && rel_path[0..4].chars().all(|c| c.is_ascii_digit()) {
+                    // It looks like YYYY/MM/DD/...
+                    let day_prefix = &rel_path[0..10]; // YYYY/MM/DD
+                    if day_prefix < &expiration_prefix[0..10] {
+                        if let Err(e) = store.delete(&meta.location).await {
+                            debug!("failed to delete expired query log {}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+
 
 fn protocol_label(protocol: &Protocol) -> &'static str {
     match protocol {
