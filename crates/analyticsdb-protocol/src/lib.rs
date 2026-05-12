@@ -49,6 +49,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::util::display::array_value_to_string;
 use futures::stream;
 use futures::Sink;
