@@ -45,6 +45,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::array::UInt16Array;
 use datafusion::arrow::array::UInt32Array;
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::datatypes::Schema;
@@ -288,14 +289,18 @@ pub async fn serve_flight_sql_with_label(
         let identity = tonic::transport::Identity::from_pem(cert, key);
         builder
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
-            .add_service(FlightServiceServer::new(service))
+            .add_service(FlightServiceServer::new(service)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024))
     } else {
         if label == "Flight SQL" || label == "Client Flight SQL" {
             warn!("{}: Starting in PLAINTEXT mode (insecure)", label);
         } else {
             warn!("{}: Starting in PLAINTEXT mode (internal)", label);
         }
-        builder.add_service(FlightServiceServer::new(service))
+        builder.add_service(FlightServiceServer::new(service)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024))
     };
 
     router
@@ -1664,6 +1669,59 @@ fn unsupported_parameter_type_error(name: &str) -> PgWireError {
     ))))
 }
 
+fn ensure_compatible_schema(schema: SchemaRef) -> SchemaRef {
+    let mut fields = schema.fields().to_vec();
+    let mut changed = false;
+    for field in fields.iter_mut() {
+        if matches!(field.data_type(), DataType::Utf8View) {
+            *field = Arc::new(Field::new(field.name(), DataType::Utf8, field.is_nullable()));
+            changed = true;
+        } else if matches!(field.data_type(), DataType::BinaryView) {
+            *field = Arc::new(Field::new(
+                field.name(),
+                DataType::Binary,
+                field.is_nullable(),
+            ));
+            changed = true;
+        }
+    }
+    if changed {
+        Arc::new(Schema::new(fields))
+    } else {
+        schema
+    }
+}
+
+fn ensure_compatible_batch(batch: RecordBatch) -> anyhow::Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut changed = false;
+    for field in schema.fields() {
+        if matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            changed = true;
+            break;
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+
+    let mut columns = batch.columns().to_vec();
+    let fields = schema.fields();
+    for (i, column) in columns.iter_mut().enumerate() {
+        match fields[i].data_type() {
+            DataType::Utf8View => {
+                *column = cast(column, &DataType::Utf8)?;
+            }
+            DataType::BinaryView => {
+                *column = cast(column, &DataType::Binary)?;
+            }
+            _ => {}
+        }
+    }
+    let new_schema = ensure_compatible_schema(schema);
+    Ok(RecordBatch::try_new(new_schema, columns)?)
+}
+
 fn statement_update_rows_affected(execution: &QueryExecutionResult) -> i64 {
     match &execution.outcome {
         StatementOutcome::Rows => 0,
@@ -1683,7 +1741,8 @@ async fn plan_rows_schema(
         .await
         .map_err(status_from_error)?;
 
-    Ok(schema.unwrap_or_else(|| Arc::new(Schema::empty())))
+    let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    Ok(ensure_compatible_schema(schema))
 }
 
 fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
@@ -1942,11 +2001,16 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .map_err(status_from_error)?;
 
         let stream = FlightDataEncoderBuilder::new()
-            .with_schema(Arc::clone(&execution.schema))
+            .with_schema(ensure_compatible_schema(Arc::clone(&execution.schema)))
             .build(execution.stream.map(|batch| {
-                batch.map_err(|error| {
-                    arrow_flight::error::FlightError::from_external_error(Box::new(error))
-                })
+                batch
+                    .map_err(anyhow::Error::from)
+                    .and_then(ensure_compatible_batch)
+                    .map_err(|error| {
+                        arrow_flight::error::FlightError::from_external_error(Box::new(
+                            std::io::Error::other(error.to_string()),
+                        ))
+                    })
             }))
             .map_err(Status::from)
             .boxed();

@@ -150,6 +150,7 @@ fn base_session_config() -> SessionConfig {
         .execution
         .parquet
         .schema_force_view_types = false;
+    config.options_mut().sql_parser.map_string_types_to_utf8view = false;
     config.options_mut().execution.target_partitions = num_cpus::get();
     config
 }

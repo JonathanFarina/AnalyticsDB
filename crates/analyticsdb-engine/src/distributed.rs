@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use analyticsdb_control::{CatalogColumn, ClusterNode, ControlPlane, NodeRole, NodeStatus};
 use analyticsdb_core::SessionContext;
 use anyhow::Result;
-use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
 use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
@@ -231,14 +231,16 @@ impl PartitionClient {
         req: &ExecutePartitionWriteRequest,
     ) -> Result<ExecutePartitionWriteAck> {
         let channel = self.get_or_create_channel(node_endpoint).await?;
-        let mut client = FlightSqlServiceClient::new(channel);
+        let mut client = FlightServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
 
         let action = Action {
             r#type: "ExecutePartitionWrite".to_string(),
             body: bincode::serialize(req)?.into(),
         };
 
-        let mut stream = client.do_action(action).await?;
+        let mut stream = client.do_action(action).await?.into_inner();
         let flight_result = stream
             .next()
             .await
@@ -256,14 +258,16 @@ impl PartitionClient {
         req: &ExecutePartitionRequest,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<RecordBatch>> + Send>>> {
         let channel = self.get_or_create_channel(node_endpoint).await?;
-        let mut client = FlightSqlServiceClient::new(channel);
+        let mut client = FlightServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
 
         let action = Action {
             r#type: "ExecutePartition".to_string(),
             body: bincode::serialize(req)?.into(),
         };
 
-        let stream = client.do_action(action).await?;
+        let stream = client.do_action(action).await?.into_inner();
         let batch_stream = stream.then(|result| async move {
             match result {
                 Ok(flight_result) => match ipc_bytes_to_batches(&flight_result.body) {

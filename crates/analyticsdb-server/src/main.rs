@@ -231,7 +231,9 @@ async fn run() -> Result<()> {
                 .with_context(|| "Failed to connect to cluster coordinator. Ensure the coordinator node is running and accessible (check if TLS is required).")?
         };
 
-        let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
 
         let req = analyticsdb_control::raft::JoinRequest {
             node_id: cli.node_id.clone(),
@@ -244,7 +246,7 @@ async fn run() -> Result<()> {
             body: body.into(),
         };
 
-        let mut stream = client.do_action(action).await?;
+        let mut stream = client.do_action(action).await?.into_inner();
         let res_bytes = stream
             .next()
             .await
