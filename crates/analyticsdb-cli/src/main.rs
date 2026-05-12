@@ -370,7 +370,10 @@ async fn run_flight_sql_query(
                         format!("failed to connect to Flight SQL endpoint '{normalized_endpoint}'")
                     })?;
 
-            let mut client = FlightSqlServiceClient::new(channel);
+            let inner = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX);
+            let mut client = FlightSqlServiceClient::new_from_inner(inner);
             client.set_header("x-analyticsdb-user", session.user.clone());
             client.set_header("x-analyticsdb-role", session.role.clone());
             client.set_header("x-analyticsdb-database", session.database.clone());

@@ -232,8 +232,8 @@ async fn run() -> Result<()> {
         };
 
         let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX);
 
         let req = analyticsdb_control::raft::JoinRequest {
             node_id: cli.node_id.clone(),

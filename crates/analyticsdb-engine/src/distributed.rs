@@ -232,8 +232,8 @@ impl PartitionClient {
     ) -> Result<ExecutePartitionWriteAck> {
         let channel = self.get_or_create_channel(node_endpoint).await?;
         let mut client = FlightServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX);
 
         let action = Action {
             r#type: "ExecutePartitionWrite".to_string(),
@@ -259,8 +259,8 @@ impl PartitionClient {
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<RecordBatch>> + Send>>> {
         let channel = self.get_or_create_channel(node_endpoint).await?;
         let mut client = FlightServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX);
 
         let action = Action {
             r#type: "ExecutePartition".to_string(),

@@ -50,7 +50,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::arrow::util::display::array_value_to_string;
 use futures::stream;
 use futures::Sink;
@@ -290,8 +290,8 @@ pub async fn serve_flight_sql_with_label(
         builder
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
             .add_service(FlightServiceServer::new(service)
-                .max_decoding_message_size(256 * 1024 * 1024)
-                .max_encoding_message_size(256 * 1024 * 1024))
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX))
     } else {
         if label == "Flight SQL" || label == "Client Flight SQL" {
             warn!("{}: Starting in PLAINTEXT mode (insecure)", label);
@@ -299,8 +299,8 @@ pub async fn serve_flight_sql_with_label(
             warn!("{}: Starting in PLAINTEXT mode (internal)", label);
         }
         builder.add_service(FlightServiceServer::new(service)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024))
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX))
     };
 
     router
@@ -2504,6 +2504,13 @@ fn catalog_relation_to_arrow_schema(columns: &[analyticsdb_control::CatalogColum
 }
 
 fn catalog_type_to_arrow_data_type(data_type: &str) -> DataType {
+    if data_type.starts_with("Timestamp") {
+        if data_type.contains("Some") || data_type.contains("UTC") {
+            return DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        } else {
+            return DataType::Timestamp(TimeUnit::Microsecond, None);
+        }
+    }
     match data_type {
         "Boolean" => DataType::Boolean,
         "Float32" => DataType::Float32,
@@ -2512,6 +2519,7 @@ fn catalog_type_to_arrow_data_type(data_type: &str) -> DataType {
         "Int64" => DataType::Int64,
         "UInt32" => DataType::UInt32,
         "UInt64" => DataType::UInt64,
+        "Date32" | "Date" => DataType::Date32,
         _ => DataType::Utf8,
     }
 }

@@ -1,0 +1,5 @@
+target/
+analyticsdb-catalog.managed/
+cluster-catalog.managed/
+.claude/
+.idea/

@@ -4167,7 +4167,20 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
             let columns = if insert.columns.is_empty() {
                 None
             } else {
-                Some(insert.columns.iter().map(|i| i.to_string()).collect())
+                Some(
+                    insert
+                        .columns
+                        .iter()
+                        .map(|i| {
+                            let s = i.to_string();
+                            if s.starts_with('"') && s.ends_with('"') {
+                                s[1..s.len() - 1].to_string()
+                            } else {
+                                s
+                            }
+                        })
+                        .collect(),
+                )
             };
 
             let rows = match insert.source.as_deref() {
@@ -4228,7 +4241,14 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 columns: create_index
                     .columns
                     .iter()
-                    .map(|c| c.column.expr.to_string())
+                    .map(|c| {
+                        let s = c.column.expr.to_string();
+                        if s.starts_with('"') && s.ends_with('"') {
+                            s[1..s.len() - 1].to_string()
+                        } else {
+                            s
+                        }
+                    })
                     .collect(),
                 unique: create_index.unique,
                 concurrently: create_index.concurrently,
@@ -4289,7 +4309,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
 
             let mut result_assignments = Vec::new();
             for assignment in &update.assignments {
-                let col = match &assignment.target {
+                let mut col = match &assignment.target {
                     sqlparser::ast::AssignmentTarget::ColumnName(name) => name
                         .0
                         .iter()
@@ -4298,6 +4318,9 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         .join("."),
                     _ => return None, // Unsupported assignment target (e.g. Tuple)
                 };
+                if col.starts_with('"') && col.ends_with('"') {
+                    col = col[1..col.len() - 1].to_string();
+                }
                 result_assignments.push((col, assignment.value.to_string()));
             }
 

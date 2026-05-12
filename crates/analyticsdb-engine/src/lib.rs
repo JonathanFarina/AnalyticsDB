@@ -15,7 +15,7 @@ use analyticsdb_control::{
 use analyticsdb_core::{QueryRequest, QueryResponse, SessionContext, StatementOutcome};
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
@@ -1642,7 +1642,10 @@ impl PrototypeEngine {
 
             // Merge all worker streams into one concurrent stream.
             let mut merged_stream = futures::stream::select_all(worker_streams);
-            let base_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
+            let ctx = DfSessionContext::new_with_config(base_session_config());
+            let all_file_paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+            let base_schema =
+                build_partition_read_schema(&ctx, all_file_paths, &relation.columns).await?;
 
             if aggregate_plan.is_some() {
                 // For aggregates, we must materialize the (small) partial results to finalize.
@@ -3747,9 +3750,13 @@ impl PrototypeEngine {
                     .unwrap_or_default();
                 let mut update_expressions = Vec::new();
                 for column in &relation.columns {
-                    if let Some((_, value_sql)) =
-                        assignments.iter().find(|(name, _)| name == &column.name)
-                    {
+                    if let Some((_, value_sql)) = assignments.iter().find(|(name, _)| {
+                        if name.starts_with('"') && name.ends_with('"') {
+                            &name[1..name.len() - 1] == column.name
+                        } else {
+                            name.eq_ignore_ascii_case(&column.name)
+                        }
+                    }) {
                         update_expressions.push(format!("{value_sql} AS \"{}\"", column.name));
                     } else {
                         update_expressions.push(format!("\"{}\"", column.name));
@@ -5632,7 +5639,13 @@ fn build_record_batch_from_rows(
             }
         } else {
             let target_idx = if let Some(ref names) = target_columns {
-                names.iter().position(|n| n == field.name())
+                names.iter().position(|n| {
+                    if n.starts_with('"') && n.ends_with('"') {
+                        &n[1..n.len() - 1] == field.name()
+                    } else {
+                        n.eq_ignore_ascii_case(field.name())
+                    }
+                })
             } else {
                 Some(i)
             };
@@ -8238,6 +8251,13 @@ fn catalog_data_type(data_type: &str) -> DataType {
         // or parse them if we want to be more precise
         return DataType::Decimal128(38, 10);
     }
+    if upper.starts_with("TIMESTAMP") {
+        if upper.contains("WITH TIME ZONE") || upper.contains("TZ") || upper.contains("UTC") {
+            return DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        } else {
+            return DataType::Timestamp(TimeUnit::Microsecond, None);
+        }
+    }
     match upper.as_str() {
         "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
         "BIGINT" | "INT8" | "INT64" => DataType::Int64,
@@ -8245,7 +8265,7 @@ fn catalog_data_type(data_type: &str) -> DataType {
         "BOOLEAN" | "BOOL" => DataType::Boolean,
         "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
         "FLOAT8" | "DOUBLE PRECISION" | "FLOAT64" => DataType::Float64,
-        "DATE" => DataType::Date32,
+        "DATE" | "DATE32" => DataType::Date32,
         _ => DataType::Utf8,
     }
 }
