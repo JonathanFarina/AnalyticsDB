@@ -1,3 +1,13 @@
+export interface QueryLogConfig {
+  enabled: boolean;
+  sample_rate: number;
+  min_duration_ms: number;
+  batch_size: number;
+  batch_interval_ms: number;
+  max_query_length_bytes: number;
+  retention_days: number;
+}
+
 export interface ClusterConfig {
   base_postgres_port: number;
   base_flight_sql_port: number;
@@ -6,6 +16,7 @@ export interface ClusterConfig {
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   next_available_port_offset: number;
+  query_log?: QueryLogConfig;
 }
 
 export interface ClusterConfigEnvelope {
@@ -13,7 +24,7 @@ export interface ClusterConfigEnvelope {
   readonly config: ClusterConfig;
 }
 
-export type NodeRole = "Coordinator" | "Compute" | string;
+export type NodeRole = "Control" | "Coordinator" | "Compute" | string;
 export type NodeStatus = "Ready" | "Unavailable" | string;
 
 export interface ClusterNode {
@@ -57,6 +68,7 @@ export interface ClusterCatalogEnvelope {
   readonly path: string;
   readonly catalog: ClusterCatalog;
   readonly modifiedAtEpochMs?: number;
+  readonly source?: "sqlite" | "json-legacy";
 }
 
 export async function fetchClusterConfig(): Promise<ClusterConfigEnvelope> {
