@@ -461,10 +461,16 @@ async fn test_alter_table() {
     run_sql(&endpoint, "INSERT INTO alter_test VALUES (1, 'initial')");
 
     // 2. ALTER TABLE alter_test ADD COLUMN age INT DEFAULT 30
-    run_sql(&endpoint, "ALTER TABLE alter_test ADD COLUMN age INT DEFAULT 30");
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ADD COLUMN age INT DEFAULT 30",
+    );
     let select_add = run_sql(&endpoint, "SELECT age FROM alter_test WHERE id = 1");
     if !select_add.contains("30") {
-        panic!("SELECT age output does not contain 30. Output:\n{}", select_add);
+        panic!(
+            "SELECT age output does not contain 30. Output:\n{}",
+            select_add
+        );
     }
 
     // 3. ALTER TABLE RENAME COLUMN
@@ -483,22 +489,40 @@ async fn test_alter_table() {
     // (Type change is mostly metadata in the prototype but we verify it doesn't fail)
 
     // 5. ALTER TABLE ALTER COLUMN SET/DROP NOT NULL
-    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age SET NOT NULL");
-    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age DROP NOT NULL");
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ALTER COLUMN age SET NOT NULL",
+    );
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ALTER COLUMN age DROP NOT NULL",
+    );
 
     // 6. ALTER TABLE ALTER COLUMN SET/DROP DEFAULT
-    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age SET DEFAULT 40");
-    run_sql(&endpoint, "INSERT INTO alter_test (id, full_name) VALUES (2, 'second')");
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ALTER COLUMN age SET DEFAULT 40",
+    );
+    run_sql(
+        &endpoint,
+        "INSERT INTO alter_test (id, full_name) VALUES (2, 'second')",
+    );
     let select_default = run_sql(&endpoint, "SELECT age FROM alter_test WHERE id = 2");
     assert!(select_default.contains("40"));
-    run_sql(&endpoint, "ALTER TABLE alter_test ALTER COLUMN age DROP DEFAULT");
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test ALTER COLUMN age DROP DEFAULT",
+    );
 
     // 7. ALTER TABLE ADD/DROP CONSTRAINT
     run_sql(
         &endpoint,
         "ALTER TABLE alter_test ADD CONSTRAINT unique_id UNIQUE (id)",
     );
-    run_sql(&endpoint, "ALTER TABLE alter_test DROP CONSTRAINT unique_id");
+    run_sql(
+        &endpoint,
+        "ALTER TABLE alter_test DROP CONSTRAINT unique_id",
+    );
 
     // 8. ALTER TABLE alter_test RENAME TO table_renamed
     run_sql(&endpoint, "ALTER TABLE alter_test RENAME TO table_renamed");
@@ -509,8 +533,14 @@ async fn test_alter_table() {
     // 9. ALTER TABLE table_renamed DROP COLUMN age
     run_sql(&endpoint, "ALTER TABLE table_renamed DROP COLUMN age");
     let select_drop = run_sql_failure(&endpoint, "SELECT age FROM table_renamed");
-    if !select_drop.contains("not found") && !select_drop.contains("column") && !select_drop.contains("Schema error") {
-        panic!("SELECT age should have failed with a clear error. Actual output:\n{}", select_drop);
+    if !select_drop.contains("not found")
+        && !select_drop.contains("column")
+        && !select_drop.contains("Schema error")
+    {
+        panic!(
+            "SELECT age should have failed with a clear error. Actual output:\n{}",
+            select_drop
+        );
     }
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -568,7 +598,10 @@ async fn test_create_index() {
     let (_server, endpoint) = start_postgres_server(&catalog_path).await;
 
     run_sql(&endpoint, "CREATE TABLE idx_test (id INT, val TEXT)");
-    run_sql(&endpoint, "INSERT INTO idx_test VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    run_sql(
+        &endpoint,
+        "INSERT INTO idx_test VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
 
     // 1. Simple index
     run_sql(&endpoint, "CREATE INDEX simple_idx ON idx_test (val)");
@@ -578,13 +611,20 @@ async fn test_create_index() {
 
     // 2. Multi-column index
     run_sql(&endpoint, "CREATE INDEX multi_idx ON idx_test (id, val)");
-    let select_multi = run_sql(&endpoint, "SELECT id FROM idx_test WHERE id = 3 AND val = 'c'");
+    let select_multi = run_sql(
+        &endpoint,
+        "SELECT id FROM idx_test WHERE id = 3 AND val = 'c'",
+    );
     assert!(select_multi.contains("3"));
 
     // 3. Unique index
     run_sql(&endpoint, "CREATE UNIQUE INDEX unique_idx ON idx_test (id)");
     let insert_fail = run_sql_failure(&endpoint, "INSERT INTO idx_test VALUES (1, 'dup')");
-    assert!(insert_fail.contains("unique") || insert_fail.contains("violation") || insert_fail.contains("exists"));
+    assert!(
+        insert_fail.contains("unique")
+            || insert_fail.contains("violation")
+            || insert_fail.contains("exists")
+    );
 
     // 4. Index on missing table
     let create_fail = run_sql_failure(&endpoint, "CREATE INDEX missing_idx ON missing_table (col)");
@@ -617,7 +657,11 @@ async fn test_drop_index() {
     // 4. Try to drop a constraint-backed index (should fail or be protected)
     run_sql(&endpoint, "CREATE TABLE const_test (id INT PRIMARY KEY)");
     let drop_const_fail = run_sql_failure(&endpoint, "DROP INDEX const_test_id_idx");
-    assert!(drop_const_fail.contains("constraint") || drop_const_fail.contains("protected") || drop_const_fail.contains("primary key"));
+    assert!(
+        drop_const_fail.contains("constraint")
+            || drop_const_fail.contains("protected")
+            || drop_const_fail.contains("primary key")
+    );
 
     cleanup_catalog_artifacts(&catalog_path);
 }
@@ -629,7 +673,7 @@ async fn test_user_management() {
 
     // 1. CREATE USER
     run_sql(&endpoint, "CREATE USER alice PASSWORD 'secret'");
-    
+
     // 2. ALTER USER (Password rotation)
     run_sql(&endpoint, "ALTER USER alice PASSWORD 'new_secret'");
 
@@ -669,7 +713,8 @@ async fn test_projection_collisions() {
 
     // 2. Wildcard expansion with overlapping names
     // This query will expand to many columns, including multiple 'oid's
-    let sql_wildcard = "SELECT db.*, ns.* FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
+    let sql_wildcard =
+        "SELECT db.*, ns.* FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
     let res_wildcard = run_sql(&endpoint, sql_wildcard);
     // Should not fail planning
     assert!(res_wildcard.contains("datname"));
@@ -688,12 +733,13 @@ async fn test_projection_collisions() {
     assert!(res_wc_coll.contains("oid_1"));
 
     // 5. Join with same column names (oid) from different tables
-    let sql_join = "SELECT db.oid, ns.oid FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
+    let sql_join =
+        "SELECT db.oid, ns.oid FROM pg_catalog.pg_database db, pg_catalog.pg_namespace ns LIMIT 1";
     let res_join = run_sql(&endpoint, sql_join);
     // Should have unique names in header (oid, oid_1)
     assert!(res_join.contains("oid"));
     assert!(res_join.contains("oid_1"));
-    
+
     cleanup_catalog_artifacts(&catalog_path);
 }
 
@@ -717,7 +763,10 @@ async fn test_group_management() {
     run_sql(&endpoint, "ALTER GROUP analytics_team DROP USER carol");
 
     // 4.1 ALTER GROUP RENAME TO
-    run_sql(&endpoint, "ALTER GROUP analytics_team RENAME TO analytics_group");
+    run_sql(
+        &endpoint,
+        "ALTER GROUP analytics_team RENAME TO analytics_group",
+    );
     let show_roles = run_sql(&endpoint, "SELECT rolname FROM pg_catalog.pg_roles");
     assert!(show_roles.contains("analytics_group"));
     assert!(!show_roles.contains("analytics_team"));

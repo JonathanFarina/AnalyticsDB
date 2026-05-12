@@ -1,19 +1,11 @@
 {
   "databases": {
-    "my_database": {
-      "name": "my_database",
-      "schemas": [
-        "public"
-      ],
-      "owner": "postgres",
-      "parameters": {}
-    },
     "postgres": {
       "name": "postgres",
       "schemas": [
         "public"
       ],
-      "owner": "",
+      "owner": "postgres",
       "parameters": {}
     }
   },
@@ -23,7 +15,7 @@
       "is_admin": false,
       "password": "analytics_reader",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206,
+      "password_rotated_at_epoch_ms": 1778448556602,
       "members": []
     },
     "analyticsdb_admin": {
@@ -31,7 +23,7 @@
       "is_admin": false,
       "password": "analyticsdb_admin",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206,
+      "password_rotated_at_epoch_ms": 1778448556602,
       "members": []
     },
     "postgres": {
@@ -39,267 +31,12 @@
       "is_admin": true,
       "password": "postgres",
       "password_version": 1,
-      "password_rotated_at_epoch_ms": 1777221067206,
+      "password_rotated_at_epoch_ms": 1778448556602,
       "members": []
     }
   },
-  "nodes": {
-    "coord-1": {
-      "id": "coord-1",
-      "role": "Control",
-      "endpoint": "127.0.0.1:50051",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778167503310
-    },
-    "node-4": {
-      "id": "node-4",
-      "role": "Compute",
-      "endpoint": "https://127.0.0.1:50112",
-      "internal_endpoint": "http://127.0.0.1:60112",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778442995488
-    },
-    "node1": {
-      "id": "node1",
-      "role": "Control",
-      "endpoint": "https://127.0.0.1:50051",
-      "internal_endpoint": "http://127.0.0.1:60051",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778442987983
-    },
-    "node2": {
-      "id": "node2",
-      "role": "Control",
-      "endpoint": "127.0.0.1:50051",
-      "status": "Ready",
-      "last_heartbeat_at_epoch_ms": 1778169597070
-    }
-  },
-  "relations": {
-    "my_database.public.customers": {
-      "database": "my_database",
-      "schema": "public",
-      "name": "customers",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "cluster-catalog.managed/my_database__public__customers.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "first_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "last_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "email",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "created_at",
-          "data_type": "Utf8",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "_row_id",
-          "data_type": "Utf8",
-          "nullable": true,
-          "default_value": null
-        }
-      ],
-      "constraints": [
-        {
-          "name": "auto_constraint",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ],
-      "indexes": [
-        {
-          "name": "customers_id_idx",
-          "columns": [
-            "id"
-          ],
-          "is_unique": true,
-          "is_primary": true
-        }
-      ]
-    },
-    "postgres.public.customers": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "customers",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "cluster-catalog.managed/postgres__public__customers.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "first_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "last_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "email",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "created_at",
-          "data_type": "Timestamp(ns)",
-          "nullable": true,
-          "default_value": "CURRENT_TIMESTAMP"
-        }
-      ],
-      "constraints": [
-        {
-          "name": "customers_pkey",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ],
-      "indexes": []
-    },
-    "postgres.public.explain_idx_test": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "explain_idx_test",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "cluster-catalog.managed/postgres__public__explain_idx_test.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int32",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "_row_id",
-          "data_type": "Utf8",
-          "nullable": true,
-          "default_value": null
-        }
-      ],
-      "constraints": [],
-      "indexes": [
-        {
-          "name": "explain_idx",
-          "columns": [
-            "id"
-          ],
-          "is_unique": false,
-          "is_primary": false
-        }
-      ]
-    },
-    "postgres.public.orders": {
-      "database": "postgres",
-      "schema": "public",
-      "name": "orders",
-      "kind": "Table",
-      "definition_sql": null,
-      "storage_path": "cluster-catalog.managed/postgres__public__orders.table.parquet",
-      "external_format": null,
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "Int64",
-          "nullable": true,
-          "default_value": null
-        },
-        {
-          "name": "customer_name",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "order_value",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "date_of_purchase",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        },
-        {
-          "name": "_row_id",
-          "data_type": "Utf8",
-          "nullable": false,
-          "default_value": null
-        }
-      ],
-      "constraints": [
-        {
-          "name": "auto_constraint",
-          "kind": "PrimaryKey",
-          "columns": [
-            "id"
-          ],
-          "referenced_database": null,
-          "referenced_schema": null,
-          "referenced_table": null,
-          "referenced_columns": []
-        }
-      ],
-      "indexes": [
-        {
-          "name": "orders_id_idx",
-          "columns": [
-            "id"
-          ],
-          "is_unique": true,
-          "is_primary": false
-        }
-      ]
-    }
-  },
+  "nodes": {},
+  "relations": {},
   "aggregates": {},
   "collations": {},
   "conversions": {},
@@ -309,8 +46,9 @@
     "base_flight_sql_port": 50051,
     "base_node_port": 60051,
     "catalog_path": "analyticsdb-catalog.db",
-    "tls_cert_path": "certs/server.crt",
-    "tls_key_path": "certs/server.key",
-    "next_available_port_offset": 61
-  }
+    "tls_cert_path": null,
+    "tls_key_path": null,
+    "next_available_port_offset": 0
+  },
+  "catalogue_version": 1
 }
