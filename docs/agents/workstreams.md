@@ -260,6 +260,16 @@ Outputs:
 
 - production-readiness evidence
 
+Current evidence:
+
+- prototype query-log records for non-streaming query execution are persisted asynchronously to Parquet and exposed through `system.query_log`
+- query-log behavior has engine SQL coverage and CLI-driven PostgreSQL-wire SQL coverage
+
+Remaining gaps before this phase should be considered `Partial` overall:
+
+- no benchmark gate exists yet for query-log overhead
+- query-log retention, metric enrichment, distributed worker rows, and full Flight SQL stream lifecycle accounting remain incomplete
+
 ## Cross-Cutting Rules
 
 - each phase should leave behind tests

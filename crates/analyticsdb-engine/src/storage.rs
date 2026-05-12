@@ -222,6 +222,18 @@ pub async fn object_exists(store: &Arc<dyn ObjectStore>, key: &OPath) -> Result<
     }
 }
 
+/// Deletes the given object keys.  Missing objects are treated as success
+/// so callers can use this idempotently to clean up partial writes.
+pub async fn delete_objects(store: &Arc<dyn ObjectStore>, keys: &[OPath]) -> Result<()> {
+    for key in keys {
+        match store.delete(key).await {
+            Ok(_) | Err(OsError::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Recursively deletes all objects whose path starts with `prefix`.
 pub async fn delete_prefix(store: &Arc<dyn ObjectStore>, prefix: &OPath) -> Result<()> {
     let mut list = store.list(Some(prefix));

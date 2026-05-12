@@ -212,7 +212,7 @@ pub struct QueryAdmission {
     pub coordinator_node_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClusterConfig {
     pub base_postgres_port: u16,
     pub base_flight_sql_port: u16,
@@ -224,6 +224,64 @@ pub struct ClusterConfig {
     #[serde(alias = "tls_key")]
     pub tls_key_path: Option<String>,
     pub next_available_port_offset: u16,
+    #[serde(default)]
+    pub query_log: QueryLogConfig,
+}
+
+fn default_query_log_enabled() -> bool {
+    true
+}
+
+fn default_query_log_sample_rate() -> f64 {
+    1.0
+}
+
+fn default_query_log_batch_size() -> usize {
+    1024
+}
+
+fn default_query_log_batch_interval_ms() -> u64 {
+    5000
+}
+
+fn default_query_log_max_query_length_bytes() -> usize {
+    65_536
+}
+
+fn default_query_log_retention_days() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryLogConfig {
+    #[serde(default = "default_query_log_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_query_log_sample_rate")]
+    pub sample_rate: f64,
+    #[serde(default)]
+    pub min_duration_ms: u64,
+    #[serde(default = "default_query_log_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_query_log_batch_interval_ms")]
+    pub batch_interval_ms: u64,
+    #[serde(default = "default_query_log_max_query_length_bytes")]
+    pub max_query_length_bytes: usize,
+    #[serde(default = "default_query_log_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for QueryLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_query_log_enabled(),
+            sample_rate: default_query_log_sample_rate(),
+            min_duration_ms: 0,
+            batch_size: default_query_log_batch_size(),
+            batch_interval_ms: default_query_log_batch_interval_ms(),
+            max_query_length_bytes: default_query_log_max_query_length_bytes(),
+            retention_days: default_query_log_retention_days(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -695,6 +753,28 @@ impl ControlPlane {
     pub async fn local_node(&self) -> Option<ClusterNode> {
         let state = self.state.read().await;
         state.nodes.get(&self.coordinator_node_id).cloned()
+    }
+
+    pub async fn cluster_config(&self) -> Option<ClusterConfig> {
+        self.state.read().await.config.clone()
+    }
+
+    pub fn catalog_path(&self) -> Option<PathBuf> {
+        self.catalog_path.clone()
+    }
+
+    pub fn managed_data_root(&self) -> PathBuf {
+        let catalog_path_buf = self
+            .catalog_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CATALOG_PATH));
+        let catalog_path = catalog_path_buf.as_path();
+        let base_name = catalog_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("analyticsdb-catalog");
+        let parent_dir = catalog_path.parent().unwrap_or_else(|| Path::new("."));
+        parent_dir.join(format!("{base_name}.managed"))
     }
 
     pub fn is_coordinator(&self) -> bool {
@@ -2092,18 +2172,7 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
         }
 
-        let catalog_path_buf = self
-            .catalog_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CATALOG_PATH));
-        let catalog_path = catalog_path_buf.as_path();
-
-        let base_name = catalog_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("analyticsdb-catalog");
-        let parent_dir = catalog_path.parent().unwrap_or_else(|| Path::new("."));
-        let data_dir = parent_dir.join(format!("{base_name}.managed"));
+        let data_dir = self.managed_data_root();
 
         Ok(data_dir.join(format!(
             "{database_name}__{schema_name}__{table_name}.table.parquet"
@@ -3474,6 +3543,7 @@ fn bootstrap_state() -> CatalogState {
         tls_cert_path: None,
         tls_key_path: None,
         next_available_port_offset: 0,
+        query_log: QueryLogConfig::default(),
     });
 
     CatalogState {

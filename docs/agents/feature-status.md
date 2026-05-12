@@ -73,6 +73,7 @@ A feature is `Complete` only when all of the following are true:
 | Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
 | Query optimizer | Prototype | logical and physical rule scaffolding | statistics-aware distributed optimization with regressions covered |
 | Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
+| Query log / query-level lineage | Partial | durable async Parquet-backed `system.query_log` for the non-streaming execution path, config defaults, and CLI-driven PostgreSQL-wire SQL coverage | streaming Flight SQL lifecycle accounting, DataFusion metrics, worker sibling rows, retention sweeper, partitioned layout, and benchmark gates |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
 | Encryption at rest | Prototype | key management design and hooks | end-to-end encrypted storage path with rotation story |
 | CLI | Partial | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, and initial meta commands (`\q`, `\?`, `\conninfo`) | broader psql-style meta-command coverage and polished timing UX complete |
@@ -149,6 +150,7 @@ A feature is `Complete` only when all of the following are true:
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
 - Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths
+- Prototype durable **query log / query-level lineage** now writes non-streaming query outcomes asynchronously to Parquet under `<catalog>.managed/system/query_log/` and exposes the records as `system.query_log`; coverage includes an engine SQL test and a CLI-driven PostgreSQL-wire SQL test. Current gaps remain for Flight SQL stream-finish logging, execution-plan metrics, retention, distributed worker sibling rows, date-partitioned layout, and benchmark gates.
 - Distributed scatter-gather path now supports **concurrent worker fetch** and **zero-materialization streaming** via a `StreamingTableProvider`, allowing large result sets (e.g. 1B rows) to flow from workers directly to the client without coordinator-side materialization
 - Distributed executor now includes **node resilience** with active failure detection (marking nodes `Unavailable`) and automatic **query retry** with re-partitioning across remaining healthy nodes, with transparent fallback to local execution if the cluster is unavailable
 - Coordinator now uses a **cost-aware worker selection heuristic** to determine the optimal number of nodes based on data size (~128MB per worker target) and file count, avoiding "scatter-gather tax" on small datasets by selectively dispatching to a subset of the cluster

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, fmt};
 
-use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
+use analyticsdb_control::{ClusterNode, ControlPlane, NodeRole, NodeStatus};
 use analyticsdb_core::QueryResponse;
 use analyticsdb_engine::PrototypeEngine;
 use analyticsdb_protocol::{serve_flight_sql, serve_postgres_wire};
@@ -214,6 +214,22 @@ fn cleanup_catalog_artifacts(catalog_path: &str) {
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
     let _ = std::fs::remove_dir_all(managed_dir);
+}
+
+async fn configure_fast_query_log(catalog_path: &str) {
+    let control_plane = ControlPlane::from_catalog_path(catalog_path)
+        .await
+        .expect("control plane should initialize");
+    let mut config = control_plane
+        .cluster_config()
+        .await
+        .expect("bootstrap config should exist");
+    config.query_log.batch_size = 1;
+    config.query_log.batch_interval_ms = 25;
+    control_plane
+        .update_cluster_config(config)
+        .await
+        .expect("query log config should persist");
 }
 
 fn managed_table_storage_dir(
@@ -918,6 +934,56 @@ async fn cli_executes_sql_and_reports_timing() {
     assert!(stdout.contains("| one | two |"));
     assert!(stdout.contains("| 1   | 2   |"));
     assert!(stdout.contains("Rows: 1"));
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_can_query_postgres_wire_query_log() {
+    let catalog_path = temp_catalog_path();
+    configure_fast_query_log(&catalog_path).await;
+    let (_postgres_server, postgres_endpoint) = start_postgres_server(&catalog_path).await;
+
+    let executed = protocol_json_response(
+        "postgresql",
+        &postgres_endpoint,
+        None,
+        "SELECT 13 AS query_log_probe",
+    );
+    assert_eq!(executed.rows, vec![vec!["13".to_string()]]);
+
+    let mut logged = QueryResponse {
+        query_id: String::new(),
+        coordinator_node_id: String::new(),
+        session: analyticsdb_core::SessionContext::default(),
+        columns: Vec::new(),
+        rows: Vec::new(),
+        message: String::new(),
+        execution_time_ms: 0,
+    };
+
+    for _ in 0..20 {
+        logged = protocol_json_response(
+            "postgresql",
+            &postgres_endpoint,
+            None,
+            "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
+        );
+        if !logged.rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        logged.rows,
+        vec![vec![
+            "SELECT 13 AS query_log_probe".to_string(),
+            "QueryFinish".to_string(),
+            "postgresql".to_string(),
+            "1".to_string()
+        ]]
+    );
 
     cleanup_catalog_artifacts(&catalog_path);
 }

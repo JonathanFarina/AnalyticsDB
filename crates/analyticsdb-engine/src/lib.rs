@@ -121,6 +121,7 @@ use tracing::{info, warn};
 pub mod distributed;
 pub mod functions;
 pub mod postgres_compatibility;
+pub mod query_log;
 pub mod sql_rewriter;
 pub mod storage;
 pub mod system_catalog;
@@ -131,7 +132,8 @@ pub use distributed::{
 };
 
 use functions::register_postgres_functions;
-use system_catalog::PgCatalogSchemaProvider;
+use query_log::QueryLog;
+use system_catalog::{PgCatalogSchemaProvider, SystemSchemaProvider};
 
 #[allow(dead_code)]
 const INSERT_SELECT_PARQUET_ROW_GROUP_SIZE: usize = 1_048_576;
@@ -228,6 +230,7 @@ pub struct PrototypeEngine {
     relation_locks: Arc<tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
     partition_client: Arc<PartitionClient>,
     file_list_cache: Arc<FileListCache>,
+    query_log: Arc<QueryLog>,
 }
 
 impl std::fmt::Debug for PrototypeEngine {
@@ -237,6 +240,7 @@ impl std::fmt::Debug for PrototypeEngine {
             .field("session_context_cache", &"<cached session contexts>")
             .field("partition_client", &"<partition client>")
             .field("file_list_cache", &"<file list cache>")
+            .field("query_log", &self.query_log.root_location())
             .finish()
     }
 }
@@ -249,6 +253,7 @@ impl Clone for PrototypeEngine {
             relation_locks: Arc::clone(&self.relation_locks),
             partition_client: Arc::clone(&self.partition_client),
             file_list_cache: Arc::clone(&self.file_list_cache),
+            query_log: Arc::clone(&self.query_log),
         }
     }
 }
@@ -562,11 +567,21 @@ impl PrototypeEngine {
             relation_locks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
+            query_log: Arc::new(QueryLog::disabled()),
         })
     }
 
     pub async fn from_catalog_path(catalog_path: &str) -> Result<Self> {
         let control_plane = Arc::new(ControlPlane::from_catalog_path(catalog_path).await?);
+        let query_log_config = control_plane
+            .cluster_config()
+            .await
+            .map(|config| config.query_log)
+            .unwrap_or_default();
+        let query_log_root = control_plane
+            .managed_data_root()
+            .join("system")
+            .join("query_log");
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
         partition_client.set_compute_eligible(true);
         let partition_client = Arc::new(partition_client);
@@ -576,6 +591,7 @@ impl PrototypeEngine {
             relation_locks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
+            query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
         })
     }
 
@@ -651,41 +667,57 @@ impl PrototypeEngine {
 
     /// Executes an `ExecutePartitionWriteRequest` on behalf of a Coordinator.
     ///
-    /// Runs `req.sql` in a fresh DataFusion session, writes each output batch
-    /// as a distinct UUID-named Parquet file under `req.write_prefix` in the
-    /// shared object store, and returns an acknowledgment with the written file
-    /// paths and total row count.
+    /// When `partition_files` is non-empty: opens those Parquet files via the
+    /// DataFusion Rust API (a passthrough copy of the source files into the
+    /// target table, optionally re-typed by `source_columns`).
+    ///
+    /// When `partition_files` is empty: executes `req.sql` directly via
+    /// DataFusion.  Used by the generate_series distribution path where the
+    /// worker has no upstream files to read and synthesises its own rows.
+    ///
+    /// Either way, each output batch is written as a distinct UUID-named
+    /// Parquet file under `req.write_prefix` and the function returns an
+    /// acknowledgment with the written file paths and total row count.
     pub async fn execute_distributed_write_partition(
         &self,
         req: &distributed::ExecutePartitionWriteRequest,
     ) -> Result<distributed::ExecutePartitionWriteAck> {
         let (store, prefix) = storage::store_for_location(&req.write_prefix)?;
 
-        let ctx = DfSessionContext::new_with_config(base_session_config());
-        register_postgres_functions(&ctx);
+        let ctx = self.create_session_context(&req.session).await?;
 
-        // Use the Rust API to read partition files directly — DataFusion does not
-        // expose `read_parquet([...])` as a SQL table function in this version.
-        let paths = req
-            .partition_files
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let df = if req.source_columns.is_empty() {
-            ctx.read_parquet(paths, ParquetReadOptions::default())
+        let batches = if req.partition_files.is_empty() {
+            // SQL-driven path (e.g. generate_series).
+            let rewritten = sql_rewriter::rewrite_sql_for_postgres_compatibility(
+                &req.sql,
+                &self.control_plane,
+                &req.session,
+            )
+            .await?;
+            let df = ctx.sql(&rewritten).await.map_err(sanitize_error)?;
+            df.collect().await.map_err(sanitize_error)?
+        } else {
+            let paths = req
+                .partition_files
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let df = if req.source_columns.is_empty() {
+                ctx.read_parquet(paths, ParquetReadOptions::default())
+                    .await
+                    .map_err(sanitize_error)?
+            } else {
+                let source_schema =
+                    build_partition_read_schema(&ctx, paths.clone(), &req.source_columns).await?;
+                ctx.read_parquet(
+                    paths,
+                    ParquetReadOptions::default().schema(source_schema.as_ref()),
+                )
                 .await
                 .map_err(sanitize_error)?
-        } else {
-            let source_schema =
-                build_partition_read_schema(&ctx, paths.clone(), &req.source_columns).await?;
-            ctx.read_parquet(
-                paths,
-                ParquetReadOptions::default().schema(source_schema.as_ref()),
-            )
-            .await
-            .map_err(sanitize_error)?
+            };
+            df.collect().await.map_err(sanitize_error)?
         };
-        let batches = df.collect().await.map_err(sanitize_error)?;
 
         let mut written_files = Vec::new();
         let mut total_rows = 0usize;
@@ -1213,6 +1245,98 @@ impl PrototypeEngine {
         Ok(())
     }
 
+    /// After a distributed insert completes, validates that the union of newly
+    /// written Parquet files does not violate any unique/primary index — both
+    /// against itself (cross-partition duplicates) and against existing data
+    /// captured in the published index snapshots.
+    async fn validate_uniqueness_across_new_files(
+        &self,
+        relation: &analyticsdb_control::CatalogRelation,
+        new_files: &[String],
+    ) -> Result<()> {
+        if new_files.is_empty() {
+            return Ok(());
+        }
+        if !relation
+            .indexes
+            .iter()
+            .any(|idx| idx.is_unique || idx.is_primary)
+        {
+            return Ok(());
+        }
+
+        let (store, table_prefix) = table_store_prefix(relation)?;
+
+        for index in &relation.indexes {
+            if !index.is_unique && !index.is_primary {
+                continue;
+            }
+
+            let df_context = DfSessionContext::new_with_config(base_session_config());
+            register_postgres_functions(&df_context);
+
+            let paths: Vec<&str> = new_files.iter().map(|s| s.as_str()).collect();
+            let new_df = df_context
+                .read_parquet(paths, ParquetReadOptions::default())
+                .await
+                .map_err(sanitize_error)?;
+
+            let index_cols: Vec<_> = index.columns.iter().map(|c| col(c)).collect();
+
+            // 1. Cross-partition duplicates within the newly written files.
+            let dup_df = new_df
+                .clone()
+                .aggregate(index_cols.clone(), vec![count(lit(1)).alias("count")])?
+                .filter(col("count").gt(lit(1)))?;
+            let dup_results = dup_df.collect().await.map_err(sanitize_error)?;
+            if dup_results.iter().any(|b| b.num_rows() > 0) {
+                anyhow::bail!(
+                    "Unique index '{}' on '{}.{}.{}' would contain duplicate keys across distributed partitions",
+                    index.name,
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
+            }
+
+            // 2. Conflicts against existing data captured in the index snapshot.
+            let Some(snapshot) = read_index_snapshot(&store, &table_prefix, &index.name).await?
+            else {
+                continue;
+            };
+            let data_key = index_data_key(&table_prefix, &index.name, &snapshot.entries_object);
+            if !storage::object_exists(&store, &data_key).await? {
+                continue;
+            }
+            let data_local_path = format!("/{}", data_key.as_ref());
+            let snapshot_df = df_context
+                .read_parquet(&data_local_path, ParquetReadOptions::default())
+                .await
+                .map_err(sanitize_error)?;
+
+            let join_on_cols: Vec<&str> = index.columns.iter().map(|c| c.as_str()).collect();
+            let join_df = new_df.clone().join(
+                snapshot_df,
+                datafusion::prelude::JoinType::LeftSemi,
+                &join_on_cols,
+                &join_on_cols,
+                None,
+            )?;
+            let join_results = join_df.collect().await.map_err(sanitize_error)?;
+            if join_results.iter().any(|b| b.num_rows() > 0) {
+                anyhow::bail!(
+                    "Unique index '{}' on '{}.{}.{}' would conflict with existing rows",
+                    index.name,
+                    relation.database,
+                    relation.schema,
+                    relation.name
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn list_databases(&self, session: &SessionContext) -> Result<Vec<String>> {
         self.control_plane.list_databases(session).await
     }
@@ -1367,6 +1491,7 @@ impl PrototypeEngine {
                 .map(|(chunk_files, node)| {
                     let req = distributed::ExecutePartitionRequest {
                         query_id: admission.query_id.clone(),
+                        initial_query_id: admission.query_id.clone(),
                         sql: worker_sql.clone(),
                         session: request.session.clone(),
                         partition_files: chunk_files,
@@ -1656,13 +1781,7 @@ impl PrototypeEngine {
         admission: &QueryAdmission,
         started: Instant,
     ) -> Result<Option<QueryExecutionResult>> {
-        // Only distribute when the SELECT source is a plain table reference.
-        let Some((src_db, src_schema, src_table)) = parse_plain_select_table(&statement.query_sql)
-        else {
-            return Ok(None);
-        };
-
-        // Resolve the target relation.
+        // Resolve the target relation first so we can describe it in logs.
         let target_relation = match self
             .control_plane
             .table_relation(
@@ -1674,20 +1793,44 @@ impl PrototypeEngine {
             .await
         {
             Ok(r) => r,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                info!(
+                    "[coordinator] Distributed insert skipped: target table lookup failed: {}",
+                    e
+                );
+                return Ok(None);
+            }
         };
 
-        // Skip distribution when uniqueness constraints exist — cross-partition
-        // duplicate validation requires a separate merge step not yet implemented.
-        if target_relation
-            .indexes
-            .iter()
-            .any(|idx| idx.is_unique || idx.is_primary)
-        {
+        let Some(target_storage) = target_relation.storage_path.as_deref() else {
+            info!(
+                "[coordinator] Distributed insert skipped: target '{}.{}.{}' has no storage path",
+                target_relation.database, target_relation.schema, target_relation.name
+            );
             return Ok(None);
+        };
+
+        // Try generate_series first — it doesn't need a managed source table.
+        if let Some(plan) = parse_generate_series_select(&statement.query_sql) {
+            return self
+                .try_execute_distributed_generate_series_insert(
+                    request,
+                    statement,
+                    &target_relation,
+                    target_storage,
+                    plan,
+                    admission,
+                    started,
+                )
+                .await;
         }
 
-        let Some(target_storage) = target_relation.storage_path.as_deref() else {
+        // Otherwise the SELECT source must be a plain managed table.
+        let Some((src_db, src_schema, src_table)) = parse_plain_select_table(&statement.query_sql)
+        else {
+            info!(
+                "[coordinator] Distributed insert skipped: SELECT source is not a plain table reference (and not generate_series). Falling back to single-node execution."
+            );
             return Ok(None);
         };
 
@@ -1703,10 +1846,20 @@ impl PrototypeEngine {
             .await
         {
             Ok(r) => r,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                info!(
+                    "[coordinator] Distributed insert skipped: source '{}' is not a managed table. Falling back to single-node execution.",
+                    src_table
+                );
+                return Ok(None);
+            }
         };
 
         let Some(source_storage) = source_relation.storage_path.as_deref() else {
+            info!(
+                "[coordinator] Distributed insert skipped: source '{}.{}.{}' has no storage path",
+                source_relation.database, source_relation.schema, source_relation.name
+            );
             return Ok(None);
         };
 
@@ -1742,7 +1895,75 @@ impl PrototypeEngine {
 
         let total_size: u64 = source_files.iter().map(|(_, size)| *size).sum();
         let file_count = source_files.len();
+
+        // Acquire the write lock on the target relation once for the duration
+        // of all retry attempts; otherwise other writers could slip in between
+        // an aborted attempt and a retry.
+        let relation_lock = self.relation_lock(&target_relation).await;
+        let _write_guard = relation_lock.write().await;
+
+        let make_tasks = |compute_nodes: &[analyticsdb_control::ClusterNode]| -> Vec<(
+            analyticsdb_control::ClusterNode,
+            distributed::ExecutePartitionWriteRequest,
+        )> {
+            let chunks =
+                distributed::partition_files_for_workers(source_files.clone(), compute_nodes.len());
+            chunks
+                .into_iter()
+                .zip(compute_nodes.iter().cloned())
+                .map(|(chunk_files, node)| {
+                    let req = distributed::ExecutePartitionWriteRequest {
+                        query_id: admission.query_id.clone(),
+                        initial_query_id: admission.query_id.clone(),
+                        sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
+                        session: request.session.clone(),
+                        partition_files: chunk_files,
+                        source_columns: source_relation.columns.clone(),
+                        write_prefix: target_storage.to_string(),
+                    };
+                    (node, req)
+                })
+                .collect()
+        };
+
+        self.run_distributed_insert(
+            request,
+            &target_relation,
+            target_storage,
+            total_size,
+            file_count,
+            make_tasks,
+            admission,
+            started,
+        )
+        .await
+    }
+
+    /// Driver shared by the file-based and generate_series distributed-insert
+    /// paths.  Handles retry-with-cleanup, post-merge uniqueness validation,
+    /// commit (index snapshot refresh + file-list cache invalidation), and the
+    /// final success/failure result.
+    async fn run_distributed_insert<F>(
+        &self,
+        request: &QueryRequest,
+        target_relation: &analyticsdb_control::CatalogRelation,
+        target_storage: &str,
+        total_size: u64,
+        file_count: usize,
+        make_tasks: F,
+        admission: &QueryAdmission,
+        started: Instant,
+    ) -> Result<Option<QueryExecutionResult>>
+    where
+        F: Fn(
+            &[analyticsdb_control::ClusterNode],
+        ) -> Vec<(
+            analyticsdb_control::ClusterNode,
+            distributed::ExecutePartitionWriteRequest,
+        )>,
+    {
         let partition_client = Arc::clone(&self.partition_client);
+        let (target_store, _) = storage::store_for_location(target_storage)?;
 
         let mut attempts = 0;
         const MAX_ATTEMPTS: usize = 3;
@@ -1764,31 +1985,11 @@ impl PrototypeEngine {
             );
             compute_nodes.truncate(optimal_worker_count);
 
-            // Partition source files across workers (greedy size-aware).
-            let chunks =
-                distributed::partition_files_for_workers(source_files.clone(), compute_nodes.len());
-
-            // Acquire the write lock on the target relation.
-            let relation_lock = self.relation_lock(&target_relation).await;
-            let _write_guard = relation_lock.write().await;
-
-            // Build one ExecutePartitionWriteRequest per worker chunk.
-            let worker_tasks: Vec<_> = chunks
-                .into_iter()
-                .zip(compute_nodes.iter())
-                .map(|(chunk_files, node)| {
-                    let req = distributed::ExecutePartitionWriteRequest {
-                        query_id: admission.query_id.clone(),
-                        // sql is unused when partition_files is non-empty; kept for tracing.
-                        sql: format!("SELECT * FROM partition ({} files)", chunk_files.len()),
-                        session: request.session.clone(),
-                        partition_files: chunk_files,
-                        source_columns: source_relation.columns.clone(),
-                        write_prefix: target_storage.to_string(),
-                    };
-                    (node, req)
-                })
-                .collect();
+            let worker_tasks = make_tasks(&compute_nodes);
+            if worker_tasks.is_empty() {
+                info!("[coordinator] Distributed insert: no work to dispatch.");
+                return Ok(None);
+            }
 
             // Dispatch all concurrently.
             let mut dispatch_futures = Vec::new();
@@ -1797,6 +1998,7 @@ impl PrototypeEngine {
                     distributed::PartitionClient::node_channel_endpoint(node).to_string();
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
+                let req = req.clone();
                 dispatch_futures.push(async move {
                     match pc.write_on_node(&endpoint, &req).await {
                         Ok(ack) => Ok((node_id, ack)),
@@ -1806,9 +2008,12 @@ impl PrototypeEngine {
             }
 
             let dispatch_results = futures::future::join_all(dispatch_futures).await;
-            let mut all_acks = Vec::new();
-            let mut failed_node_id = None;
 
+            // Collect every ack we received, plus any failures.  We must inspect
+            // every result so we can clean up files written by successful workers
+            // before retrying.
+            let mut all_acks = Vec::new();
+            let mut failed_node_id: Option<String> = None;
             for res in dispatch_results {
                 match res {
                     Ok((_, ack)) => all_acks.push(ack),
@@ -1817,23 +2022,73 @@ impl PrototypeEngine {
                             "[coordinator] Node '{}' failed during distributed write: {}",
                             node_id, e
                         );
-                        failed_node_id = Some(node_id);
-                        break;
+                        if failed_node_id.is_none() {
+                            failed_node_id = Some(node_id);
+                        }
                     }
                 }
             }
 
             if let Some(node_id) = failed_node_id {
-                info!("[coordinator] Marking node '{}' as unavailable and retrying distributed insert...", node_id);
+                // Clean up files written by workers that did succeed, otherwise
+                // a retry would double-insert their rows.
+                let already_written: Vec<String> = all_acks
+                    .iter()
+                    .flat_map(|a| a.written_files.iter().cloned())
+                    .collect();
+                if let Err(cleanup_err) =
+                    delete_written_files(&target_store, &already_written).await
+                {
+                    warn!(
+                        "[coordinator] Failed to clean up partial writes after node failure: {}",
+                        cleanup_err
+                    );
+                }
+                info!(
+                    "[coordinator] Marking node '{}' as unavailable and retrying distributed insert...",
+                    node_id
+                );
                 let _ = partition_client.mark_node_unavailable(&node_id).await;
                 continue;
             }
 
-            // Success!
+            // All workers succeeded.  Before committing, validate uniqueness
+            // across new files + existing data if the target has unique/PK
+            // indexes — individual workers cannot check this themselves.
+            let written_files: Vec<String> = all_acks
+                .iter()
+                .flat_map(|a| a.written_files.iter().cloned())
+                .collect();
+
+            let needs_unique_check = target_relation
+                .indexes
+                .iter()
+                .any(|idx| idx.is_unique || idx.is_primary);
+            if needs_unique_check {
+                if let Err(e) = self
+                    .validate_uniqueness_across_new_files(target_relation, &written_files)
+                    .await
+                {
+                    warn!(
+                        "[coordinator] Distributed insert failed uniqueness validation: {}",
+                        e
+                    );
+                    if let Err(cleanup_err) =
+                        delete_written_files(&target_store, &written_files).await
+                    {
+                        warn!(
+                            "[coordinator] Failed to clean up written files after validation error: {}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+
             let total_rows: usize = all_acks.iter().map(|a| a.row_count).sum();
 
             // Commit: refresh index sidecars now that new Parquet files are visible.
-            self.refresh_index_snapshots_after_mutation(&request.session, &target_relation)
+            self.refresh_index_snapshots_after_mutation(&request.session, target_relation)
                 .await;
 
             let table_key = format!(
@@ -1868,6 +2123,96 @@ impl PrototypeEngine {
         Ok(None)
     }
 
+    /// Distributed insert path for `INSERT … SELECT … FROM generate_series(start, end) AS s(n)`.
+    ///
+    /// Slices the integer range across workers and asks each worker to execute
+    /// its own `SELECT` with the assigned subrange, writing results directly to
+    /// the target's storage prefix.
+    async fn try_execute_distributed_generate_series_insert(
+        &self,
+        request: &QueryRequest,
+        statement: &InsertSelectStatement,
+        target_relation: &analyticsdb_control::CatalogRelation,
+        target_storage: &str,
+        plan: GenerateSeriesPlan,
+        admission: &QueryAdmission,
+        started: Instant,
+    ) -> Result<Option<QueryExecutionResult>> {
+        let total_rows_estimate =
+            plan.end.saturating_sub(plan.start).saturating_add(1).max(1) as u64;
+
+        // Use a synthetic "file count" of one per worker-worth of rows so the
+        // worker-count heuristic spreads across nodes.  We treat each ~1M rows
+        // as roughly 128MB (a coarse but useful approximation for size-based
+        // planning).
+        let approx_bytes_per_row: u64 = 128;
+        let total_size = total_rows_estimate.saturating_mul(approx_bytes_per_row);
+        let synthetic_file_count = total_rows_estimate.max(1) as usize;
+
+        // Determine the column names workers should emit so future reads of
+        // the target table find the expected schema.  Prefer the explicit
+        // column list on the INSERT; otherwise fall back to the catalog order.
+        let target_columns: Vec<String> = match &statement.columns {
+            Some(cols) if !cols.is_empty() => cols.clone(),
+            _ => target_relation
+                .columns
+                .iter()
+                .filter(|c| c.name != "_row_id")
+                .map(|c| c.name.clone())
+                .collect(),
+        };
+
+        let plan = Arc::new(plan);
+        let query_sql = statement.query_sql.clone();
+        let target_columns = Arc::new(target_columns);
+
+        let make_tasks = move |compute_nodes: &[analyticsdb_control::ClusterNode]| -> Vec<(
+            analyticsdb_control::ClusterNode,
+            distributed::ExecutePartitionWriteRequest,
+        )> {
+            let ranges = slice_int_range(plan.start, plan.end, compute_nodes.len());
+            ranges
+                .into_iter()
+                .zip(compute_nodes.iter().cloned())
+                .map(|((s, e), node)| {
+                    let worker_sql = rewrite_generate_series_range(
+                        &query_sql,
+                        &plan,
+                        s,
+                        e,
+                        target_columns.as_ref(),
+                    )
+                    .unwrap_or_else(|| query_sql.clone());
+                    let req = distributed::ExecutePartitionWriteRequest {
+                        query_id: admission.query_id.clone(),
+                        initial_query_id: admission.query_id.clone(),
+                        sql: worker_sql,
+                        session: request.session.clone(),
+                        partition_files: Vec::new(),
+                        source_columns: Vec::new(),
+                        write_prefix: target_storage.to_string(),
+                    };
+                    (node, req)
+                })
+                .collect()
+        };
+
+        let relation_lock = self.relation_lock(target_relation).await;
+        let _write_guard = relation_lock.write().await;
+
+        self.run_distributed_insert(
+            request,
+            target_relation,
+            target_storage,
+            total_size,
+            synthetic_file_count,
+            make_tasks,
+            admission,
+            started,
+        )
+        .await
+    }
+
     async fn prepare_query_request(
         &self,
         request: &QueryRequest,
@@ -1891,8 +2236,22 @@ impl PrototypeEngine {
     }
 
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
+        let original_sql = request.sql.clone();
         let (request, admission, started) = self.prepare_query_request(request).await?;
+        let probe = self
+            .query_log
+            .start_probe(&request, &admission, &original_sql);
+        let result = self.execute_query_inner(request, admission, started).await;
+        probe.finish_result(&result);
+        result
+    }
 
+    async fn execute_query_inner(
+        &self,
+        request: QueryRequest,
+        admission: QueryAdmission,
+        started: Instant,
+    ) -> Result<QueryExecutionResult> {
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             return self
                 .execute_insert_select(&request, statement, admission, started)
@@ -4417,6 +4776,10 @@ impl PrototypeEngine {
                     &self.control_plane,
                 )));
                 provider.register_schema("pg_catalog", pg_catalog)?;
+                let system_schema = Arc::new(SystemSchemaProvider::new(
+                    self.query_log.root_location().to_string(),
+                ));
+                provider.register_schema("system", system_schema)?;
             }
 
             ctx.register_catalog(&database, provider);
@@ -5754,6 +6117,196 @@ fn store_range_binary_predicate(
 /// The result is used by `try_execute_distributed_select` to decide whether the
 /// query can be fanned out to Compute nodes.  Conservative: returns `None` for
 /// anything that doesn't look like `SELECT … FROM [db.][ schema.]table [WHERE …]`.
+/// Parsed shape of a `generate_series(start, end)` source used as the FROM
+/// of an `INSERT … SELECT`.  Only inclusive integer ranges with literal bounds
+/// are supported — partition slicing requires constant endpoints known to the
+/// coordinator.
+#[derive(Debug, Clone)]
+pub(crate) struct GenerateSeriesPlan {
+    pub start: i64,
+    pub end: i64,
+    /// Original function name as it appeared in the SQL (case preserved).
+    pub func_name: String,
+}
+
+/// Detects `SELECT … FROM generate_series(<int>, <int>) [AS …]` and extracts
+/// the integer range.  Returns `None` for anything more complex (step argument,
+/// non-literal bounds, joins, CTEs, …).
+fn parse_generate_series_select(sql: &str) -> Option<GenerateSeriesPlan> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value};
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.into_iter().next()?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, args, .. } = &select.from[0].relation else {
+        return None;
+    };
+    let last_part = name.0.last()?.to_string().to_lowercase();
+    if last_part != "generate_series" {
+        return None;
+    }
+    let arg_list = match args.as_ref()? {
+        sqlparser::ast::TableFunctionArgs { args, .. } => args,
+    };
+    if arg_list.len() != 2 {
+        return None;
+    }
+
+    let extract_int = |fa: &FunctionArg| -> Option<i64> {
+        let expr = match fa {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => e,
+            _ => return None,
+        };
+        match expr {
+            Expr::Value(v) => match &v.value {
+                Value::Number(s, _) => s.parse::<i64>().ok(),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Minus,
+                expr,
+            } => match &**expr {
+                Expr::Value(v) => match &v.value {
+                    Value::Number(s, _) => s.parse::<i64>().ok().map(|n| -n),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let start = extract_int(&arg_list[0])?;
+    let end = extract_int(&arg_list[1])?;
+    if end < start {
+        return None;
+    }
+
+    Some(GenerateSeriesPlan {
+        start,
+        end,
+        func_name: name.0.last()?.to_string(),
+    })
+}
+
+/// Slices `[start, end]` (inclusive, integer) into at most `num_workers` chunks.
+/// The first `remainder` chunks are one element larger so every element is
+/// assigned to exactly one chunk and the chunk sizes differ by at most one.
+/// Returns an empty Vec if the range is empty or `num_workers == 0`.
+fn slice_int_range(start: i64, end: i64, num_workers: usize) -> Vec<(i64, i64)> {
+    if num_workers == 0 || end < start {
+        return Vec::new();
+    }
+    let total = (end - start + 1) as u128;
+    let workers = (num_workers as u128).min(total);
+    let base = total / workers;
+    let remainder = total - base * workers;
+    let mut chunks = Vec::with_capacity(workers as usize);
+    let mut cursor = start;
+    for i in 0..workers {
+        let extra = if i < remainder { 1 } else { 0 };
+        let size = (base + extra) as i64;
+        let chunk_end = cursor + size - 1;
+        chunks.push((cursor, chunk_end));
+        cursor = chunk_end + 1;
+    }
+    chunks
+}
+
+/// Replaces the two literal integer arguments of the `generate_series(...)` call
+/// in `sql` with `start` and `end`, and rewrites each projection item so its
+/// output column name matches the corresponding entry in `target_columns`.
+/// Returns the rewritten SQL or `None` if the SQL cannot be parsed or the
+/// projection arity does not match `target_columns`.
+fn rewrite_generate_series_range(
+    sql: &str,
+    plan: &GenerateSeriesPlan,
+    start: i64,
+    end: i64,
+    target_columns: &[String],
+) -> Option<String> {
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, Ident, SelectItem, Value, ValueWithSpan,
+    };
+    let dialect = PostgreSqlDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let statement = statements.get_mut(0)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    let SetExpr::Select(select) = &mut *query.body else {
+        return None;
+    };
+    if select.from.len() != 1 {
+        return None;
+    }
+    let TableFactor::Table { name, args, .. } = &mut select.from[0].relation else {
+        return None;
+    };
+    if name.0.last()?.to_string().to_lowercase() != plan.func_name.to_lowercase() {
+        return None;
+    }
+    let make_int = |n: i64| {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
+            value: Value::Number(n.to_string(), false),
+            span: sqlparser::tokenizer::Span::empty(),
+        })))
+    };
+    if let Some(ta) = args.as_mut() {
+        if ta.args.len() == 2 {
+            ta.args[0] = make_int(start);
+            ta.args[1] = make_int(end);
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    if !target_columns.is_empty() {
+        if select.projection.len() != target_columns.len() {
+            return None;
+        }
+        for (item, target) in select.projection.iter_mut().zip(target_columns.iter()) {
+            let expr = match item.clone() {
+                SelectItem::UnnamedExpr(e) => e,
+                SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => return None,
+            };
+            *item = SelectItem::ExprWithAlias {
+                expr,
+                alias: Ident::with_quote('"', target.clone()),
+            };
+        }
+    }
+
+    Some(statement.to_string())
+}
+
+async fn delete_written_files(store: &Arc<dyn ObjectStore>, files: &[String]) -> Result<()> {
+    let keys: Vec<object_store::path::Path> = files
+        .iter()
+        .filter_map(|p| object_store::path::Path::parse(p.trim_start_matches('/')).ok())
+        .collect();
+    storage::delete_objects(store, &keys).await
+}
+
 fn parse_plain_select_table(sql: &str) -> Option<(Option<String>, Option<String>, String)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let dialect = PostgreSqlDialect {};
@@ -6251,6 +6804,70 @@ FROM generate_series(1, 1000000) AS s(n)
         let _ = std::fs::remove_dir_all(managed_dir);
     }
 
+    async fn configure_fast_query_log(catalog_path: &str) {
+        let control_plane = analyticsdb_control::ControlPlane::from_catalog_path(catalog_path)
+            .await
+            .expect("control plane should initialize");
+        let mut config = control_plane
+            .cluster_config()
+            .await
+            .expect("bootstrap config should exist");
+        config.query_log.batch_size = 1;
+        config.query_log.batch_interval_ms = 25;
+        control_plane
+            .update_cluster_config(config)
+            .await
+            .expect("query log config should persist");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_log_records_successful_queries_as_system_table() {
+        let catalog_path = temp_catalog_path();
+        configure_fast_query_log(&catalog_path).await;
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let session = SessionContext {
+            protocol: Protocol::Embedded,
+            ..SessionContext::default()
+        };
+
+        engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT 1 AS logged_value".to_string(),
+                session: session.clone(),
+            })
+            .await
+            .expect("logged query should execute");
+
+        let mut rows = Vec::new();
+        for _ in 0..20 {
+            let result = engine
+                .execute_query(&QueryRequest {
+                    sql: "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 1 AS logged_value' ORDER BY event_time_us LIMIT 1".to_string(),
+                    session: session.clone(),
+                })
+                .await
+                .expect("query log should be readable");
+            rows = result.to_query_response().rows;
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                "SELECT 1 AS logged_value".to_string(),
+                "QueryFinish".to_string(),
+                "embedded".to_string(),
+                "1".to_string()
+            ]]
+        );
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_primary_key_inserts_keep_table_and_index_consistent() {
         let catalog_path = temp_catalog_path();
@@ -6496,6 +7113,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-q1".to_string(),
+            initial_query_id: "test-partition-q1".to_string(),
             sql: "SELECT 1 + 1 AS result".to_string(),
             session: SessionContext {
                 protocol: Protocol::Embedded,
@@ -6563,6 +7181,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-orders-agg".to_string(),
+            initial_query_id: "test-partition-orders-agg".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session: session.clone(),
             partition_files: partition_files.clone(),
@@ -6591,6 +7210,7 @@ FROM generate_series(1, 10) AS s(n)";
             .collect::<Vec<_>>();
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-orders-agg-wrong-catalog".to_string(),
+            initial_query_id: "test-partition-orders-agg-wrong-catalog".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session: session.clone(),
             partition_files,
@@ -6653,6 +7273,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-string-backed-orders-agg".to_string(),
+            initial_query_id: "test-partition-string-backed-orders-agg".to_string(),
             sql: "SELECT COUNT(*) AS order_count, SUM(order_value) AS total_order_value, AVG(order_value) AS avg_order_value, MIN(date_of_purchase) AS first_order_date, MAX(date_of_purchase) AS last_order_date FROM __partition__ WHERE date_of_purchase >= DATE '2020-01-01'".to_string(),
             session,
             partition_files,
@@ -6978,6 +7599,93 @@ FROM generate_series(1, 10) AS s(n)";
         );
     }
 
+    #[test]
+    fn slice_int_range_even_split() {
+        assert_eq!(slice_int_range(1, 10, 2), vec![(1, 5), (6, 10)]);
+    }
+
+    #[test]
+    fn slice_int_range_uneven_split_extras_go_first() {
+        // 10 elements / 3 workers → sizes [4, 3, 3]
+        assert_eq!(slice_int_range(1, 10, 3), vec![(1, 4), (5, 7), (8, 10)]);
+    }
+
+    #[test]
+    fn slice_int_range_more_workers_than_elements() {
+        // 3 elements / 5 workers → only 3 chunks
+        assert_eq!(slice_int_range(1, 3, 5), vec![(1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn slice_int_range_empty_input() {
+        assert!(slice_int_range(5, 4, 4).is_empty());
+        assert!(slice_int_range(1, 10, 0).is_empty());
+    }
+
+    #[test]
+    fn parse_generate_series_select_basic() {
+        let plan = parse_generate_series_select("SELECT n FROM generate_series(1, 100) AS s(n)")
+            .expect("should parse");
+        assert_eq!(plan.start, 1);
+        assert_eq!(plan.end, 100);
+        assert_eq!(plan.func_name.to_lowercase(), "generate_series");
+    }
+
+    #[test]
+    fn parse_generate_series_select_rejects_step_argument() {
+        assert!(
+            parse_generate_series_select("SELECT n FROM generate_series(1, 100, 2) AS s(n)")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_generate_series_select_rejects_non_literal_bounds() {
+        assert!(parse_generate_series_select(
+            "SELECT n FROM generate_series(now(), now() + interval '1 day') AS s(n)"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_generate_series_select_rejects_other_table() {
+        assert!(parse_generate_series_select("SELECT * FROM customers").is_none());
+    }
+
+    #[test]
+    fn rewrite_generate_series_range_substitutes_and_aliases() {
+        let plan =
+            parse_generate_series_select("SELECT n, n * 2 FROM generate_series(1, 100) AS s(n)")
+                .unwrap();
+        let targets = vec!["id".to_string(), "doubled".to_string()];
+        let rewritten = rewrite_generate_series_range(
+            "SELECT n, n * 2 FROM generate_series(1, 100) AS s(n)",
+            &plan,
+            25,
+            50,
+            &targets,
+        )
+        .expect("should rewrite");
+        assert!(rewritten.contains("generate_series(25, 50)"));
+        assert!(rewritten.contains(r#"AS "id""#));
+        assert!(rewritten.contains(r#"AS "doubled""#));
+    }
+
+    #[test]
+    fn rewrite_generate_series_range_rejects_projection_arity_mismatch() {
+        let plan =
+            parse_generate_series_select("SELECT n FROM generate_series(1, 100) AS s(n)").unwrap();
+        let targets = vec!["a".to_string(), "b".to_string()];
+        assert!(rewrite_generate_series_range(
+            "SELECT n FROM generate_series(1, 100) AS s(n)",
+            &plan,
+            1,
+            10,
+            &targets,
+        )
+        .is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn distributed_select_falls_through_to_local_when_no_compute_nodes() {
         let catalog_path = temp_catalog_path();
@@ -7073,6 +7781,7 @@ FROM generate_series(1, 10) AS s(n)";
 
         let req = crate::distributed::ExecutePartitionWriteRequest {
             query_id: "write-test-1".to_string(),
+            initial_query_id: "write-test-1".to_string(),
             sql: format!("SELECT * FROM partition ({} files)", src_files.len()),
             session: session.clone(),
             partition_files: src_files,

@@ -28,6 +28,93 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use analyticsdb_control::{CatalogTableConstraintKind, ControlPlane};
 use analyticsdb_core::SessionContext;
 
+pub struct SystemSchemaProvider {
+    tables: BTreeMap<String, Arc<dyn TableProvider>>,
+}
+
+impl SystemSchemaProvider {
+    pub fn new(query_log_root_location: String) -> Self {
+        let mut tables: BTreeMap<String, Arc<dyn TableProvider>> = BTreeMap::new();
+        tables.insert(
+            "query_log".to_string(),
+            Arc::new(QueryLogListingTable::new(query_log_root_location)),
+        );
+        Self { tables }
+    }
+}
+
+impl std::fmt::Debug for SystemSchemaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemSchemaProvider")
+            .field("table_names", &self.table_names())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for SystemSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        Ok(self.tables.get(name).cloned())
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
+}
+
+#[derive(Debug)]
+struct QueryLogListingTable {
+    root_location: String,
+    schema: SchemaRef,
+}
+
+impl QueryLogListingTable {
+    fn new(root_location: String) -> Self {
+        Self {
+            root_location,
+            schema: crate::query_log::schema(),
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for QueryLogListingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let table_path = ListingTableUrl::parse(&self.root_location)?;
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+            .with_schema(Arc::clone(&self.schema));
+        let table = ListingTable::try_new(config)?;
+        table.scan(state, projection, filters, limit).await
+    }
+}
+
 pub struct AnalyticsCatalogProvider {
     control_plane: Arc<ControlPlane>,
     session: SessionContext,
