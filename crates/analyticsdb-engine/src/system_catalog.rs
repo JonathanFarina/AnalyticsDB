@@ -106,7 +106,10 @@ impl TableProvider for QueryLogListingTable {
         filters: &[datafusion::prelude::Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let local_path = self.root_location.strip_prefix("file://").unwrap_or(&self.root_location);
+        let local_path = self
+            .root_location
+            .strip_prefix("file://")
+            .unwrap_or(&self.root_location);
 
         // Resolve to an absolute path so that file:// URLs are well-formed
         // (e.g. file:///abs/path, not file://relative/path which DataFusion
@@ -139,7 +142,9 @@ impl TableProvider for QueryLogListingTable {
         collect_files(&abs_root, &mut all_files);
 
         if all_files.is_empty() {
-            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema))));
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                Arc::clone(&self.schema),
+            )));
         }
 
         let mut table_paths = Vec::new();

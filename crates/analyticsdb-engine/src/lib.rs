@@ -2339,7 +2339,9 @@ impl PrototypeEngine {
         let probe = self
             .query_log
             .start_probe(&request, &admission, &original_sql);
-        let result = self.execute_query_inner(request, admission, started, &probe).await;
+        let result = self
+            .execute_query_inner(request, admission, started, &probe)
+            .await;
         probe.finish_result(&result);
         result
     }
@@ -2387,7 +2389,10 @@ impl PrototypeEngine {
         let context = self.create_session_context(&session).await?;
         let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
-        let plan = dataframe.create_physical_plan().await.map_err(sanitize_error)?;
+        let plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(sanitize_error)?;
         let batches = datafusion::physical_plan::collect(Arc::clone(&plan), context.task_ctx())
             .await
             .map_err(sanitize_error)?;
@@ -2425,7 +2430,9 @@ impl PrototypeEngine {
             .query_log
             .start_probe(&request, &admission, &original_sql);
 
-        let mut execution = self.execute_query_stream_inner(&request, admission, started, &probe).await?;
+        let mut execution = self
+            .execute_query_stream_inner(&request, admission, started, &probe)
+            .await?;
         execution.stream = Box::pin(QueryLogStreamWrapper {
             inner: execution.stream,
             probe,
@@ -2443,7 +2450,6 @@ impl PrototypeEngine {
         started: Instant,
         probe: &query_log::QueryProbe,
     ) -> Result<QueryExecutionStream> {
-
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             let execution = self
                 .execute_insert_select(&request, statement, admission, started, probe)
@@ -2530,9 +2536,13 @@ impl PrototypeEngine {
         let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
         let schema = Arc::new(dataframe.schema().as_arrow().as_ref().clone());
 
-        let plan = dataframe.create_physical_plan().await.map_err(sanitize_error)?;
+        let plan = dataframe
+            .create_physical_plan()
+            .await
+            .map_err(sanitize_error)?;
         probe.observe_plan(plan.as_ref());
-        let stream = datafusion::physical_plan::execute_stream(plan, context.task_ctx()).map_err(sanitize_error)?;
+        let stream = datafusion::physical_plan::execute_stream(plan, context.task_ctx())
+            .map_err(sanitize_error)?;
         let outcome = if schema.fields().is_empty() {
             StatementOutcome::Command {
                 tag: "OK".to_string(),
@@ -7040,7 +7050,7 @@ FROM generate_series(1, 1000000) AS s(n)
             })
             .await
             .expect("stream query should execute");
-        
+
         use futures::StreamExt;
         while let Some(batch) = stream_exec.stream.next().await {
             batch.expect("batch should be ok");
@@ -7057,7 +7067,10 @@ FROM generate_series(1, 1000000) AS s(n)
                 .await
                 .expect("query log should be readable");
             rows = result.to_query_response().rows;
-            if rows.len() >= 2 && rows.iter().any(|r| r[0].contains("100")) && rows.iter().any(|r| r[0].contains("t2")) {
+            if rows.len() >= 2
+                && rows.iter().any(|r| r[0].contains("100"))
+                && rows.iter().any(|r| r[0].contains("t2"))
+            {
                 break;
             }
             if i % 10 == 0 {
@@ -7067,31 +7080,49 @@ FROM generate_series(1, 1000000) AS s(n)
         }
 
         if rows.is_empty() {
-             let query_log_dir = std::path::Path::new(&catalog_path)
+            let query_log_dir = std::path::Path::new(&catalog_path)
                 .with_extension("managed")
                 .join("system")
                 .join("query_log");
-             println!("Query log dir: {:?}", query_log_dir);
-             if query_log_dir.exists() {
-                 for entry in std::fs::read_dir(&query_log_dir).unwrap() {
-                     println!("  Entry: {:?}", entry.unwrap().path());
-                 }
-             } else {
-                 println!("Query log dir DOES NOT EXIST");
-             }
+            println!("Query log dir: {:?}", query_log_dir);
+            if query_log_dir.exists() {
+                for entry in std::fs::read_dir(&query_log_dir).unwrap() {
+                    println!("  Entry: {:?}", entry.unwrap().path());
+                }
+            } else {
+                println!("Query log dir DOES NOT EXIST");
+            }
         }
 
-        assert!(rows.len() >= 2, "Expected at least 2 log rows, found {}", rows.len());
-        
+        assert!(
+            rows.len() >= 2,
+            "Expected at least 2 log rows, found {}",
+            rows.len()
+        );
+
         // Find generate_series(1, 100)
-        let row100 = rows.iter().find(|r| r[0].contains("100")).expect("row 100 not found");
+        let row100 = rows
+            .iter()
+            .find(|r| r[0].contains("100"))
+            .expect("row 100 not found");
         // read_rows might be 100 if generate_series is correctly instrumented
-        assert!(row100[1].parse::<i64>().unwrap() >= 100, "read_rows should be >= 100, found {}", row100[1]);
+        assert!(
+            row100[1].parse::<i64>().unwrap() >= 100,
+            "read_rows should be >= 100, found {}",
+            row100[1]
+        );
         assert_eq!(row100[2], "100");
 
         // Find generate_series(1, 50) AS t2
-        let row50 = rows.iter().find(|r| r[0].contains("t2")).expect("row 50 not found");
-        assert!(row50[1].parse::<i64>().unwrap() >= 50, "read_rows should be >= 50, found {}", row50[1]);
+        let row50 = rows
+            .iter()
+            .find(|r| r[0].contains("t2"))
+            .expect("row 50 not found");
+        assert!(
+            row50[1].parse::<i64>().unwrap() >= 50,
+            "read_rows should be >= 50, found {}",
+            row50[1]
+        );
         assert_eq!(row50[2], "50");
 
         // Verify partitioned files on disk
@@ -7099,9 +7130,10 @@ FROM generate_series(1, 1000000) AS s(n)
             .with_extension("managed")
             .join("system")
             .join("query_log");
-        
+
         let mut found_partitioned = false;
-        for entry in std::fs::read_dir(query_log_dir).expect("should be able to read query log dir") {
+        for entry in std::fs::read_dir(query_log_dir).expect("should be able to read query log dir")
+        {
             let entry = entry.expect("valid entry");
             if entry.file_type().expect("valid file type").is_dir() {
                 let name = entry.file_name();
@@ -7111,7 +7143,10 @@ FROM generate_series(1, 1000000) AS s(n)
                 }
             }
         }
-        assert!(found_partitioned, "should have created partitioned YYYY/ directories");
+        assert!(
+            found_partitioned,
+            "should have created partitioned YYYY/ directories"
+        );
         cleanup_catalog_artifacts(&catalog_path);
     }
 

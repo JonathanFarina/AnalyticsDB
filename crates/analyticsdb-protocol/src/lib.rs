@@ -289,18 +289,22 @@ pub async fn serve_flight_sql_with_label(
         let identity = tonic::transport::Identity::from_pem(cert, key);
         builder
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
-            .add_service(FlightServiceServer::new(service)
-                .max_decoding_message_size(usize::MAX)
-                .max_encoding_message_size(usize::MAX))
+            .add_service(
+                FlightServiceServer::new(service)
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX),
+            )
     } else {
         if label == "Flight SQL" || label == "Client Flight SQL" {
             warn!("{}: Starting in PLAINTEXT mode (insecure)", label);
         } else {
             warn!("{}: Starting in PLAINTEXT mode (internal)", label);
         }
-        builder.add_service(FlightServiceServer::new(service)
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX))
+        builder.add_service(
+            FlightServiceServer::new(service)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
+        )
     };
 
     router
@@ -1674,7 +1678,11 @@ fn ensure_compatible_schema(schema: SchemaRef) -> SchemaRef {
     let mut changed = false;
     for field in fields.iter_mut() {
         if matches!(field.data_type(), DataType::Utf8View) {
-            *field = Arc::new(Field::new(field.name(), DataType::Utf8, field.is_nullable()));
+            *field = Arc::new(Field::new(
+                field.name(),
+                DataType::Utf8,
+                field.is_nullable(),
+            ));
             changed = true;
         } else if matches!(field.data_type(), DataType::BinaryView) {
             *field = Arc::new(Field::new(

@@ -204,7 +204,7 @@ impl QueryProbe {
             if let Some(metrics) = plan.metrics() {
                 let mut read_rows = 0;
                 // Aggregate output_rows from all operators in the plan.
-                // Note: generate_series and some other operators might use different names 
+                // Note: generate_series and some other operators might use different names
                 // or might not have metrics until execution is complete.
                 for m in metrics.iter() {
                     let name = m.value().name();
@@ -380,7 +380,6 @@ impl QueryProbeInner {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct QueryLogRecord {
@@ -645,7 +644,8 @@ impl QueryLogWriter {
             Err(_) => return,
         };
 
-        let expiration = Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
+        let expiration =
+            Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
         let expiration_prefix = format!(
             "{:04}/{:02}/{:02}/",
             expiration.year(),
@@ -678,7 +678,6 @@ impl QueryLogWriter {
         }
     }
 }
-
 
 fn protocol_label(protocol: &Protocol) -> &'static str {
     match protocol {
