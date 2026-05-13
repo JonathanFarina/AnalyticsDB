@@ -675,7 +675,7 @@ fn make_unique_alias(base: &str, seen: &HashSet<String>) -> String {
 
     if safe_base.is_empty()
         || (!safe_base.chars().next().unwrap().is_ascii_alphabetic()
-            && safe_base.chars().next().unwrap() != '_')
+            && !safe_base.starts_with('_'))
     {
         safe_base = format!("col_{}", safe_base);
     }
@@ -747,8 +747,8 @@ fn rewrite_expr_recursive<'a>(
                     }
                 }
             }
-            Expr::CompoundIdentifier(parts) => {
-                if parts.len() >= 2 {
+            Expr::CompoundIdentifier(parts)
+                if parts.len() >= 2 => {
                     let alias = parts[parts.len() - 2].to_string();
                     let col_name = parts.last().unwrap().to_string();
                     if let Some(columns) = table_schemas.get(&alias) {
@@ -760,7 +760,6 @@ fn rewrite_expr_recursive<'a>(
                         }
                     }
                 }
-            }
             Expr::BinaryOp { left, op, right } => {
                 rewrite_expr_recursive(left, control_plane, session, table_schemas).await?;
                 rewrite_expr_recursive(right, control_plane, session, table_schemas).await?;

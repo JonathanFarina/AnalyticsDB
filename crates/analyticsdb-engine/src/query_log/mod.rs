@@ -527,28 +527,28 @@ fn records_to_batch(records: &[QueryLogRecord]) -> Result<RecordBatch> {
     )?)
 }
 
-fn string_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn string_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> Option<&str>,
+    F: Fn(&QueryLogRecord) -> Option<&str>,
 {
     Arc::new(StringArray::from(
-        records.iter().map(|record| f(record)).collect::<Vec<_>>(),
+        records.iter().map(f).collect::<Vec<_>>(),
     ))
 }
 
-fn int64_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn int64_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> i64,
+    F: Fn(&QueryLogRecord) -> i64,
 {
-    Arc::new(Int64Array::from_iter_values(records.iter().map(|r| f(r))))
+    Arc::new(Int64Array::from_iter_values(records.iter().map(f)))
 }
 
-fn timestamp_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn timestamp_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> i64,
+    F: Fn(&QueryLogRecord) -> i64,
 {
     Arc::new(TimestampMicrosecondArray::from_iter_values(
-        records.iter().map(|r| f(r)),
+        records.iter().map(f),
     ))
 }
 
@@ -725,7 +725,6 @@ fn normalize_query(sql: &str) -> String {
 
 fn query_kind(sql: &str) -> String {
     let first = sql
-        .trim_start()
         .split_whitespace()
         .next()
         .unwrap_or("Other")

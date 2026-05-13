@@ -189,6 +189,12 @@ pub struct FileListCache {
     epochs: DashMap<String, u64>,                      // table_key -> current_epoch
 }
 
+impl Default for FileListCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileListCache {
     pub fn new() -> Self {
         Self {
@@ -1289,7 +1295,7 @@ impl PrototypeEngine {
                 .await
                 .map_err(sanitize_error)?;
 
-            let index_cols = index.columns.iter().map(|c| col(c)).collect::<Vec<_>>();
+            let index_cols = index.columns.iter().map(col).collect::<Vec<_>>();
 
             // 1. Check for duplicates within the new batch
             let batch_dup_df = new_batch_df
@@ -1370,7 +1376,7 @@ impl PrototypeEngine {
                 .await
                 .map_err(sanitize_error)?;
 
-            let index_cols: Vec<_> = index.columns.iter().map(|c| col(c)).collect();
+            let index_cols: Vec<_> = index.columns.iter().map(col).collect();
 
             // 1. Cross-partition duplicates within the newly written files.
             let dup_df = new_df
@@ -1600,7 +1606,7 @@ impl PrototypeEngine {
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
                 dispatch_futures.push(async move {
-                    match pc.execute_on_node(&endpoint, &req).await {
+                    match pc.execute_on_node(&endpoint, req).await {
                         Ok(stream) => Ok((node_id, stream)),
                         Err(e) => Err((node_id, e)),
                     }
@@ -1727,6 +1733,7 @@ impl PrototypeEngine {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_coordinator_select_over_partition_stream(
         &self,
         request: &QueryRequest,
@@ -1769,6 +1776,7 @@ impl PrototypeEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_coordinator_select_over_partition_batches(
         &self,
         request: &QueryRequest,
@@ -2040,6 +2048,7 @@ impl PrototypeEngine {
     /// paths.  Handles retry-with-cleanup, post-merge uniqueness validation,
     /// commit (index snapshot refresh + file-list cache invalidation), and the
     /// final success/failure result.
+    #[allow(clippy::too_many_arguments)]
     async fn run_distributed_insert<F>(
         &self,
         request: &QueryRequest,
@@ -2225,6 +2234,7 @@ impl PrototypeEngine {
     /// Slices the integer range across workers and asks each worker to execute
     /// its own `SELECT` with the assigned subrange, writing results directly to
     /// the target's storage prefix.
+    #[allow(clippy::too_many_arguments)]
     async fn try_execute_distributed_generate_series_insert(
         &self,
         request: &QueryRequest,
@@ -2452,7 +2462,7 @@ impl PrototypeEngine {
     ) -> Result<QueryExecutionStream> {
         if let Some(statement) = parse_insert_select_statement(&request.sql)? {
             let execution = self
-                .execute_insert_select(&request, statement, admission, started, probe)
+                .execute_insert_select(request, statement, admission, started, probe)
                 .await?;
             let schema = Arc::new(Schema::empty());
             let batch_stream =
@@ -2472,7 +2482,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_indexed_select_statement(&request.sql)? {
             if let Some(execution) = self
-                .try_execute_indexed_select(&request, statement, &admission, started, probe)
+                .try_execute_indexed_select(request, statement, &admission, started, probe)
                 .await?
             {
                 let schema = Arc::clone(&execution.schema);
@@ -2498,7 +2508,7 @@ impl PrototypeEngine {
 
         if let Some(statement) = parse_metadata_statement(&request.sql) {
             let execution = self
-                .execute_metadata_query(&request, statement, admission, started, probe)
+                .execute_metadata_query(request, statement, admission, started, probe)
                 .await?;
             if matches!(execution.outcome, StatementOutcome::Command { .. }) {
                 self.invalidate_session_contexts().await;
@@ -2524,7 +2534,7 @@ impl PrototypeEngine {
         }
 
         if let Some(result) = self
-            .try_execute_distributed_select_stream(&request, &admission, started, probe)
+            .try_execute_distributed_select_stream(request, &admission, started, probe)
             .await?
         {
             return Ok(result);
@@ -3762,7 +3772,7 @@ impl PrototypeEngine {
                 for column in &relation.columns {
                     if let Some((_, value_sql)) = assignments.iter().find(|(name, _)| {
                         if name.starts_with('"') && name.ends_with('"') {
-                            &name[1..name.len() - 1] == column.name
+                            name[1..name.len() - 1] == column.name
                         } else {
                             name.eq_ignore_ascii_case(&column.name)
                         }
@@ -4432,7 +4442,7 @@ impl PrototypeEngine {
                             self.control_plane
                                 .update_relation_storage_path(
                                     &request.session,
-                                    Some(&new_name),
+                                    Some(new_name),
                                     Some(&relation.schema),
                                     &relation.name,
                                     &new_location_str,
@@ -5406,7 +5416,7 @@ impl PrototypeEngine {
         let mut row_ids = Vec::new();
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
-                if let Some(val) = array_value_to_string(batch.column(0), row_idx).ok() {
+                if let Ok(val) = array_value_to_string(batch.column(0), row_idx) {
                     row_ids.push(val);
                 }
             }
@@ -5523,9 +5533,7 @@ fn infer_utf8_partition_column_type(
         let Ok(idx) = batch.schema().index_of(column_name) else {
             return None;
         };
-        let Some(values) = batch.column(idx).as_any().downcast_ref::<StringArray>() else {
-            return None;
-        };
+        let values = batch.column(idx).as_any().downcast_ref::<StringArray>()?;
 
         for row in 0..values.len() {
             if values.is_null(row) {
@@ -5942,7 +5950,7 @@ fn metadata_projection_indices(
 
 fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
     match expr {
-        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::Eq) => {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
             let Some(column_name) = metadata_expr_column_name(left) else {
                 return true;
             };
@@ -5975,7 +5983,7 @@ fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
             }
         }
         Expr::Nested(expr) => metadata_row_matches(expr, columns, row),
-        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
             metadata_row_matches(left, columns, row) && metadata_row_matches(right, columns, row)
         }
         _ => true,
@@ -6310,9 +6318,7 @@ fn parse_generate_series_select(sql: &str) -> Option<GenerateSeriesPlan> {
     if last_part != "generate_series" {
         return None;
     }
-    let arg_list = match args.as_ref()? {
-        sqlparser::ast::TableFunctionArgs { args, .. } => args,
-    };
+    let sqlparser::ast::TableFunctionArgs { args: arg_list, .. } = args.as_ref()?;
     if arg_list.len() != 2 {
         return None;
     }
@@ -6667,14 +6673,10 @@ fn select_projection_contains_function(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(Expr::Function(_)) => true,
-        SelectItem::ExprWithAlias {
+    select.projection.iter().any(|item| matches!(item, SelectItem::UnnamedExpr(Expr::Function(_)) | SelectItem::ExprWithAlias {
             expr: Expr::Function(_),
             ..
-        } => true,
-        _ => false,
-    })
+        }))
 }
 
 struct AggregateExprParts {
@@ -6915,6 +6917,76 @@ fn record_batch_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>> {
         rows.push(row);
     }
     Ok(rows)
+}
+
+fn find_index_predicate<'a>(
+    predicates: &'a BTreeMap<String, IndexPredicate>,
+    column: &str,
+) -> Option<&'a IndexPredicate> {
+    predicates
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
+        .map(|(_, predicate)| predicate)
+}
+
+fn catalog_data_type(data_type: &str) -> DataType {
+    let upper = data_type.to_ascii_uppercase();
+    if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
+        // Default to Decimal128(38, 10) for prototype if no precision/scale specified
+        // or parse them if we want to be more precise
+        return DataType::Decimal128(38, 10);
+    }
+    if upper.starts_with("TIMESTAMP") {
+        if upper.contains("WITH TIME ZONE") || upper.contains("TZ") || upper.contains("UTC") {
+            return DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        } else {
+            return DataType::Timestamp(TimeUnit::Microsecond, None);
+        }
+    }
+    match upper.as_str() {
+        "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
+        "BIGINT" | "INT8" | "INT64" => DataType::Int64,
+        "TEXT" | "VARCHAR" | "STRING" | "UTF8" => DataType::Utf8,
+        "BOOLEAN" | "BOOL" => DataType::Boolean,
+        "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
+        "FLOAT8" | "DOUBLE PRECISION" | "FLOAT64" => DataType::Float64,
+        "DATE" | "DATE32" => DataType::Date32,
+        _ => DataType::Utf8,
+    }
+}
+
+fn validate_unique_index_rows(
+    relation: &analyticsdb_control::CatalogRelation,
+    index: &analyticsdb_control::CatalogIndex,
+    rows: &[Vec<String>],
+) -> Result<()> {
+    if !index.is_unique && !index.is_primary {
+        return Ok(());
+    }
+
+    let index_positions = index_column_positions(relation, &index.columns)?;
+    let mut seen = std::collections::HashMap::new();
+
+    for row in rows {
+        let key = index_positions
+            .iter()
+            .map(|pos| row.get(*pos).cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        *seen.entry(key).or_insert(0) += 1;
+    }
+
+    if let Some((key, _)) = seen.into_iter().find(|(_, count)| *count > 1) {
+        anyhow::bail!(
+            "Unique index '{}' on '{}.{}.{}' would contain duplicate key '{}'",
+            index.name,
+            relation.database,
+            relation.schema,
+            relation.name,
+            key.replace('\u{1f}', ",")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8267,74 +8339,4 @@ FROM generate_series(1, 10) AS s(n)";
             10
         );
     }
-}
-
-fn find_index_predicate<'a>(
-    predicates: &'a BTreeMap<String, IndexPredicate>,
-    column: &str,
-) -> Option<&'a IndexPredicate> {
-    predicates
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
-        .map(|(_, predicate)| predicate)
-}
-
-fn catalog_data_type(data_type: &str) -> DataType {
-    let upper = data_type.to_ascii_uppercase();
-    if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
-        // Default to Decimal128(38, 10) for prototype if no precision/scale specified
-        // or parse them if we want to be more precise
-        return DataType::Decimal128(38, 10);
-    }
-    if upper.starts_with("TIMESTAMP") {
-        if upper.contains("WITH TIME ZONE") || upper.contains("TZ") || upper.contains("UTC") {
-            return DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-        } else {
-            return DataType::Timestamp(TimeUnit::Microsecond, None);
-        }
-    }
-    match upper.as_str() {
-        "INT" | "INTEGER" | "INT4" | "INT32" => DataType::Int32,
-        "BIGINT" | "INT8" | "INT64" => DataType::Int64,
-        "TEXT" | "VARCHAR" | "STRING" | "UTF8" => DataType::Utf8,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "FLOAT4" | "REAL" | "FLOAT32" => DataType::Float32,
-        "FLOAT8" | "DOUBLE PRECISION" | "FLOAT64" => DataType::Float64,
-        "DATE" | "DATE32" => DataType::Date32,
-        _ => DataType::Utf8,
-    }
-}
-
-fn validate_unique_index_rows(
-    relation: &analyticsdb_control::CatalogRelation,
-    index: &analyticsdb_control::CatalogIndex,
-    rows: &[Vec<String>],
-) -> Result<()> {
-    if !index.is_unique && !index.is_primary {
-        return Ok(());
-    }
-
-    let index_positions = index_column_positions(relation, &index.columns)?;
-    let mut seen = std::collections::HashMap::new();
-
-    for row in rows {
-        let key = index_positions
-            .iter()
-            .map(|pos| row.get(*pos).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\u{1f}");
-        *seen.entry(key).or_insert(0) += 1;
-    }
-
-    if let Some((key, _)) = seen.into_iter().find(|(_, count)| *count > 1) {
-        anyhow::bail!(
-            "Unique index '{}' on '{}.{}.{}' would contain duplicate key '{}'",
-            index.name,
-            relation.database,
-            relation.schema,
-            relation.name,
-            key.replace('\u{1f}', ",")
-        );
-    }
-    Ok(())
 }

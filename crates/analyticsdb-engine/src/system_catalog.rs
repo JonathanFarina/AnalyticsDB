@@ -129,10 +129,8 @@ impl TableProvider for QueryLogListingTable {
         fn collect_files(path: &std::path::Path, files: &mut Vec<String>) {
             if path.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            collect_files(&entry.path(), files);
-                        }
+                    for entry in entries.flatten() {
+                        collect_files(&entry.path(), files);
                     }
                 }
             } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
@@ -478,9 +476,7 @@ fn infer_utf8_catalog_column_type(
         let Ok(idx) = batch.schema().index_of(column_name) else {
             return None;
         };
-        let Some(values) = batch.column(idx).as_any().downcast_ref::<StringArray>() else {
-            return None;
-        };
+        let values = batch.column(idx).as_any().downcast_ref::<StringArray>()?;
 
         for row in 0..values.len() {
             if values.is_null(row) {
