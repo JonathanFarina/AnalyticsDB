@@ -5950,7 +5950,11 @@ fn metadata_projection_indices(
 
 fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             let Some(column_name) = metadata_expr_column_name(left) else {
                 return true;
             };
@@ -5983,9 +5987,11 @@ fn metadata_row_matches(expr: &Expr, columns: &[&str], row: &[String]) -> bool {
             }
         }
         Expr::Nested(expr) => metadata_row_matches(expr, columns, row),
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            metadata_row_matches(left, columns, row) && metadata_row_matches(right, columns, row)
-        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => metadata_row_matches(left, columns, row) && metadata_row_matches(right, columns, row),
         _ => true,
     }
 }
@@ -6673,10 +6679,16 @@ fn select_projection_contains_function(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.projection.iter().any(|item| matches!(item, SelectItem::UnnamedExpr(Expr::Function(_)) | SelectItem::ExprWithAlias {
-            expr: Expr::Function(_),
-            ..
-        }))
+    select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(Expr::Function(_))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::Function(_),
+                    ..
+                }
+        )
+    })
 }
 
 struct AggregateExprParts {

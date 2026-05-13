@@ -3565,7 +3565,6 @@ fn bootstrap_state() -> CatalogState {
     }
 }
 
-
 fn validate_identifier(value: &str) -> Result<()> {
     if value.is_empty() {
         bail!("Identifiers must not be empty");
@@ -5968,4 +5967,3 @@ mod tests {
         });
     }
 }
-

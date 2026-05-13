@@ -531,9 +531,7 @@ fn string_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
     F: Fn(&QueryLogRecord) -> Option<&str>,
 {
-    Arc::new(StringArray::from(
-        records.iter().map(f).collect::<Vec<_>>(),
-    ))
+    Arc::new(StringArray::from(records.iter().map(f).collect::<Vec<_>>()))
 }
 
 fn int64_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
