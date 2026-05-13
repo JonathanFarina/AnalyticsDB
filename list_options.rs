@@ -1,5 +1,5 @@
-use datafusion::prelude::*;
 use datafusion::error::Result;
+use datafusion::prelude::*;
 
 // Define a dummy version of base_session_config to test it
 fn test_base_session_config() -> SessionConfig {
