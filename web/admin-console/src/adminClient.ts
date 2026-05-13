@@ -11,7 +11,7 @@ export interface QueryLogConfig {
 export interface ClusterConfig {
   base_postgres_port: number;
   base_flight_sql_port: number;
-  base_node_port?: number;
+  base_node_port?: number | null;
   catalog_path: string;
   tls_cert_path?: string | null;
   tls_key_path?: string | null;

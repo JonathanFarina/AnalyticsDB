@@ -3,8 +3,16 @@ import {
   saveClusterConfig,
   type ClusterConfig,
   type ClusterConfigEnvelope,
-  type QueryLogConfig,
 } from "../adminClient";
+import {
+  DEFAULT_QUERY_LOG,
+  buildSavePayload,
+  emptyToNull,
+  getPath,
+  isDirty,
+  setPath,
+  withDisplayDefaults,
+} from "../clusterConfigForm";
 import { icon } from "../icons";
 
 interface SettingsState {
@@ -28,16 +36,6 @@ interface FieldDescriptor {
   readonly group: FieldGroup;
   readonly step?: string;
 }
-
-const DEFAULT_QUERY_LOG: QueryLogConfig = {
-  enabled: true,
-  sample_rate: 1.0,
-  min_duration_ms: 0,
-  batch_size: 1024,
-  batch_interval_ms: 5000,
-  max_query_length_bytes: 65536,
-  retention_days: 30,
-};
 
 const FIELDS: readonly FieldDescriptor[] = [
   {
@@ -190,7 +188,7 @@ export function mountSettingsView(container: HTMLElement): void {
 
   discardButton.addEventListener("click", () => {
     if (state.loaded) {
-      state.draft = cloneConfig(state.loaded.config);
+      state.draft = withDisplayDefaults(state.loaded.config);
       state.error = null;
       state.notice = null;
       renderAll();
@@ -212,7 +210,12 @@ export function mountSettingsView(container: HTMLElement): void {
   }
 
   function refreshActionButtons(): void {
-    const dirty = isDirty(state);
+    if (!state.loaded || !state.draft) {
+      saveButton.disabled = true;
+      discardButton.disabled = true;
+      return;
+    }
+    const dirty = isDirty(state.loaded.config, state.draft);
     saveButton.disabled = !dirty || state.saving;
     discardButton.disabled = !dirty || state.saving;
     saveButton.classList.toggle("is-running", state.saving);
@@ -220,6 +223,10 @@ export function mountSettingsView(container: HTMLElement): void {
     if (label) {
       label.textContent = state.saving ? "Saving…" : "Save settings";
     }
+  }
+
+  function clearInlineNotice(): void {
+    body.querySelectorAll(".settings-notice").forEach((node) => node.remove());
   }
 
   function bindFieldHandlers(): void {
@@ -232,7 +239,10 @@ export function mountSettingsView(container: HTMLElement): void {
         if (!state.draft) {
           return;
         }
-        state.notice = null;
+        if (state.notice !== null) {
+          state.notice = null;
+          clearInlineNotice();
+        }
         state.draft = applyFieldChange(state.draft, field, input);
         refreshActionButtons();
       };
@@ -250,7 +260,7 @@ export function mountSettingsView(container: HTMLElement): void {
     try {
       const envelope = await fetchClusterConfig();
       state.loaded = envelope;
-      state.draft = cloneConfig(envelope.config);
+      state.draft = withDisplayDefaults(envelope.config);
     } catch (error) {
       state.error = error instanceof Error ? error.message : String(error);
     }
@@ -258,18 +268,18 @@ export function mountSettingsView(container: HTMLElement): void {
   }
 
   async function save(): Promise<void> {
-    if (!state.draft) {
+    if (!state.draft || !state.loaded) {
       return;
     }
     state.saving = true;
     state.error = null;
     state.notice = null;
-    renderAll();
+    refreshActionButtons();
     try {
-      const payload = normaliseForSave(state.draft);
+      const payload = buildSavePayload(state.draft, state.loaded.config);
       const envelope = await saveClusterConfig(payload);
       state.loaded = envelope;
-      state.draft = cloneConfig(envelope.config);
+      state.draft = withDisplayDefaults(envelope.config);
       state.notice = `Saved to ${envelope.path}.`;
     } catch (error) {
       state.error = error instanceof Error ? error.message : String(error);
@@ -285,7 +295,7 @@ function applyFieldChange(
   field: FieldDescriptor,
   input: HTMLInputElement,
 ): ClusterConfig {
-  const next = cloneConfig(draft);
+  const next = cloneDraft(draft);
   if (field.type === "boolean") {
     setPath(next, field.key, input.checked);
     return next;
@@ -312,113 +322,8 @@ function applyFieldChange(
   return next;
 }
 
-function isDirty(state: SettingsState): boolean {
-  if (!state.loaded || !state.draft) {
-    return false;
-  }
-  return !deepEqual(state.loaded.config, state.draft);
-}
-
-function deepEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-function cloneConfig(config: ClusterConfig): ClusterConfig {
-  const cloned = JSON.parse(JSON.stringify(config)) as ClusterConfig;
-  // Ensure query_log is always present when editing so toggles render.
-  if (!cloned.query_log) {
-    cloned.query_log = { ...DEFAULT_QUERY_LOG };
-  }
-  return cloned;
-}
-
-function normaliseForSave(draft: ClusterConfig): ClusterConfig {
-  const queryLog = draft.query_log ?? DEFAULT_QUERY_LOG;
-  return {
-    base_postgres_port: Number(draft.base_postgres_port),
-    base_flight_sql_port: Number(draft.base_flight_sql_port),
-    base_node_port:
-      draft.base_node_port === undefined || draft.base_node_port === null
-        ? undefined
-        : Number(draft.base_node_port),
-    catalog_path: String(draft.catalog_path),
-    tls_cert_path: emptyToNull(draft.tls_cert_path),
-    tls_key_path: emptyToNull(draft.tls_key_path),
-    next_available_port_offset: Number(draft.next_available_port_offset),
-    query_log: {
-      enabled: Boolean(queryLog.enabled),
-      sample_rate: clampFloat(queryLog.sample_rate, 0, 1, DEFAULT_QUERY_LOG.sample_rate),
-      min_duration_ms: clampNonNegInt(
-        queryLog.min_duration_ms,
-        DEFAULT_QUERY_LOG.min_duration_ms,
-      ),
-      batch_size: clampNonNegInt(queryLog.batch_size, DEFAULT_QUERY_LOG.batch_size),
-      batch_interval_ms: clampNonNegInt(
-        queryLog.batch_interval_ms,
-        DEFAULT_QUERY_LOG.batch_interval_ms,
-      ),
-      max_query_length_bytes: clampNonNegInt(
-        queryLog.max_query_length_bytes,
-        DEFAULT_QUERY_LOG.max_query_length_bytes,
-      ),
-      retention_days: clampNonNegInt(queryLog.retention_days, DEFAULT_QUERY_LOG.retention_days),
-    },
-  };
-}
-
-function clampFloat(value: unknown, min: number, max: number, fallback: number): number {
-  const numeric = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(numeric)) {
-    return fallback;
-  }
-  return Math.min(Math.max(numeric, min), max);
-}
-
-function clampNonNegInt(value: unknown, fallback: number): number {
-  const numeric = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(numeric) || numeric < 0) {
-    return fallback;
-  }
-  return Math.floor(numeric);
-}
-
-function emptyToNull(value: string | null | undefined): string | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  const trimmed = String(value).trim();
-  return trimmed === "" ? null : trimmed;
-}
-
-function setPath(target: ClusterConfig, key: string, value: unknown): void {
-  const parts = key.split(".");
-  if (parts.length === 1) {
-    (target as unknown as Record<string, unknown>)[parts[0]] = value;
-    return;
-  }
-
-  let cursor = target as unknown as Record<string, unknown>;
-  for (let index = 0; index < parts.length - 1; index += 1) {
-    const part = parts[index];
-    const existing = cursor[part];
-    if (existing === undefined || existing === null || typeof existing !== "object") {
-      cursor[part] = {};
-    }
-    cursor = cursor[part] as Record<string, unknown>;
-  }
-  cursor[parts[parts.length - 1]] = value;
-}
-
-function getPath(source: ClusterConfig, key: string): unknown {
-  const parts = key.split(".");
-  let cursor: unknown = source;
-  for (const part of parts) {
-    if (cursor === undefined || cursor === null || typeof cursor !== "object") {
-      return undefined;
-    }
-    cursor = (cursor as Record<string, unknown>)[part];
-  }
-  return cursor;
+function cloneDraft(config: ClusterConfig): ClusterConfig {
+  return withDisplayDefaults(JSON.parse(JSON.stringify(config)) as ClusterConfig);
 }
 
 function renderBody(state: SettingsState): string {
@@ -426,6 +331,12 @@ function renderBody(state: SettingsState): string {
   const draft = state.draft!;
   const tlsEnabled = Boolean(emptyToNull(draft.tls_cert_path) && emptyToNull(draft.tls_key_path));
   const queryLogEnabled = Boolean(draft.query_log?.enabled);
+  const baselineHasQueryLog = envelope.config.query_log !== undefined;
+  const queryLogBadge = baselineHasQueryLog
+    ? queryLogEnabled
+      ? `<span class="status-pill status-pill-success"><span class="status-dot"></span>logging</span>`
+      : `<span class="status-pill status-pill-muted"><span class="status-dot"></span>disabled</span>`
+    : `<span class="status-pill status-pill-muted"><span class="status-dot"></span>defaults (not in file)</span>`;
   return `
     ${state.notice ? renderNotice(state.notice, "success") : ""}
     ${state.error ? renderNotice(state.error, "error") : ""}
@@ -460,14 +371,12 @@ function renderBody(state: SettingsState): string {
       )}
       ${sectionCard(
         "Query log",
-        "Persistent log of completed queries written by the engine.",
+        baselineHasQueryLog
+          ? "Persistent log of completed queries written by the engine."
+          : "Engine defaults are shown — they are only persisted to the file if you change one.",
         ["query-log"],
         draft,
-        [
-          queryLogEnabled
-            ? `<span class="status-pill status-pill-success"><span class="status-dot"></span>logging</span>`
-            : `<span class="status-pill status-pill-muted"><span class="status-dot"></span>disabled</span>`,
-        ],
+        [queryLogBadge],
       )}
     </div>
     <section class="card">
@@ -525,12 +434,14 @@ function renderField(field: FieldDescriptor, draft: ClusterConfig): string {
     `;
   }
 
+  const fallback = field.type === "number" ? DEFAULT_NUMBER_FALLBACKS[field.key] : undefined;
   const value =
     raw === undefined || raw === null
       ? ""
       : field.type === "number"
         ? String(raw)
         : String(raw);
+  const placeholder = field.placeholder ?? (fallback !== undefined ? String(fallback) : undefined);
   return `
     <label class="form-field">
       <span class="form-label">${field.label}${optionalTag ? ` ${optionalTag}` : ""}</span>
@@ -540,12 +451,21 @@ function renderField(field: FieldDescriptor, draft: ClusterConfig): string {
         data-key="${field.key}"
         value="${escapeAttribute(value)}"
         ${field.step ? `step="${escapeAttribute(field.step)}"` : ""}
-        ${field.placeholder ? `placeholder="${escapeAttribute(field.placeholder)}"` : ""}
+        ${placeholder ? `placeholder="${escapeAttribute(placeholder)}"` : ""}
       />
       ${field.hint ? `<span class="form-hint">${field.hint}</span>` : ""}
     </label>
   `;
 }
+
+const DEFAULT_NUMBER_FALLBACKS: Readonly<Record<string, number>> = {
+  "query_log.sample_rate": DEFAULT_QUERY_LOG.sample_rate,
+  "query_log.min_duration_ms": DEFAULT_QUERY_LOG.min_duration_ms,
+  "query_log.batch_size": DEFAULT_QUERY_LOG.batch_size,
+  "query_log.batch_interval_ms": DEFAULT_QUERY_LOG.batch_interval_ms,
+  "query_log.max_query_length_bytes": DEFAULT_QUERY_LOG.max_query_length_bytes,
+  "query_log.retention_days": DEFAULT_QUERY_LOG.retention_days,
+};
 
 function renderTlsBadge(enabled: boolean): string {
   return enabled
@@ -556,7 +476,7 @@ function renderTlsBadge(enabled: boolean): string {
 function renderNotice(message: string, kind: "success" | "error"): string {
   const iconName = kind === "success" ? "circle-check" : "x-circle";
   return `
-    <div class="message message-${kind === "success" ? "info" : "error"}">
+    <div class="message message-${kind === "success" ? "info" : "error"} settings-notice">
       ${icon(iconName, 14)}
       <span>${escapeHtml(message)}</span>
     </div>
@@ -571,7 +491,7 @@ function renderError(message: string): string {
   return `
     <div class="card">
       <div class="card-body">
-        <div class="message message-error">
+        <div class="message message-error settings-notice">
           ${icon("x-circle", 14)}
           <span>${escapeHtml(message)}. Confirm the dev server is running (npm run dev) so the cluster admin API is reachable.</span>
         </div>
