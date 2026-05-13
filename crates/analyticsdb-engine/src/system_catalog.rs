@@ -107,7 +107,21 @@ impl TableProvider for QueryLogListingTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let local_path = self.root_location.strip_prefix("file://").unwrap_or(&self.root_location);
-        
+
+        // Resolve to an absolute path so that file:// URLs are well-formed
+        // (e.g. file:///abs/path, not file://relative/path which DataFusion
+        // mistakenly parses as having a URL host named "relative").
+        let abs_root = {
+            let p = std::path::Path::new(local_path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?
+                    .join(p)
+            }
+        };
+
         let mut all_files = Vec::new();
         fn collect_files(path: &std::path::Path, files: &mut Vec<String>) {
             if path.is_dir() {
@@ -122,7 +136,7 @@ impl TableProvider for QueryLogListingTable {
                 files.push(path.to_string_lossy().to_string());
             }
         }
-        collect_files(std::path::Path::new(local_path), &mut all_files);
+        collect_files(&abs_root, &mut all_files);
 
         if all_files.is_empty() {
             return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema))));
@@ -130,13 +144,17 @@ impl TableProvider for QueryLogListingTable {
 
         let mut table_paths = Vec::new();
         for file in all_files {
+            // `file` is now an absolute path (e.g. /data/...) so
+            // format!("file://{}", file) produces file:///data/... — a valid
+            // local-filesystem URL that DataFusion's built-in LocalFileSystem
+            // object store can handle.
             let url = format!("file://{}", file);
             table_paths.push(ListingTableUrl::parse(url)?);
         }
 
         let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
         listing_options.file_extension = ".parquet".to_string();
-        
+
         let config = ListingTableConfig::new_with_multi_paths(table_paths)
             .with_listing_options(listing_options)
             .with_schema(Arc::clone(&self.schema));
