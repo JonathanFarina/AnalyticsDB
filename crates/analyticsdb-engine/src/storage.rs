@@ -117,7 +117,7 @@ pub async fn list_parquet_files_with_sizes(
                     .trim_start_matches('/');
                 if !relative.contains('/') && relative.ends_with(".parquet") {
                     // Prepend '/' so DataFusion sees an absolute path.
-                    files.push((format!("/{}", loc), meta.size as u64));
+                    files.push((format!("/{}", loc), meta.size));
                 }
             }
             Some(Err(OsError::NotFound { .. })) => break,
@@ -278,7 +278,7 @@ pub async fn rename_prefix(
                 let new_key = if relative.is_empty() {
                     new_prefix.clone()
                 } else {
-                    OPath::parse(&format!("{}/{}", new_str, relative))
+                    OPath::parse(format!("{}/{}", new_str, relative))
                         .map_err(|e| anyhow::anyhow!("Invalid renamed path: {}", e))?
                 };
                 moves.push((meta.location, new_key));

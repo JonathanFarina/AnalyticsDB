@@ -204,7 +204,7 @@ impl QueryProbe {
             if let Some(metrics) = plan.metrics() {
                 let mut read_rows = 0;
                 // Aggregate output_rows from all operators in the plan.
-                // Note: generate_series and some other operators might use different names 
+                // Note: generate_series and some other operators might use different names
                 // or might not have metrics until execution is complete.
                 for m in metrics.iter() {
                     let name = m.value().name();
@@ -381,7 +381,6 @@ impl QueryProbeInner {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct QueryLogRecord {
     pub event_type: String,
@@ -528,28 +527,26 @@ fn records_to_batch(records: &[QueryLogRecord]) -> Result<RecordBatch> {
     )?)
 }
 
-fn string_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn string_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> Option<&str>,
+    F: Fn(&QueryLogRecord) -> Option<&str>,
 {
-    Arc::new(StringArray::from(
-        records.iter().map(|record| f(record)).collect::<Vec<_>>(),
-    ))
+    Arc::new(StringArray::from(records.iter().map(f).collect::<Vec<_>>()))
 }
 
-fn int64_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn int64_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> i64,
+    F: Fn(&QueryLogRecord) -> i64,
 {
-    Arc::new(Int64Array::from_iter_values(records.iter().map(|r| f(r))))
+    Arc::new(Int64Array::from_iter_values(records.iter().map(f)))
 }
 
-fn timestamp_array<F>(records: &[QueryLogRecord], mut f: F) -> ArrayRef
+fn timestamp_array<F>(records: &[QueryLogRecord], f: F) -> ArrayRef
 where
-    F: FnMut(&QueryLogRecord) -> i64,
+    F: Fn(&QueryLogRecord) -> i64,
 {
     Arc::new(TimestampMicrosecondArray::from_iter_values(
-        records.iter().map(|r| f(r)),
+        records.iter().map(f),
     ))
 }
 
@@ -645,7 +642,8 @@ impl QueryLogWriter {
             Err(_) => return,
         };
 
-        let expiration = Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
+        let expiration =
+            Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
         let expiration_prefix = format!(
             "{:04}/{:02}/{:02}/",
             expiration.year(),
@@ -678,7 +676,6 @@ impl QueryLogWriter {
         }
     }
 }
-
 
 fn protocol_label(protocol: &Protocol) -> &'static str {
     match protocol {
@@ -726,7 +723,6 @@ fn normalize_query(sql: &str) -> String {
 
 fn query_kind(sql: &str) -> String {
     let first = sql
-        .trim_start()
         .split_whitespace()
         .next()
         .unwrap_or("Other")

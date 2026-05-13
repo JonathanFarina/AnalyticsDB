@@ -66,7 +66,7 @@ pub fn partition_files_for_workers(
 
     // Sort by size descending
     let mut sorted = files;
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     // Greedy assignment: assign each file to the bucket with the smallest total size.
     for (file, size) in sorted {
@@ -413,7 +413,7 @@ mod tests {
     fn ipc_round_trip() {
         let batch = make_batch();
         let schema = batch.schema();
-        let bytes = batches_to_ipc_bytes(&schema, &[batch.clone()]).unwrap();
+        let bytes = batches_to_ipc_bytes(&schema, std::slice::from_ref(&batch)).unwrap();
         let decoded = ipc_bytes_to_batches(&bytes).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].num_rows(), 3);

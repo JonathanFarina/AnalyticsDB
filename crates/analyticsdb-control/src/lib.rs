@@ -1341,6 +1341,7 @@ impl ControlPlane {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_index(
         &self,
         session: &SessionContext,
@@ -1513,10 +1514,10 @@ impl ControlPlane {
                         name, new_name
                     ));
                 }
-                AlterDatabaseOperation::OwnerTo { new_owner } => {
-                    if !state.users.contains_key(new_owner) {
-                        bail!("User '{}' does not exist", new_owner);
-                    }
+                AlterDatabaseOperation::OwnerTo { new_owner }
+                    if !state.users.contains_key(new_owner) =>
+                {
+                    bail!("User '{}' does not exist", new_owner);
                 }
                 _ => {}
             }
@@ -2179,6 +2180,7 @@ impl ControlPlane {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_managed_table(
         &self,
         session: &SessionContext,
@@ -2421,6 +2423,7 @@ impl ControlPlane {
             .ok_or_else(|| anyhow::anyhow!("Index '{}' not found", index_name))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview_create_index(
         &self,
         session: &SessionContext,
@@ -2556,6 +2559,7 @@ impl ControlPlane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn drop_constraint(
         &self,
         session: &SessionContext,
@@ -2905,6 +2909,7 @@ impl ControlPlane {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_external_table(
         &self,
         session: &SessionContext,
@@ -3557,337 +3562,6 @@ fn bootstrap_state() -> CatalogState {
         functions: BTreeMap::new(),
         config,
         catalogue_version: 0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run_async_test<F>(future: F)
-    where
-        F: std::future::Future<Output = ()>,
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime should build")
-            .block_on(future);
-    }
-
-    #[test]
-    fn join_cluster_advertises_plaintext_endpoint_without_tls_config() {
-        run_async_test(async {
-            let control_plane = ControlPlane::new_bootstrap();
-
-            let response = control_plane
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join should succeed");
-
-            let nodes = control_plane.list_nodes().await.expect("nodes should list");
-            let worker = nodes
-                .iter()
-                .find(|node| node.id == response.node_id)
-                .expect("joined node should be registered");
-
-            assert_eq!(worker.endpoint, "http://10.0.0.2:50052");
-            assert_eq!(
-                worker.internal_endpoint.as_deref(),
-                Some("http://10.0.0.2:60052")
-            );
-        });
-    }
-
-    #[test]
-    fn join_cluster_advertises_tls_endpoint_when_tls_config_is_available() {
-        run_async_test(async {
-            let control_plane = ControlPlane::new_bootstrap();
-            control_plane
-                .set_tls_paths(
-                    Some("certs/server.crt".to_string()),
-                    Some("certs/server.key".to_string()),
-                )
-                .await
-                .expect("tls paths should update");
-
-            let response = control_plane
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join should succeed");
-
-            let nodes = control_plane.list_nodes().await.expect("nodes should list");
-            let worker = nodes
-                .iter()
-                .find(|node| node.id == response.node_id)
-                .expect("joined node should be registered");
-
-            assert_eq!(worker.endpoint, "https://10.0.0.2:50052");
-            assert_eq!(
-                worker.internal_endpoint.as_deref(),
-                Some("http://10.0.0.2:60052")
-            );
-        });
-    }
-
-    #[test]
-    fn heartbeat_does_not_rewrite_catalog_file() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-heartbeat-test-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let catalog_path = dir.join("catalog.json");
-
-            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
-                .await
-                .expect("bootstrap");
-
-            control_plane
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join should succeed");
-
-            let mtime_before = std::fs::metadata(&catalog_path)
-                .expect("catalog metadata")
-                .modified()
-                .expect("modified time");
-
-            // Sleep just enough for filesystem mtime resolution to advance.
-            std::thread::sleep(std::time::Duration::from_millis(20));
-
-            for _ in 0..50 {
-                control_plane
-                    .heartbeat("worker-1")
-                    .await
-                    .expect("heartbeat");
-            }
-
-            let mtime_after = std::fs::metadata(&catalog_path)
-                .expect("catalog metadata")
-                .modified()
-                .expect("modified time");
-
-            assert_eq!(
-                mtime_before, mtime_after,
-                "heartbeats must not rewrite the catalogue file"
-            );
-
-            // The node should still report Ready via list_nodes, sourced from
-            // the in-memory liveness map.
-            let nodes = control_plane.list_nodes().await.expect("list nodes");
-            let worker = nodes
-                .iter()
-                .find(|n| n.id == "worker-1")
-                .expect("worker registered");
-            assert_eq!(worker.status, NodeStatus::Ready);
-            assert!(worker.last_heartbeat_at_epoch_ms > 0);
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn catalogue_version_increments_on_persisted_writes() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-version-test-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let catalog_path = dir.join("catalog.json");
-
-            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
-                .await
-                .expect("bootstrap");
-
-            // Bootstrap itself performs one persist (creating the file), so
-            // the version should be at least 1.
-            let v0 = control_plane.catalogue_version().await;
-            assert!(v0 >= 1, "bootstrap should have bumped version, got {v0}");
-
-            // Subscribe before further writes so we can confirm we receive a
-            // notification.
-            let mut rx = control_plane.subscribe_catalogue_version();
-
-            control_plane
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join");
-
-            let v1 = control_plane.catalogue_version().await;
-            assert!(v1 > v0, "join_cluster should bump version: {v0} -> {v1}");
-
-            // Receiver should observe the new version (latest-value semantics).
-            rx.changed().await.expect("notification");
-            assert_eq!(*rx.borrow(), v1);
-
-            // Heartbeats must NOT bump the version (they don't persist).
-            for _ in 0..10 {
-                control_plane.heartbeat("worker-1").await.expect("hb");
-            }
-            let v2 = control_plane.catalogue_version().await;
-            assert_eq!(v2, v1, "heartbeats must not bump catalogue version");
-
-            // Snapshot exposes the version.
-            let snap = control_plane.cluster_snapshot().await;
-            assert_eq!(snap.catalogue_version, v1);
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn migrate_json_to_sqlite_preserves_state() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-migrate-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let json_path = dir.join("catalog.json");
-            let sqlite_path = dir.join("catalog.db");
-
-            // Build a JSON catalogue with some content.
-            let cp_json = ControlPlane::from_catalog_path(&json_path)
-                .await
-                .expect("bootstrap json");
-            cp_json
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join");
-            let snap_before = cp_json.cluster_snapshot().await;
-            drop(cp_json);
-
-            // Migrate.
-            ControlPlane::migrate_json_to_sqlite(&json_path, &sqlite_path)
-                .await
-                .expect("migration");
-
-            // Reopen on the SQLite path and compare.
-            let cp_sql = ControlPlane::from_catalog_path(&sqlite_path)
-                .await
-                .expect("bootstrap sqlite");
-            let snap_after = cp_sql.cluster_snapshot().await;
-
-            assert_eq!(snap_before.databases, snap_after.databases);
-            assert_eq!(snap_before.users, snap_after.users);
-            assert_eq!(snap_before.relations, snap_after.relations);
-            // Node identity preserved (statuses differ because liveness map
-            // resets on reload — that's expected per Phase 1 design).
-            let ids_before: Vec<&str> = snap_before.nodes.iter().map(|n| n.id.as_str()).collect();
-            let ids_after: Vec<&str> = snap_after.nodes.iter().map(|n| n.id.as_str()).collect();
-            assert_eq!(ids_before, ids_after);
-            assert_eq!(snap_before.catalogue_version, snap_after.catalogue_version);
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn catalogue_version_survives_reload() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-version-reload-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let catalog_path = dir.join("catalog.json");
-
-            let cp1 = ControlPlane::from_catalog_path(&catalog_path)
-                .await
-                .expect("bootstrap");
-            cp1.join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join");
-            let v_before = cp1.catalogue_version().await;
-            drop(cp1);
-
-            let cp2 = ControlPlane::from_catalog_path(&catalog_path)
-                .await
-                .expect("reload");
-            let v_after = cp2.catalogue_version().await;
-            assert_eq!(v_after, v_before, "version must survive reload");
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn first_install_creates_sqlite_file() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-firstinstall-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let db_path = dir.join("analyticsdb-catalog.db");
-
-            assert!(!db_path.exists(), "should start with no catalog file");
-
-            let cp = ControlPlane::from_catalog_path(&db_path)
-                .await
-                .expect("first-install bootstrap");
-
-            assert!(
-                db_path.exists(),
-                "SQLite catalog must be created on first start"
-            );
-
-            // Default database and users should be present.
-            let snap = cp.cluster_snapshot().await;
-            assert!(
-                snap.databases.iter().any(|d| d.name == "postgres"),
-                "default postgres database should exist"
-            );
-            assert!(
-                snap.users.iter().any(|u| u.name == "postgres"),
-                "default postgres user should exist"
-            );
-            assert!(
-                snap.catalogue_version >= 1,
-                "version should be > 0 after bootstrap"
-            );
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn startup_auto_migrates_legacy_json_to_sqlite() {
-        run_async_test(async {
-            let dir = std::env::temp_dir().join(format!("adb-automigrate-{}", Uuid::now_v7()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-
-            // Simulate an existing JSON deployment by bootstrapping with the
-            // JSON path first.
-            let json_path = dir.join("analyticsdb-catalog.json");
-            let cp_json = ControlPlane::from_catalog_path(&json_path)
-                .await
-                .expect("json bootstrap");
-            cp_json
-                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
-                .await
-                .expect("join");
-            let snap_json = cp_json.cluster_snapshot().await;
-            drop(cp_json);
-
-            // Now start with the new default SQLite path (same stem). The
-            // engine should auto-migrate — no manual intervention required.
-            let db_path = dir.join("analyticsdb-catalog.db");
-            assert!(!db_path.exists(), "db must not exist before auto-migration");
-
-            let cp_db = ControlPlane::from_catalog_path(&db_path)
-                .await
-                .expect("auto-migrate + load");
-
-            assert!(
-                db_path.exists(),
-                "SQLite file must be created by auto-migration"
-            );
-
-            let snap_db = cp_db.cluster_snapshot().await;
-            assert_eq!(
-                snap_json.databases, snap_db.databases,
-                "databases must survive auto-migration"
-            );
-            assert_eq!(
-                snap_json.users, snap_db.users,
-                "users must survive auto-migration"
-            );
-            assert_eq!(
-                snap_json.catalogue_version, snap_db.catalogue_version,
-                "version must survive auto-migration"
-            );
-
-            std::fs::remove_dir_all(&dir).ok();
-        });
     }
 }
 
@@ -4841,9 +4515,9 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         let mut target_sql = trimmed;
         if upper.ends_with(" CASCADE") {
             cascade = true;
-            target_sql = &trimmed[..trimmed.len() - " CASCADE".len()].trim();
+            target_sql = trimmed[..trimmed.len() - " CASCADE".len()].trim();
         } else if upper.ends_with(" RESTRICT") {
-            target_sql = &trimmed[..trimmed.len() - " RESTRICT".len()].trim();
+            target_sql = trimmed[..trimmed.len() - " RESTRICT".len()].trim();
         }
 
         let upper_target = target_sql.to_ascii_uppercase();
@@ -5629,10 +5303,11 @@ fn schema_contains_index_name(
                 continue;
             }
         }
-        if relation.database == database_name && relation.schema == schema_name {
-            if relation.indexes.iter().any(|i| i.name == index_name) {
-                return true;
-            }
+        if relation.database == database_name
+            && relation.schema == schema_name
+            && relation.indexes.iter().any(|i| i.name == index_name)
+        {
+            return true;
         }
     }
     false
@@ -5682,21 +5357,19 @@ fn build_relation_with_catalog_constraint(
     if matches!(
         constraint.kind,
         CatalogTableConstraintKind::PrimaryKey | CatalogTableConstraintKind::Unique
+    ) && schema_contains_index_name(
+        state,
+        database_name,
+        schema_name,
+        &constraint.name,
+        Some(&relation_key),
     ) {
-        if schema_contains_index_name(
-            state,
+        bail!(
+            "Index '{}' already exists in schema '{}.{}'",
+            constraint.name,
             database_name,
-            schema_name,
-            &constraint.name,
-            Some(&relation_key),
-        ) {
-            bail!(
-                "Index '{}' already exists in schema '{}.{}'",
-                constraint.name,
-                database_name,
-                schema_name
-            );
-        }
+            schema_name
+        );
     }
 
     let mut preview = relation.clone();
@@ -5962,4 +5635,335 @@ fn indexes_from_constraints(
             index
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build")
+            .block_on(future);
+    }
+
+    #[test]
+    fn join_cluster_advertises_plaintext_endpoint_without_tls_config() {
+        run_async_test(async {
+            let control_plane = ControlPlane::new_bootstrap();
+
+            let response = control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let nodes = control_plane.list_nodes().await.expect("nodes should list");
+            let worker = nodes
+                .iter()
+                .find(|node| node.id == response.node_id)
+                .expect("joined node should be registered");
+
+            assert_eq!(worker.endpoint, "http://10.0.0.2:50052");
+            assert_eq!(
+                worker.internal_endpoint.as_deref(),
+                Some("http://10.0.0.2:60052")
+            );
+        });
+    }
+
+    #[test]
+    fn join_cluster_advertises_tls_endpoint_when_tls_config_is_available() {
+        run_async_test(async {
+            let control_plane = ControlPlane::new_bootstrap();
+            control_plane
+                .set_tls_paths(
+                    Some("certs/server.crt".to_string()),
+                    Some("certs/server.key".to_string()),
+                )
+                .await
+                .expect("tls paths should update");
+
+            let response = control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let nodes = control_plane.list_nodes().await.expect("nodes should list");
+            let worker = nodes
+                .iter()
+                .find(|node| node.id == response.node_id)
+                .expect("joined node should be registered");
+
+            assert_eq!(worker.endpoint, "https://10.0.0.2:50052");
+            assert_eq!(
+                worker.internal_endpoint.as_deref(),
+                Some("http://10.0.0.2:60052")
+            );
+        });
+    }
+
+    #[test]
+    fn heartbeat_does_not_rewrite_catalog_file() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-heartbeat-test-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+
+            control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join should succeed");
+
+            let mtime_before = std::fs::metadata(&catalog_path)
+                .expect("catalog metadata")
+                .modified()
+                .expect("modified time");
+
+            // Sleep just enough for filesystem mtime resolution to advance.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            for _ in 0..50 {
+                control_plane
+                    .heartbeat("worker-1")
+                    .await
+                    .expect("heartbeat");
+            }
+
+            let mtime_after = std::fs::metadata(&catalog_path)
+                .expect("catalog metadata")
+                .modified()
+                .expect("modified time");
+
+            assert_eq!(
+                mtime_before, mtime_after,
+                "heartbeats must not rewrite the catalogue file"
+            );
+
+            // The node should still report Ready via list_nodes, sourced from
+            // the in-memory liveness map.
+            let nodes = control_plane.list_nodes().await.expect("list nodes");
+            let worker = nodes
+                .iter()
+                .find(|n| n.id == "worker-1")
+                .expect("worker registered");
+            assert_eq!(worker.status, NodeStatus::Ready);
+            assert!(worker.last_heartbeat_at_epoch_ms > 0);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn catalogue_version_increments_on_persisted_writes() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-version-test-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let control_plane = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+
+            // Bootstrap itself performs one persist (creating the file), so
+            // the version should be at least 1.
+            let v0 = control_plane.catalogue_version().await;
+            assert!(v0 >= 1, "bootstrap should have bumped version, got {v0}");
+
+            // Subscribe before further writes so we can confirm we receive a
+            // notification.
+            let mut rx = control_plane.subscribe_catalogue_version();
+
+            control_plane
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+
+            let v1 = control_plane.catalogue_version().await;
+            assert!(v1 > v0, "join_cluster should bump version: {v0} -> {v1}");
+
+            // Receiver should observe the new version (latest-value semantics).
+            rx.changed().await.expect("notification");
+            assert_eq!(*rx.borrow(), v1);
+
+            // Heartbeats must NOT bump the version (they don't persist).
+            for _ in 0..10 {
+                control_plane.heartbeat("worker-1").await.expect("hb");
+            }
+            let v2 = control_plane.catalogue_version().await;
+            assert_eq!(v2, v1, "heartbeats must not bump catalogue version");
+
+            // Snapshot exposes the version.
+            let snap = control_plane.cluster_snapshot().await;
+            assert_eq!(snap.catalogue_version, v1);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn migrate_json_to_sqlite_preserves_state() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-migrate-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let json_path = dir.join("catalog.json");
+            let sqlite_path = dir.join("catalog.db");
+
+            // Build a JSON catalogue with some content.
+            let cp_json = ControlPlane::from_catalog_path(&json_path)
+                .await
+                .expect("bootstrap json");
+            cp_json
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let snap_before = cp_json.cluster_snapshot().await;
+            drop(cp_json);
+
+            // Migrate.
+            ControlPlane::migrate_json_to_sqlite(&json_path, &sqlite_path)
+                .await
+                .expect("migration");
+
+            // Reopen on the SQLite path and compare.
+            let cp_sql = ControlPlane::from_catalog_path(&sqlite_path)
+                .await
+                .expect("bootstrap sqlite");
+            let snap_after = cp_sql.cluster_snapshot().await;
+
+            assert_eq!(snap_before.databases, snap_after.databases);
+            assert_eq!(snap_before.users, snap_after.users);
+            assert_eq!(snap_before.relations, snap_after.relations);
+            // Node identity preserved (statuses differ because liveness map
+            // resets on reload — that's expected per Phase 1 design).
+            let ids_before: Vec<&str> = snap_before.nodes.iter().map(|n| n.id.as_str()).collect();
+            let ids_after: Vec<&str> = snap_after.nodes.iter().map(|n| n.id.as_str()).collect();
+            assert_eq!(ids_before, ids_after);
+            assert_eq!(snap_before.catalogue_version, snap_after.catalogue_version);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn catalogue_version_survives_reload() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-version-reload-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let catalog_path = dir.join("catalog.json");
+
+            let cp1 = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("bootstrap");
+            cp1.join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let v_before = cp1.catalogue_version().await;
+            drop(cp1);
+
+            let cp2 = ControlPlane::from_catalog_path(&catalog_path)
+                .await
+                .expect("reload");
+            let v_after = cp2.catalogue_version().await;
+            assert_eq!(v_after, v_before, "version must survive reload");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn first_install_creates_sqlite_file() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-firstinstall-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("analyticsdb-catalog.db");
+
+            assert!(!db_path.exists(), "should start with no catalog file");
+
+            let cp = ControlPlane::from_catalog_path(&db_path)
+                .await
+                .expect("first-install bootstrap");
+
+            assert!(
+                db_path.exists(),
+                "SQLite catalog must be created on first start"
+            );
+
+            // Default database and users should be present.
+            let snap = cp.cluster_snapshot().await;
+            assert!(
+                snap.databases.iter().any(|d| d.name == "postgres"),
+                "default postgres database should exist"
+            );
+            assert!(
+                snap.users.iter().any(|u| u.name == "postgres"),
+                "default postgres user should exist"
+            );
+            assert!(
+                snap.catalogue_version >= 1,
+                "version should be > 0 after bootstrap"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn startup_auto_migrates_legacy_json_to_sqlite() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-automigrate-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+
+            // Simulate an existing JSON deployment by bootstrapping with the
+            // JSON path first.
+            let json_path = dir.join("analyticsdb-catalog.json");
+            let cp_json = ControlPlane::from_catalog_path(&json_path)
+                .await
+                .expect("json bootstrap");
+            cp_json
+                .join_cluster(Some("worker-1"), Some("10.0.0.2"))
+                .await
+                .expect("join");
+            let snap_json = cp_json.cluster_snapshot().await;
+            drop(cp_json);
+
+            // Now start with the new default SQLite path (same stem). The
+            // engine should auto-migrate — no manual intervention required.
+            let db_path = dir.join("analyticsdb-catalog.db");
+            assert!(!db_path.exists(), "db must not exist before auto-migration");
+
+            let cp_db = ControlPlane::from_catalog_path(&db_path)
+                .await
+                .expect("auto-migrate + load");
+
+            assert!(
+                db_path.exists(),
+                "SQLite file must be created by auto-migration"
+            );
+
+            let snap_db = cp_db.cluster_snapshot().await;
+            assert_eq!(
+                snap_json.databases, snap_db.databases,
+                "databases must survive auto-migration"
+            );
+            assert_eq!(
+                snap_json.users, snap_db.users,
+                "users must survive auto-migration"
+            );
+            assert_eq!(
+                snap_json.catalogue_version, snap_db.catalogue_version,
+                "version must survive auto-migration"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
 }

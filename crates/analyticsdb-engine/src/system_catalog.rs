@@ -106,37 +106,58 @@ impl TableProvider for QueryLogListingTable {
         filters: &[datafusion::prelude::Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let local_path = self.root_location.strip_prefix("file://").unwrap_or(&self.root_location);
-        
+        let local_path = self
+            .root_location
+            .strip_prefix("file://")
+            .unwrap_or(&self.root_location);
+
+        // Resolve to an absolute path so that file:// URLs are well-formed
+        // (e.g. file:///abs/path, not file://relative/path which DataFusion
+        // mistakenly parses as having a URL host named "relative").
+        let abs_root = {
+            let p = std::path::Path::new(local_path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?
+                    .join(p)
+            }
+        };
+
         let mut all_files = Vec::new();
         fn collect_files(path: &std::path::Path, files: &mut Vec<String>) {
             if path.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            collect_files(&entry.path(), files);
-                        }
+                    for entry in entries.flatten() {
+                        collect_files(&entry.path(), files);
                     }
                 }
             } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
                 files.push(path.to_string_lossy().to_string());
             }
         }
-        collect_files(std::path::Path::new(local_path), &mut all_files);
+        collect_files(&abs_root, &mut all_files);
 
         if all_files.is_empty() {
-            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema))));
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                Arc::clone(&self.schema),
+            )));
         }
 
         let mut table_paths = Vec::new();
         for file in all_files {
+            // `file` is now an absolute path (e.g. /data/...) so
+            // format!("file://{}", file) produces file:///data/... — a valid
+            // local-filesystem URL that DataFusion's built-in LocalFileSystem
+            // object store can handle.
             let url = format!("file://{}", file);
             table_paths.push(ListingTableUrl::parse(url)?);
         }
 
         let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
         listing_options.file_extension = ".parquet".to_string();
-        
+
         let config = ListingTableConfig::new_with_multi_paths(table_paths)
             .with_listing_options(listing_options)
             .with_schema(Arc::clone(&self.schema));
@@ -455,9 +476,7 @@ fn infer_utf8_catalog_column_type(
         let Ok(idx) = batch.schema().index_of(column_name) else {
             return None;
         };
-        let Some(values) = batch.column(idx).as_any().downcast_ref::<StringArray>() else {
-            return None;
-        };
+        let values = batch.column(idx).as_any().downcast_ref::<StringArray>()?;
 
         for row in 0..values.len() {
             if values.is_null(row) {

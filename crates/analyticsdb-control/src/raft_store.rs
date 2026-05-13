@@ -30,6 +30,7 @@ pub struct CatalogStore {
 }
 
 impl CatalogStore {
+    #[allow(clippy::result_large_err)]
     pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
         let mut options = Options::default();
         options.create_if_missing(true);
@@ -85,7 +86,7 @@ impl RaftLogReader<TypeConfig> for CatalogStore {
         );
 
         for item in iter {
-            let (key, value) = item.map_err(|e| Self::store_err(e))?;
+            let (key, value) = item.map_err(Self::store_err)?;
             let index = u64::from_be_bytes(key.as_ref().try_into().map_err(|_| {
                 Self::store_err(StoreError::Internal("invalid log key".to_string()))
             })?);
@@ -97,7 +98,7 @@ impl RaftLogReader<TypeConfig> for CatalogStore {
             }
 
             let entry: Entry<TypeConfig> =
-                serde_json::from_slice(&value).map_err(|e| Self::store_err(e))?;
+                serde_json::from_slice(&value).map_err(Self::store_err)?;
             entries.push(entry);
         }
 
@@ -113,15 +114,10 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let cf = self.db.cf_handle("meta").ok_or_else(|| {
             Self::store_err(StoreError::Internal("meta cf not found".to_string()))
         })?;
-        let value = self
-            .db
-            .get_cf(cf, b"vote")
-            .map_err(|e| Self::store_err(e))?;
+        let value = self.db.get_cf(cf, b"vote").map_err(Self::store_err)?;
 
         match value {
-            Some(v) => Ok(Some(
-                serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?,
-            )),
+            Some(v) => Ok(Some(serde_json::from_slice(&v).map_err(Self::store_err)?)),
             None => Ok(None),
         }
     }
@@ -136,10 +132,10 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let cf = self.db.cf_handle("meta").ok_or_else(|| {
             Self::store_err(StoreError::Internal("meta cf not found".to_string()))
         })?;
-        let value = serde_json::to_vec(vote).map_err(|e| Self::store_err(e))?;
+        let value = serde_json::to_vec(vote).map_err(Self::store_err)?;
         self.db
             .put_cf(cf, b"vote", value)
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
         Ok(())
     }
 
@@ -153,9 +149,9 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let last = self.db.iterator_cf(cf, rocksdb::IteratorMode::End).next();
         let last_log_id = match last {
             Some(item) => {
-                let (_, value) = item.map_err(|e| Self::store_err(e))?;
+                let (_, value) = item.map_err(Self::store_err)?;
                 let entry: Entry<TypeConfig> =
-                    serde_json::from_slice(&value).map_err(|e| Self::store_err(e))?;
+                    serde_json::from_slice(&value).map_err(Self::store_err)?;
                 Some(entry.log_id)
             }
             None => None,
@@ -167,9 +163,9 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let last_purged = self
             .db
             .get_cf(cf_meta, b"last_purged_log_id")
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
         let last_purged_log_id = match last_purged {
-            Some(v) => Some(serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?),
+            Some(v) => Some(serde_json::from_slice(&v).map_err(Self::store_err)?),
             None => None,
         };
 
@@ -188,10 +184,8 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         })?;
         for entry in entries {
             let key = entry.log_id.index.to_be_bytes();
-            let value = serde_json::to_vec(&entry).map_err(|e| Self::store_err(e))?;
-            self.db
-                .put_cf(cf, key, value)
-                .map_err(|e| Self::store_err(e))?;
+            let value = serde_json::to_vec(&entry).map_err(Self::store_err)?;
+            self.db.put_cf(cf, key, value).map_err(Self::store_err)?;
         }
         Ok(())
     }
@@ -210,8 +204,8 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         );
 
         for item in iter {
-            let (key, _) = item.map_err(|e| Self::store_err(e))?;
-            self.db.delete_cf(cf, key).map_err(|e| Self::store_err(e))?;
+            let (key, _) = item.map_err(Self::store_err)?;
+            self.db.delete_cf(cf, key).map_err(Self::store_err)?;
         }
         Ok(())
     }
@@ -223,23 +217,23 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
 
         for item in iter {
-            let (key, _) = item.map_err(|e| Self::store_err(e))?;
+            let (key, _) = item.map_err(Self::store_err)?;
             let index = u64::from_be_bytes(key.as_ref().try_into().map_err(|_| {
                 Self::store_err(StoreError::Internal("invalid log key".to_string()))
             })?);
             if index > log_id.index {
                 break;
             }
-            self.db.delete_cf(cf, key).map_err(|e| Self::store_err(e))?;
+            self.db.delete_cf(cf, key).map_err(Self::store_err)?;
         }
 
         let cf_meta = self.db.cf_handle("meta").ok_or_else(|| {
             Self::store_err(StoreError::Internal("meta cf not found".to_string()))
         })?;
-        let value = serde_json::to_vec(&log_id).map_err(|e| Self::store_err(e))?;
+        let value = serde_json::to_vec(&log_id).map_err(Self::store_err)?;
         self.db
             .put_cf(cf_meta, b"last_purged_log_id", value)
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
         Ok(())
     }
 
@@ -254,18 +248,18 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let last_applied = match self
             .db
             .get_cf(cf, b"last_applied")
-            .map_err(|e| Self::store_err(e))?
+            .map_err(Self::store_err)?
         {
-            Some(v) => Some(serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?),
+            Some(v) => Some(serde_json::from_slice(&v).map_err(Self::store_err)?),
             None => None,
         };
 
         let last_membership = match self
             .db
             .get_cf(cf, b"last_membership")
-            .map_err(|e| Self::store_err(e))?
+            .map_err(Self::store_err)?
         {
-            Some(v) => serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?,
+            Some(v) => serde_json::from_slice(&v).map_err(Self::store_err)?,
             None => StoredMembership::default(),
         };
 
@@ -287,14 +281,11 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         let mut responses = Vec::new();
 
         for entry in entries {
-            let mut catalog_state: CatalogState = match self
-                .db
-                .get_cf(cf_sm, b"state")
-                .map_err(|e| Self::store_err(e))?
-            {
-                Some(v) => serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?,
-                None => CatalogState::default(),
-            };
+            let mut catalog_state: CatalogState =
+                match self.db.get_cf(cf_sm, b"state").map_err(Self::store_err)? {
+                    Some(v) => serde_json::from_slice(&v).map_err(Self::store_err)?,
+                    None => CatalogState::default(),
+                };
 
             match entry.payload {
                 openraft::EntryPayload::Normal(ref data) => match data {
@@ -402,25 +393,25 @@ impl RaftStorage<TypeConfig> for CatalogStore {
                 },
                 openraft::EntryPayload::Membership(ref mem) => {
                     let membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    let value = serde_json::to_vec(&membership).map_err(|e| Self::store_err(e))?;
+                    let value = serde_json::to_vec(&membership).map_err(Self::store_err)?;
                     self.db
                         .put_cf(cf_meta, b"last_membership", value)
-                        .map_err(|e| Self::store_err(e))?;
+                        .map_err(Self::store_err)?;
                 }
                 _ => {}
             }
 
             // Save state
-            let value = serde_json::to_vec(&catalog_state).map_err(|e| Self::store_err(e))?;
+            let value = serde_json::to_vec(&catalog_state).map_err(Self::store_err)?;
             self.db
                 .put_cf(cf_sm, b"state", value)
-                .map_err(|e| Self::store_err(e))?;
+                .map_err(Self::store_err)?;
 
             // Update last applied
-            let value = serde_json::to_vec(&entry.log_id).map_err(|e| Self::store_err(e))?;
+            let value = serde_json::to_vec(&entry.log_id).map_err(Self::store_err)?;
             self.db
                 .put_cf(cf_meta, b"last_applied", value)
-                .map_err(|e| Self::store_err(e))?;
+                .map_err(Self::store_err)?;
 
             responses.push(Response {
                 message: "Applied".to_string(),
@@ -447,8 +438,8 @@ impl RaftStorage<TypeConfig> for CatalogStore {
         meta: &SnapshotMeta<NodeId, ClusterNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let catalog_state: CatalogState = serde_json::from_slice(snapshot.into_inner().as_slice())
-            .map_err(|e| Self::store_err(e))?;
+        let catalog_state: CatalogState =
+            serde_json::from_slice(snapshot.into_inner().as_slice()).map_err(Self::store_err)?;
 
         let cf_sm = self
             .db
@@ -458,20 +449,20 @@ impl RaftStorage<TypeConfig> for CatalogStore {
             Self::store_err(StoreError::Internal("meta cf not found".to_string()))
         })?;
 
-        let value = serde_json::to_vec(&catalog_state).map_err(|e| Self::store_err(e))?;
+        let value = serde_json::to_vec(&catalog_state).map_err(Self::store_err)?;
         self.db
             .put_cf(cf_sm, b"state", value)
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
 
-        let value = serde_json::to_vec(&meta.last_log_id).map_err(|e| Self::store_err(e))?;
+        let value = serde_json::to_vec(&meta.last_log_id).map_err(Self::store_err)?;
         self.db
             .put_cf(cf_meta, b"last_applied", value)
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
 
-        let value = serde_json::to_vec(&meta.last_membership).map_err(|e| Self::store_err(e))?;
+        let value = serde_json::to_vec(&meta.last_membership).map_err(Self::store_err)?;
         self.db
             .put_cf(cf_meta, b"last_membership", value)
-            .map_err(|e| Self::store_err(e))?;
+            .map_err(Self::store_err)?;
 
         Ok(())
     }
@@ -488,16 +479,13 @@ impl RaftStorage<TypeConfig> for CatalogStore {
             .db
             .cf_handle("sm")
             .ok_or_else(|| Self::store_err(StoreError::Internal("sm cf not found".to_string())))?;
-        let catalog_state: CatalogState = match self
-            .db
-            .get_cf(cf_sm, b"state")
-            .map_err(|e| Self::store_err(e))?
-        {
-            Some(v) => serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?,
-            None => return Ok(None),
-        };
+        let catalog_state: CatalogState =
+            match self.db.get_cf(cf_sm, b"state").map_err(Self::store_err)? {
+                Some(v) => serde_json::from_slice(&v).map_err(Self::store_err)?,
+                None => return Ok(None),
+            };
 
-        let snapshot_data = serde_json::to_vec(&catalog_state).map_err(|e| Self::store_err(e))?;
+        let snapshot_data = serde_json::to_vec(&catalog_state).map_err(Self::store_err)?;
 
         let meta = SnapshotMeta {
             last_log_id: last_applied,
@@ -524,16 +512,13 @@ impl RaftSnapshotBuilder<TypeConfig> for CatalogStore {
             .db
             .cf_handle("sm")
             .ok_or_else(|| Self::store_err(StoreError::Internal("sm cf not found".to_string())))?;
-        let catalog_state: CatalogState = match self
-            .db
-            .get_cf(cf_sm, b"state")
-            .map_err(|e| Self::store_err(e))?
-        {
-            Some(v) => serde_json::from_slice(&v).map_err(|e| Self::store_err(e))?,
-            None => CatalogState::default(),
-        };
+        let catalog_state: CatalogState =
+            match self.db.get_cf(cf_sm, b"state").map_err(Self::store_err)? {
+                Some(v) => serde_json::from_slice(&v).map_err(Self::store_err)?,
+                None => CatalogState::default(),
+            };
 
-        let snapshot_data = serde_json::to_vec(&catalog_state).map_err(|e| Self::store_err(e))?;
+        let snapshot_data = serde_json::to_vec(&catalog_state).map_err(Self::store_err)?;
 
         let meta = SnapshotMeta {
             last_log_id: last_applied,

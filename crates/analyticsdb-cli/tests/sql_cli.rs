@@ -80,9 +80,9 @@ fn documented_sql_capabilities_from_readme() -> BTreeSet<SqlCapability> {
             SqlCapability::CreateSchema
         } else if line.starts_with("- `CREATE SCHEMA <database>.<name>`") {
             SqlCapability::CreateSchemaQualified
-        } else if line.starts_with("- `ALTER SCHEMA <name> RENAME TO") {
-            SqlCapability::AlterSchema
-        } else if line.starts_with("- `ALTER SCHEMA <database>.<name> RENAME TO") {
+        } else if line.starts_with("- `ALTER SCHEMA <name> RENAME TO")
+            || line.starts_with("- `ALTER SCHEMA <database>.<name> RENAME TO")
+        {
             SqlCapability::AlterSchema
         } else if line.starts_with("- `CREATE TABLE <name> AS") {
             SqlCapability::CreateTableAs
@@ -108,9 +108,9 @@ fn documented_sql_capabilities_from_readme() -> BTreeSet<SqlCapability> {
             SqlCapability::Delete
         } else if line.starts_with("- `TRUNCATE TABLE <table>") {
             SqlCapability::Truncate
-        } else if line.starts_with("- `ALTER TABLE <table> ADD COLUMN") {
-            SqlCapability::AlterTable
-        } else if line.starts_with("- `ALTER TABLE <table> RENAME TO") {
+        } else if line.starts_with("- `ALTER TABLE <table> ADD COLUMN")
+            || line.starts_with("- `ALTER TABLE <table> RENAME TO")
+        {
             SqlCapability::AlterTable
         } else if line.starts_with("- `SHOW DATABASES`") {
             SqlCapability::ShowDatabases
@@ -362,6 +362,7 @@ fn protocol_json_response_with_context(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn protocol_json_response_with_auth_context(
     protocol: &str,
     endpoint: &str,
@@ -422,6 +423,7 @@ fn protocol_stderr_failure(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn protocol_stderr_failure_with_auth_context(
     protocol: &str,
     endpoint: &str,
@@ -5411,7 +5413,7 @@ async fn cli_supports_omitted_column_with_default() {
 
     assert_eq!(response.rows.len(), 1);
     assert_eq!(response.rows[0][0], "8");
-    assert_eq!(response.rows[0][4].contains('T'), true);
+    assert!(response.rows[0][4].contains('T'));
 
     cleanup_catalog_artifacts(&catalog_path);
 }
