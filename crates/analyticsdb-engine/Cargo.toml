@@ -5,10 +5,6 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "list_options"
-path = "../../list_options.rs"
-
 [dependencies]
 anyhow.workspace = true
 arrow-flight.workspace = true

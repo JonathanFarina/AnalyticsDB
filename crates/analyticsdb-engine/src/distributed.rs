@@ -70,12 +70,13 @@ pub fn partition_files_for_workers(
 
     // Greedy assignment: assign each file to the bucket with the smallest total size.
     for (file, size) in sorted {
+        // bucket_sizes is non-empty (buckets > 0 is checked at entry), so min always exists.
         let min_idx = bucket_sizes
             .iter()
             .enumerate()
             .min_by_key(|(_, s)| *s)
             .map(|(i, _)| i)
-            .unwrap();
+            .unwrap_or(0);
         chunks[min_idx].push(file);
         bucket_sizes[min_idx] += size;
     }
@@ -355,6 +356,9 @@ struct ClusterInternalConnector {
 
 impl ClusterInternalConnector {
     fn new() -> Self {
+        // `with_safe_default_protocol_versions()` only fails if the provider supports
+        // no TLS versions, which cannot happen with the bundled aws-lc-rs default.
+        #[allow(clippy::expect_used)]
         let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))

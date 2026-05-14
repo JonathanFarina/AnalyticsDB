@@ -607,7 +607,7 @@ fn resolve_table_schemas_recursive<'a>(
                 } else {
                     None
                 };
-                let table_name = idents.last().unwrap();
+                let Some(table_name) = idents.last() else { return Ok(()) };
 
                 if let Ok(relation) = control_plane
                     .find_relation(session, db_name, schema_name, table_name)
@@ -674,7 +674,8 @@ fn make_unique_alias(base: &str, seen: &HashSet<String>) -> String {
     let mut safe_base = base.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
 
     if safe_base.is_empty()
-        || (!safe_base.chars().next().unwrap().is_ascii_alphabetic() && !safe_base.starts_with('_'))
+        || (!safe_base.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && !safe_base.starts_with('_'))
     {
         safe_base = format!("col_{}", safe_base);
     }
@@ -748,7 +749,7 @@ fn rewrite_expr_recursive<'a>(
             }
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                 let alias = parts[parts.len() - 2].to_string();
-                let col_name = parts.last().unwrap().to_string();
+                let col_name = parts.last().map(|p| p.to_string()).unwrap_or_default();
                 if let Some(columns) = table_schemas.get(&alias) {
                     if let Some((_, Some(default_val))) =
                         columns.iter().find(|(c, _)| c == &col_name)

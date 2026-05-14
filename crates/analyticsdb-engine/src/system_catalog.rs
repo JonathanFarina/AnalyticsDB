@@ -704,7 +704,7 @@ impl TableProvider for PgTablesTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -779,7 +779,7 @@ impl TableProvider for PgViewsTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -860,7 +860,7 @@ impl TableProvider for PgNamespaceTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -975,7 +975,7 @@ impl TableProvider for PgDatabaseTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1078,7 +1078,7 @@ impl TableProvider for PgRolesTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1220,7 +1220,7 @@ impl TableProvider for PgTypeTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1448,7 +1448,7 @@ impl TableProvider for PgClassTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1577,7 +1577,7 @@ impl TableProvider for PgAttributeTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1589,20 +1589,20 @@ struct SystemCatalogExec {
 }
 
 impl SystemCatalogExec {
-    fn new(batch: RecordBatch, projection: Option<&Vec<usize>>) -> Self {
+    fn new(batch: RecordBatch, projection: Option<&Vec<usize>>) -> DataFusionResult<Self> {
         let schema = batch.schema();
-        let projected_schema = project_schema(&schema, projection).unwrap();
+        let projected_schema = project_schema(&schema, projection)?;
         let cache = PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self {
+        Ok(Self {
             batch,
             projection: projection.cloned(),
             properties: Arc::new(cache),
-        }
+        })
     }
 }
 
@@ -1745,7 +1745,7 @@ impl TableProvider for PgIndexTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1793,7 +1793,7 @@ impl TableProvider for PgDescriptionTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Return empty for now
         let batch = RecordBatch::new_empty(Arc::clone(&self.schema));
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1871,7 +1871,7 @@ impl TableProvider for PgAttrdefTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -1922,7 +1922,7 @@ impl TableProvider for PgDependTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Return empty for now to satisfy joins
         let batch = RecordBatch::new_empty(Arc::clone(&self.schema));
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 
@@ -2080,7 +2080,7 @@ impl TableProvider for PgConstraintTable {
             ],
         )?;
 
-        Ok(Arc::new(SystemCatalogExec::new(batch, projection)))
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
     }
 }
 

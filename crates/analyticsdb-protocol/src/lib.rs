@@ -1,3 +1,9 @@
+#![cfg_attr(not(test), deny(clippy::panic))]
+#![cfg_attr(not(test), deny(clippy::todo))]
+#![cfg_attr(not(test), deny(clippy::unimplemented))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![allow(clippy::type_complexity)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -1233,7 +1239,9 @@ fn split_search_path_entries(raw: &str) -> PgWireResult<Vec<String>> {
             '"' => {
                 current.push(ch);
                 if in_quotes && matches!(chars.peek(), Some('"')) {
-                    current.push(chars.next().expect("quoted search_path char should exist"));
+                    if let Some(next_ch) = chars.next() {
+                        current.push(next_ch);
+                    }
                 } else {
                     in_quotes = !in_quotes;
                 }
@@ -1356,6 +1364,7 @@ fn query_execution_to_pg_rows(
     Ok(stream::iter(encoded_rows))
 }
 
+#[allow(clippy::expect_used)] // downcasts are guarded by the match arm on column.data_type()
 fn encode_pg_row_value(
     encoder: &mut DataRowEncoder,
     column: &dyn datafusion::arrow::array::Array,

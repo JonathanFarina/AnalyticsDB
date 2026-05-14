@@ -2,8 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
 
 use analyticsdb_control::{QueryAdmission, QueryLogConfig};
 use analyticsdb_core::{Protocol, QueryRequest, SessionContext, StatementOutcome};
@@ -26,6 +25,15 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::{storage, QueryExecutionResult};
+use std::time::{Duration, Instant};
+
+// Static regexes — compiled once; patterns are validated literals so .expect() is safe.
+#[allow(clippy::expect_used)]
+static RE_STRINGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"'([^']|'')*'").expect("valid string regex"));
+#[allow(clippy::expect_used)]
+static RE_NUMBERS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d+(\.\d+)?\b").expect("valid number regex"));
 
 #[derive(Debug, Clone)]
 pub struct QueryLog {
@@ -710,10 +718,8 @@ fn normalized_query_hash(sql: &str) -> i64 {
 }
 
 fn normalize_query(sql: &str) -> String {
-    let strings = Regex::new(r"'([^']|'')*'").expect("valid string regex");
-    let numbers = Regex::new(r"\b\d+(\.\d+)?\b").expect("valid number regex");
-    let without_strings = strings.replace_all(sql, "?");
-    numbers
+    let without_strings = RE_STRINGS.replace_all(sql, "?");
+    RE_NUMBERS
         .replace_all(&without_strings, "?")
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -774,7 +780,7 @@ fn extract_keyword_table(sql: &str, session: &SessionContext, out: &mut Vec<Stri
         r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_\.]*)",
     ];
     for pattern in patterns {
-        let re = Regex::new(pattern).expect("valid query-log table regex");
+        let Ok(re) = Regex::new(pattern) else { continue };
         if let Some(captures) = re.captures(sql) {
             if let Some(name) = captures.get(1) {
                 out.push(qualify_object_name(name.as_str(), session));
