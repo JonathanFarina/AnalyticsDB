@@ -143,6 +143,7 @@ use tracing::{info, warn};
 
 pub mod distributed;
 pub mod functions;
+pub(crate) mod manifest;
 pub mod postgres_compatibility;
 pub mod query_log;
 pub mod sql_rewriter;
@@ -256,7 +257,7 @@ impl FileListCache {
             }
         }
 
-        let files = storage::list_parquet_files_with_sizes(store, prefix).await?;
+        let files = manifest::list_files_with_sizes(store, prefix).await?;
         self.cache
             .insert(table_key.to_string(), (current_epoch, files.clone()));
         Ok(files)
@@ -1837,7 +1838,7 @@ FROM generate_series(1, 10) AS s(n)";
             .clone()
             .expect("orders should have managed storage");
         let (store, prefix) = crate::storage::store_for_location(&storage_path).unwrap();
-        let partition_files = crate::storage::list_parquet_files(&store, &prefix)
+        let partition_files = crate::manifest::list_files(&store, &prefix)
             .await
             .unwrap();
         assert!(
@@ -1932,10 +1933,10 @@ FROM generate_series(1, 10) AS s(n)";
         std::fs::create_dir_all(&write_dir).unwrap();
         let storage_path = format!("file://{}", write_dir.display());
         let (store, prefix) = crate::storage::store_for_location(&storage_path).unwrap();
-        crate::storage::append_parquet_batch(&store, &prefix, batch)
+        crate::manifest::append_batch(&store, &prefix, batch)
             .await
             .unwrap();
-        let partition_files = crate::storage::list_parquet_files(&store, &prefix)
+        let partition_files = crate::manifest::list_files(&store, &prefix)
             .await
             .unwrap();
 
@@ -2434,7 +2435,7 @@ FROM generate_series(1, 10) AS s(n)";
             .unwrap();
         let src_path = src_relation.storage_path.clone().unwrap();
         let (src_store, src_prefix) = crate::storage::store_for_location(&src_path).unwrap();
-        let src_files = crate::storage::list_parquet_files(&src_store, &src_prefix)
+        let src_files = crate::manifest::list_files(&src_store, &src_prefix)
             .await
             .unwrap();
         assert!(

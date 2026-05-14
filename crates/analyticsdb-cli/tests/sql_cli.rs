@@ -245,7 +245,10 @@ fn managed_table_storage_dir(
         .expect("catalog path should have a file stem")
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
-    managed_dir.join(format!("{database}__{schema}__{table}.table.parquet"))
+    managed_dir
+        .join(format!("db={database}"))
+        .join(format!("schema={schema}"))
+        .join(format!("table={table}"))
 }
 
 fn index_snapshot_root(

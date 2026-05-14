@@ -307,7 +307,7 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                     .any(|field| matches!(field.data_type(), DataType::Utf8))
                 {
                     if let Ok((store, prefix)) = crate::storage::store_for_location(storage_path) {
-                        if let Ok(files) = crate::storage::list_parquet_files(&store, &prefix).await
+                        if let Ok(files) = crate::manifest::list_files(&store, &prefix).await
                         {
                             if !files.is_empty() {
                                 if let Ok(sample_df) = infer_context

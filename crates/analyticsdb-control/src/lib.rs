@@ -226,6 +226,12 @@ pub struct ClusterConfig {
     pub next_available_port_offset: u16,
     #[serde(default)]
     pub query_log: QueryLogConfig,
+    /// Base URI for managed table storage. When set, managed tables are stored at
+    /// `<storage_root>/db=<db>/schema=<schema>/table=<table>`.
+    /// Supports s3://, gs://, az://, azure://, and file:// URIs.
+    /// When not set, defaults to a local `file://` path derived from catalog_path.
+    #[serde(default)]
+    pub storage_root: Option<String>,
 }
 
 fn default_query_log_enabled() -> bool {
@@ -2157,13 +2163,38 @@ impl ControlPlane {
         ))
     }
 
+    /// Returns the base URI for a managed table's storage.
+    ///
+    /// If `ClusterConfig::storage_root` is set, uses it as the base.
+    /// Otherwise falls back to a `file://` URI derived from `managed_data_root()`.
+    ///
+    /// Layout: `<base>/db=<db>/schema=<schema>/table=<table>`
+    pub fn managed_table_uri(&self, database: &str, schema: &str, table: &str) -> String {
+        let base = {
+            if let Ok(state) = self.state.try_read() {
+                state
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.storage_root.clone())
+            } else {
+                None
+            }
+        };
+        let base = base.unwrap_or_else(|| {
+            let root = self.managed_data_root();
+            format!("file://{}", root.to_string_lossy())
+        });
+        let base = base.trim_end_matches('/');
+        format!("{base}/db={database}/schema={schema}/table={table}")
+    }
+
     pub async fn managed_table_storage_location(
         &self,
         session: &SessionContext,
         database: Option<&str>,
         schema: Option<&str>,
         table_name: &str,
-    ) -> Result<PathBuf> {
+    ) -> Result<String> {
         validate_identifier(table_name)?;
         let database_name = database.unwrap_or(&session.database);
         let schema_name = schema.unwrap_or(&session.schema);
@@ -2173,11 +2204,7 @@ impl ControlPlane {
             self._validate_session(&state, session)?;
         }
 
-        let data_dir = self.managed_data_root();
-
-        Ok(data_dir.join(format!(
-            "{database_name}__{schema_name}__{table_name}.table.parquet"
-        )))
+        Ok(self.managed_table_uri(database_name, schema_name, table_name))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2187,7 +2214,7 @@ impl ControlPlane {
         database: Option<&str>,
         schema: Option<&str>,
         table_name: &str,
-        storage_path: &Path,
+        storage_uri: &str,
         columns: Vec<CatalogColumn>,
         constraints: Vec<CatalogTableConstraint>,
     ) -> Result<String> {
@@ -2228,7 +2255,7 @@ impl ControlPlane {
                     name: table_name.to_string(),
                     kind: CatalogRelationKind::Table,
                     definition_sql: None,
-                    storage_path: Some(storage_path.to_string_lossy().to_string()),
+                    storage_path: Some(storage_uri.to_string()),
                     external_format: None,
                     columns,
                     constraints,
@@ -3549,6 +3576,7 @@ fn bootstrap_state() -> CatalogState {
         tls_key_path: None,
         next_available_port_offset: 0,
         query_log: QueryLogConfig::default(),
+        storage_root: None,
     });
 
     CatalogState {

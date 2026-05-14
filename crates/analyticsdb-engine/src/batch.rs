@@ -135,9 +135,24 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
 
     storage::clear_parquet_files(store, prefix).await?;
 
+    let mut manifest_entries = Vec::new();
     for prepared_batch in prepared_batches {
-        storage::append_parquet_batch(store, prefix, prepared_batch).await?;
+        let filename = format!("{}.parquet", uuid::Uuid::now_v7());
+        let key = prefix.clone().join(filename.as_str());
+        let bytes = storage::encode_parquet_batches(
+            prepared_batch.schema(),
+            std::slice::from_ref(&prepared_batch),
+        )?;
+        let size = bytes.len() as u64;
+        let entry_row_count = prepared_batch.num_rows() as i64;
+        store.put(&key, bytes.into()).await?;
+        manifest_entries.push(crate::manifest::ManifestEntry {
+            path: filename,
+            size,
+            row_count: entry_row_count,
+        });
     }
+    crate::manifest::replace_manifest(store, prefix, manifest_entries).await?;
     Ok(row_count)
 }
 
@@ -199,7 +214,8 @@ pub(crate) async fn persist_empty_table_snapshot(
 ) -> Result<()> {
     storage::clear_parquet_files(store, prefix).await?;
     let key = prefix.clone().join("empty.parquet");
-    storage::write_empty_parquet(store, &key, schema).await
+    storage::write_empty_parquet(store, &key, schema).await?;
+    crate::manifest::replace_manifest(store, prefix, Vec::new()).await
 }
 
 pub(crate) fn utf8_record_batch(columns: &[&str], rows: &[Vec<String>]) -> Result<RecordBatch> {

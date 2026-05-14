@@ -688,7 +688,7 @@ impl PrototypeEngine {
                 name,
                 query_sql,
             } => {
-                let storage_location = self
+                let location_str = self
                     .control_plane
                     .managed_table_storage_location(
                         &request.session,
@@ -697,7 +697,6 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let location_str = storage_location.to_string_lossy().into_owned();
                 let (store, prefix) = storage::store_for_location(&location_str)?;
 
                 let context = self.create_session_context(&request.session).await?;
@@ -723,7 +722,7 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         &name,
-                        &storage_location,
+                        &location_str,
                         columns_metadata,
                         Vec::new(),
                     )
@@ -743,7 +742,7 @@ impl PrototypeEngine {
                 name,
                 query_sql,
             } => {
-                let storage_location = self
+                let location_str = self
                     .control_plane
                     .managed_table_storage_location(
                         &request.session,
@@ -752,7 +751,6 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let location_str = storage_location.to_string_lossy().into_owned();
                 let (store, prefix) = storage::store_for_location(&location_str)?;
 
                 let context = self.create_session_context(&request.session).await?;
@@ -778,7 +776,7 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         &name,
-                        &storage_location,
+                        &location_str,
                         columns_metadata,
                         Vec::new(),
                     )
@@ -799,7 +797,7 @@ impl PrototypeEngine {
                 columns,
                 constraints,
             } => {
-                let storage_location = self
+                let location_str = self
                     .control_plane
                     .managed_table_storage_location(
                         &request.session,
@@ -808,7 +806,6 @@ impl PrototypeEngine {
                         &name,
                     )
                     .await?;
-                let location_str = storage_location.to_string_lossy().into_owned();
                 let (store, prefix) = storage::store_for_location(&location_str)?;
                 let arrow_schema = build_arrow_schema_from_definitions(&columns, false)?;
 
@@ -821,7 +818,7 @@ impl PrototypeEngine {
                         database.as_deref(),
                         schema.as_deref(),
                         &name,
-                        &storage_location,
+                        &location_str,
                         catalog_columns_from_schema(&arrow_schema),
                         catalog_constraints_from_definitions(
                             &name,
@@ -920,7 +917,7 @@ impl PrototypeEngine {
                 )
                 .await?;
 
-                storage::append_parquet_batch(&store, &prefix, prepared_batch).await?;
+                crate::manifest::append_batch(&store, &prefix, prepared_batch).await?;
                 self.refresh_index_snapshots_after_mutation(&request.session, &relation)
                     .await?;
 

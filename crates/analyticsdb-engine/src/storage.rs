@@ -12,11 +12,35 @@ use object_store::{Error as OsError, ObjectStore, ObjectStoreExt};
 
 /// Creates a `(store, prefix)` pair from a storage-location string.
 ///
-/// Supports `file://` URIs and plain paths (absolute or relative) for the
-/// local filesystem.  Relative paths are resolved against the current working
-/// directory so they match what DataFusion's `ListingTableUrl` would resolve
-/// to.  The returned prefix is a key within the store (no leading `/`).
+/// Supported URI schemes:
+///   - `file://` and plain local paths (absolute or relative)
+///   - `s3://bucket/key-prefix`   — AWS S3 (standard credential chain)
+///   - `gs://bucket/key-prefix`   — Google Cloud Storage (ADC chain)
+///   - `az://container/key-prefix` or `azure://container/...`  — Azure Blob Storage
+///
+/// Cloud credentials are resolved at call time from the standard provider chain
+/// for each backend (environment variables, instance metadata, workload identity,
+/// etc.).  Long-lived secrets must never be embedded in catalog state; reference
+/// them by name and resolve here at runtime.
 pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
+    if let Some(rest) = location
+        .strip_prefix("s3://")
+        .or_else(|| location.strip_prefix("s3a://"))
+    {
+        return build_s3_store(rest);
+    }
+    if let Some(rest) = location.strip_prefix("gs://") {
+        return build_gcs_store(rest);
+    }
+    if let Some(rest) = location
+        .strip_prefix("az://")
+        .or_else(|| location.strip_prefix("azure://"))
+        .or_else(|| location.strip_prefix("abfss://"))
+    {
+        return build_azure_store(rest, location);
+    }
+
+    // Local / file:// paths.
     let local_path = if let Some(p) = location.strip_prefix("file://") {
         p
     } else if !location.contains("://") {
@@ -24,7 +48,7 @@ pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath
     } else {
         anyhow::bail!(
             "Storage location '{}' uses an unsupported scheme. \
-             Only 'file://' and local paths are supported in the current prototype.",
+             Supported schemes: file://, s3://, gs://, az://, azure://.",
             location
         );
     };
@@ -50,6 +74,67 @@ pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath
     let prefix = OPath::parse(path_str)
         .map_err(|e| anyhow::anyhow!("Invalid storage path '{}': {}", path_str, e))?;
     Ok((store, prefix))
+}
+
+fn build_s3_store(rest: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
+    let (bucket, key_prefix) = split_bucket_and_prefix(rest);
+    let store = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()
+        .map_err(|e| anyhow::anyhow!("S3 store init failed for bucket '{}': {}", bucket, e))?;
+    let prefix = OPath::parse(key_prefix)
+        .map_err(|e| anyhow::anyhow!("Invalid S3 prefix '{}': {}", key_prefix, e))?;
+    Ok((Arc::new(store), prefix))
+}
+
+fn build_gcs_store(rest: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
+    let (bucket, key_prefix) = split_bucket_and_prefix(rest);
+    let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+        .with_bucket_name(bucket)
+        .build()
+        .map_err(|e| anyhow::anyhow!("GCS store init failed for bucket '{}': {}", bucket, e))?;
+    let prefix = OPath::parse(key_prefix)
+        .map_err(|e| anyhow::anyhow!("Invalid GCS prefix '{}': {}", key_prefix, e))?;
+    Ok((Arc::new(store), prefix))
+}
+
+fn build_azure_store(rest: &str, original_location: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
+    // Normalise: strip the account-FQDN for abfss:// (container@account.dfs.core.windows.net/path)
+    // and treat remainder as container/prefix like the other schemes.
+    let normalised = if original_location.starts_with("abfss://") {
+        if let Some((container_at_host, path)) = rest.split_once('/') {
+            let container = container_at_host.split('@').next().unwrap_or(container_at_host);
+            format!("{}/{}", container, path)
+        } else {
+            rest.to_string()
+        }
+    } else {
+        rest.to_string()
+    };
+
+    let (container, key_prefix) = split_bucket_and_prefix(&normalised);
+    let store = object_store::azure::MicrosoftAzureBuilder::from_env()
+        .with_container_name(container)
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Azure store init failed for container '{}': {}",
+                container,
+                e
+            )
+        })?;
+    let prefix = OPath::parse(key_prefix)
+        .map_err(|e| anyhow::anyhow!("Invalid Azure prefix '{}': {}", key_prefix, e))?;
+    Ok((Arc::new(store), prefix))
+}
+
+/// Splits `bucket/key/prefix` into `("bucket", "key/prefix")`.
+/// If there is no `/`, the prefix is empty.
+fn split_bucket_and_prefix(s: &str) -> (&str, &str) {
+    match s.split_once('/') {
+        Some((bucket, prefix)) => (bucket, prefix),
+        None => (s, ""),
+    }
 }
 
 /// Returns the local filesystem path for a storage-location string.

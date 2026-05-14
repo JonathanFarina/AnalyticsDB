@@ -30,7 +30,7 @@ impl PrototypeEngine {
         };
 
         let (store, prefix) = storage::store_for_location(storage_path)?;
-        let files = storage::list_parquet_files(&store, &prefix).await?;
+        let files = crate::manifest::list_files(&store, &prefix).await?;
 
         for file_path in files {
             let ctx = DfSessionContext::new_with_config(base_session_config());
@@ -66,7 +66,7 @@ impl PrototypeEngine {
         };
 
         let (store, prefix) = storage::store_for_location(storage_path)?;
-        let files = storage::list_parquet_files(&store, &prefix).await?;
+        let files = crate::manifest::list_files(&store, &prefix).await?;
 
         for file_path in files {
             let ctx = DfSessionContext::new_with_config(base_session_config());
