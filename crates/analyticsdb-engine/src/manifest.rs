@@ -1,13 +1,16 @@
 use anyhow::Result;
+use bytes::Bytes;
 use chrono::Utc;
 use datafusion::arrow::array::RecordBatch;
 use object_store::path::Path as OPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::storage;
+
+const MAX_CAS_RETRIES: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
@@ -32,11 +35,38 @@ impl Manifest {
             files,
         }
     }
+
+    fn bump_snapshot(&mut self) {
+        self.snapshot_id = Uuid::now_v7().to_string();
+        self.created_at_ms = Utc::now().timestamp_millis();
+    }
 }
 
 /// Returns the OPath key for the manifest file under a given table prefix.
 pub fn manifest_key(prefix: &OPath) -> OPath {
     prefix.clone().join("meta").join("manifest.json")
+}
+
+/// Reads the manifest and its e_tag for the table at `prefix`.
+///
+/// Returns `(None, None)` if no manifest exists.  Any access error (e.g. the
+/// prefix is a single file, the meta/ sub-path doesn't exist, transient I/O)
+/// is treated as "no manifest" so the caller can fall back to a directory scan.
+async fn read_manifest_versioned(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+) -> Result<(Option<Manifest>, Option<String>)> {
+    let key = manifest_key(prefix);
+    match store.get(&key).await {
+        Ok(result) => {
+            let e_tag = result.meta.e_tag.clone();
+            let bytes = result.bytes().await?;
+            let manifest: Manifest = serde_json::from_slice(&bytes)?;
+            Ok((Some(manifest), e_tag))
+        }
+        Err(OsError::NotFound { .. }) => Ok((None, None)),
+        Err(_) => Ok((None, None)),
+    }
 }
 
 /// Reads the manifest for the table at `prefix`. Returns `None` if no manifest exists.
@@ -48,22 +78,40 @@ pub async fn read_manifest(
     store: &Arc<dyn ObjectStore>,
     prefix: &OPath,
 ) -> Result<Option<Manifest>> {
-    let key = manifest_key(prefix);
-    match storage::read_json(store, &key).await {
-        Ok(Some(json)) => Ok(Some(serde_json::from_str(&json)?)),
-        Ok(None) | Err(_) => Ok(None),
-    }
+    let (manifest, _) = read_manifest_versioned(store, prefix).await?;
+    Ok(manifest)
 }
 
-/// Writes `manifest` as JSON to `<prefix>/meta/manifest.json`.
+/// Writes `manifest` as JSON using the given `PutMode`.
+///
+/// Use `put_manifest_cas` for the public API — this is the raw write primitive.
+async fn put_manifest(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+    manifest: &Manifest,
+    mode: PutMode,
+) -> Result<String, OsError> {
+    let key = manifest_key(prefix);
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| OsError::Generic { store: "manifest", source: Box::new(e) })?;
+    let payload: object_store::PutPayload = Bytes::from(json.into_bytes()).into();
+    let result = store
+        .put_opts(&key, payload, PutOptions { mode, ..Default::default() })
+        .await?;
+    Ok(result.e_tag.unwrap_or_default())
+}
+
+/// Writes `manifest` to `<prefix>/meta/manifest.json`, replacing any existing manifest.
+#[allow(dead_code)]
 pub async fn write_manifest(
     store: &Arc<dyn ObjectStore>,
     prefix: &OPath,
     manifest: &Manifest,
 ) -> Result<()> {
-    let key = manifest_key(prefix);
-    let json = serde_json::to_string_pretty(manifest)?;
-    storage::write_json(store, &key, &json).await
+    put_manifest(store, prefix, manifest, PutMode::Overwrite)
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 /// Returns the absolute file paths listed in `manifest` (suitable for DataFusion's read_parquet).
@@ -113,8 +161,9 @@ pub async fn list_files_with_sizes(
 }
 
 /// Appends a new entry to the manifest at `prefix`, creating it if it doesn't exist.
-/// `filename` is the bare filename (e.g. "abc123.parquet"), `size` is byte size,
-/// `row_count` is the number of rows.
+///
+/// Uses optimistic concurrency (read current e_tag → CAS write → retry on conflict)
+/// so concurrent writers converge without data loss.
 pub async fn append_to_manifest(
     store: &Arc<dyn ObjectStore>,
     prefix: &OPath,
@@ -122,26 +171,86 @@ pub async fn append_to_manifest(
     size: u64,
     row_count: i64,
 ) -> Result<()> {
-    let mut manifest = read_manifest(store, prefix).await?.unwrap_or_default();
-    manifest.files.push(ManifestEntry {
-        path: filename.to_string(),
-        size,
-        row_count,
-    });
-    manifest.snapshot_id = Uuid::now_v7().to_string();
-    manifest.created_at_ms = Utc::now().timestamp_millis();
-    write_manifest(store, prefix, &manifest).await
+    for attempt in 0..MAX_CAS_RETRIES {
+        let (existing, e_tag) = read_manifest_versioned(store, prefix).await?;
+        let mut manifest = existing.unwrap_or_default();
+        manifest.files.push(ManifestEntry {
+            path: filename.to_string(),
+            size,
+            row_count,
+        });
+        manifest.bump_snapshot();
+
+        let mode = match e_tag {
+            Some(tag) => PutMode::Update(UpdateVersion { e_tag: Some(tag), version: None }),
+            None => PutMode::Create,
+        };
+        match put_manifest(store, prefix, &manifest, mode).await {
+            Ok(_) => return Ok(()),
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
+                // Another writer committed between our read and write; retry.
+                if attempt + 1 == MAX_CAS_RETRIES {
+                    anyhow::bail!(
+                        "manifest CAS failed after {} retries for prefix {}",
+                        MAX_CAS_RETRIES,
+                        prefix
+                    );
+                }
+                continue;
+            }
+            Err(OsError::NotImplemented { .. } | OsError::NotSupported { .. }) => {
+                // Backend doesn't support conditional writes (e.g. LocalFileSystem).
+                // Fall back to a plain overwrite — no CAS protection on this backend.
+                return put_manifest(store, prefix, &manifest, PutMode::Overwrite)
+                    .await
+                    .map(|_| ())
+                    .map_err(Into::into);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Replaces the manifest with a fresh snapshot listing the given files.
-/// Existing entries are discarded.
+///
+/// Uses the same optimistic CAS loop as `append_to_manifest` to prevent
+/// races with concurrent writers.
 pub async fn replace_manifest(
     store: &Arc<dyn ObjectStore>,
     prefix: &OPath,
     entries: Vec<ManifestEntry>,
 ) -> Result<()> {
-    let manifest = Manifest::new(entries);
-    write_manifest(store, prefix, &manifest).await
+    for attempt in 0..MAX_CAS_RETRIES {
+        let (_, e_tag) = read_manifest_versioned(store, prefix).await?;
+        let manifest = Manifest::new(entries.clone());
+
+        let mode = match e_tag {
+            Some(tag) => PutMode::Update(UpdateVersion { e_tag: Some(tag), version: None }),
+            None => PutMode::Create,
+        };
+        match put_manifest(store, prefix, &manifest, mode).await {
+            Ok(_) => return Ok(()),
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
+                if attempt + 1 == MAX_CAS_RETRIES {
+                    anyhow::bail!(
+                        "manifest CAS failed after {} retries for prefix {}",
+                        MAX_CAS_RETRIES,
+                        prefix
+                    );
+                }
+                continue;
+            }
+            Err(OsError::NotImplemented { .. } | OsError::NotSupported { .. }) => {
+                return put_manifest(store, prefix, &manifest, PutMode::Overwrite)
+                    .await
+                    .map(|_| ())
+                    .map_err(Into::into);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Writes `batch` as a new UUID-named Parquet file under `prefix` and updates the manifest.
