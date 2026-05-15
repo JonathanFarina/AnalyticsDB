@@ -860,12 +860,39 @@ impl PrototypeEngine {
             _permit: permit,
         };
 
+        // Enforce a wall-clock timeout.  ANALYTICSDB_QUERY_TIMEOUT_SECS controls
+        // the limit; 0 means unlimited.  On timeout we also trigger the
+        // cancellation token so any distributed legs are aborted promptly.
+        let timeout_secs: u64 = std::env::var("ANALYTICSDB_QUERY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
         let probe = self
             .query_log
             .start_probe(&request, &admission, &original_sql);
-        let result = self
-            .execute_query_inner(request, admission, started, &probe)
-            .await;
+
+        let result = if timeout_secs == 0 {
+            self.execute_query_inner(request, admission, started, &probe)
+                .await
+        } else {
+            let token_for_timeout = token.clone();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                self.execute_query_inner(request, admission, started, &probe),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    token_for_timeout.cancel();
+                    Err(anyhow::anyhow!(
+                        "Query exceeded the {timeout_secs}s execution time limit"
+                    ))
+                }
+            }
+        };
+
         probe.finish_result(&result);
         result
     }
