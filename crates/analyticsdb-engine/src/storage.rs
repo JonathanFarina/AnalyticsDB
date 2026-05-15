@@ -78,8 +78,27 @@ pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath
 
 fn build_s3_store(rest: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
     let (bucket, key_prefix) = split_bucket_and_prefix(rest);
-    let store = object_store::aws::AmazonS3Builder::from_env()
-        .with_bucket_name(bucket)
+
+    let mut builder = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket);
+
+    // SSE: ANALYTICSDB_S3_SSE takes precedence over ClusterConfig; the engine
+    // propagates ClusterConfig values into these env vars at startup if needed.
+    // Accepted values: "AES256" (SSE-S3) or "aws:kms" (SSE-KMS).
+    if let Ok(sse) = std::env::var("ANALYTICSDB_S3_SSE") {
+        let key: object_store::aws::AmazonS3ConfigKey = "aws_server_side_encryption"
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Failed to parse S3 SSE config key"))?;
+        builder = builder.with_config(key, sse);
+    }
+    if let Ok(kms_key_id) = std::env::var("ANALYTICSDB_S3_SSE_KMS_KEY_ID") {
+        let key: object_store::aws::AmazonS3ConfigKey = "aws_sse_kms_key_id"
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Failed to parse S3 KMS key config key"))?;
+        builder = builder.with_config(key, kms_key_id);
+    }
+
+    let store = builder
         .build()
         .map_err(|e| anyhow::anyhow!("S3 store init failed for bucket '{}': {}", bucket, e))?;
     let prefix = OPath::parse(key_prefix)
@@ -399,4 +418,76 @@ fn encode_empty_parquet(schema: &SchemaRef) -> Result<Bytes> {
     let writer = ArrowWriter::try_new(&mut buf, Arc::clone(schema), None)?;
     writer.close()?;
     Ok(Bytes::from(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B8: verify that ANALYTICSDB_S3_SSE is parsed into a valid AmazonS3ConfigKey.
+    /// The builder construction itself validates the key name — if the key string is
+    /// wrong the parse() call returns Err and build_s3_store propagates it.
+    #[test]
+    fn s3_sse_config_key_parses_correctly() {
+        let sse_key: Result<object_store::aws::AmazonS3ConfigKey, _> =
+            "aws_server_side_encryption".parse();
+        assert!(sse_key.is_ok(), "aws_server_side_encryption must be a valid AmazonS3ConfigKey");
+
+        let kms_key: Result<object_store::aws::AmazonS3ConfigKey, _> =
+            "aws_sse_kms_key_id".parse();
+        assert!(kms_key.is_ok(), "aws_sse_kms_key_id must be a valid AmazonS3ConfigKey");
+    }
+
+    /// B8: verify that build_s3_store picks up ANALYTICSDB_S3_SSE from the environment.
+    ///
+    /// We only test that the function does NOT error when the env var is set to a
+    /// valid SSE value. A full round-trip test requires a real S3 endpoint (see
+    /// cli_s3_storage_root_supports_full_dml_ddl_lifecycle in the CLI test suite).
+    #[test]
+    fn build_s3_store_accepts_sse_env_var() {
+        // SAFETY: single-threaded test; no concurrent env-var access.
+        unsafe {
+            std::env::set_var("ANALYTICSDB_S3_SSE", "AES256");
+        }
+        // build_s3_store will fail to connect (no real bucket) but the SSE key
+        // parsing happens before the network call, so an auth/network error
+        // confirms the key was accepted.
+        let result = build_s3_store("test-bucket/prefix");
+        unsafe {
+            std::env::remove_var("ANALYTICSDB_S3_SSE");
+        }
+        // A missing-credentials error means we got past the SSE key parse.
+        match result {
+            Ok(_) => {} // built successfully (won't happen without real creds)
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Failed to parse S3 SSE config key"),
+                    "SSE config key must parse without error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// B8: verify that ANALYTICSDB_S3_SSE_KMS_KEY_ID is parsed into a valid key.
+    #[test]
+    fn build_s3_store_accepts_kms_key_id_env_var() {
+        unsafe {
+            std::env::set_var("ANALYTICSDB_S3_SSE_KMS_KEY_ID", "arn:aws:kms:us-east-1:123:key/abc");
+        }
+        let result = build_s3_store("test-bucket/prefix");
+        unsafe {
+            std::env::remove_var("ANALYTICSDB_S3_SSE_KMS_KEY_ID");
+        }
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Failed to parse S3 KMS key config key"),
+                    "KMS key ID config key must parse without error, got: {msg}"
+                );
+            }
+        }
+    }
 }

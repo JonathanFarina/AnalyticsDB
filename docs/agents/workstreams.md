@@ -6,7 +6,7 @@ All phases are currently `Prototype`.
 
 ## Phase 0: Foundations
 
-Status: `Partial`
+Status: `Complete`
 
 Goals:
 
@@ -26,8 +26,11 @@ Current evidence:
 
 - Rust workspace and crate layout exist
 - local build, fmt, lint, and test commands exist
-- CI workflow exists
+- CI matrix covers Linux x86_64, Linux ARM64, macOS ARM64, nightly clippy, security audit, and release build
+- `rust-toolchain.toml` pins toolchain; nightly-lint job fails on clippy surface changes
+- `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo, clippy::unimplemented))]` active on engine and protocol crates
 - CLI-driven SQL tests exist for the current prototype slice
+- ADRs written for object-store consistency, catalog backing store, cluster CA, Iceberg catalog, and identity provider
 
 ## Phase 1: Control Plane And Catalog Skeleton
 
@@ -50,7 +53,7 @@ Current evidence:
 
 - embedded control-plane crate exists
 - cluster membership model supports **node registration and discovery** via SQL (**SHOW NODES**)
-- **high-availability strategy** implemented with background **heartbeats and node pruning** in the control plane
+- **high-availability strategy** implemented with background **heartbeats and node pruning** in the control plane; `Heartbeat` Flight DoAction for remote heartbeat; coordinator prunes nodes silent > 45 s to `Unavailable`
 - query admission now issues query ids and **round-robin routes to registered coordinators**
 - **CLI supports automatic failover** across multiple comma-separated endpoints for both PostgreSQL and Flight SQL
 - bootstrap users, databases, and schemas are validated on the query path
@@ -69,8 +72,8 @@ Current evidence:
 
 Remaining gaps before this phase should be considered `Partial` overall:
 
-- no object-storage-backed production columnar managed-table storage yet (local Parquet only)
-- no roles/groups yet
+- no object-storage-backed production columnar managed-table storage yet (S3/GCS/Azure paths exist but not CI-tested end-to-end)
+- no role/group-aware planner checks or grants/revokes yet
 - no storage policy model yet
 
 ## Phase 2: Single-Node Execution Slice
@@ -167,7 +170,7 @@ Remaining gaps before this phase should be considered `Complete`:
 
 ## Phase 5: Distributed Planning And Execution
 
-Status: `Prototype`
+Status: `Partial`
 
 Goals:
 
@@ -183,9 +186,26 @@ Outputs:
 - tested multi-node query execution
 - stage-level metrics and traceability
 
+Current evidence:
+
+- query **cancellation**: `CancellationToken` propagated from admission through `execute_on_node`; `KILL QUERY <id>` SQL; client disconnect aborts in-flight streams; wall-clock timeout via `ANALYTICSDB_QUERY_TIMEOUT_SECS`
+- **backpressure**: bounded per-partition `mpsc::channel(16)` merged via `select_all`; slow clients exert backpressure on workers rather than buffering
+- **retry / idempotency**: attempt-id (`{query_id}_a{n}`) embedded in Parquet filenames so retried partitions write to distinct files and cannot double-publish into the manifest
+- **worker resource quotas**: shared `GreedyMemoryPool` (default 4096 MiB) per session `RuntimeEnv`; admission semaphore (default 32 concurrent queries)
+- **graceful shutdown**: SIGTERM/SIGINT handler cancels all in-flight queries before exit
+- **node heartbeat**: 10 s background heartbeat; coordinator prunes nodes silent > 45 s to `Unavailable`
+
+Remaining gaps before this phase should be considered `Complete`:
+
+- no mTLS intra-cluster (certificate verification currently disabled)
+- no distributed equivalence tests for joins, group-by, sort/limit, window functions
+- no distributed query log sibling rows
+- no skew-aware partitioner using Parquet row-group statistics
+- no catalog concurrency for multi-coordinator setups
+
 ## Phase 6: Storage Maturity
 
-Status: `Prototype`
+Status: `Partial`
 
 Goals:
 
@@ -199,6 +219,25 @@ Outputs:
 
 - tested durable read/write paths
 - documented consistency and policy behavior
+
+Current evidence:
+
+- `store_for_location` routes `s3://`, `s3a://`, `gs://`, `azure://`/`az://`/`abfss://`, `file://`, and local paths through `object_store`; cloud backends use env-chain credential resolution
+- manifest-based snapshots: `append_to_manifest` / `replace_manifest` with CAS loop (`PutMode::Create` / `PutMode::Update(e_tag)`); `PutMode::Overwrite` fallback for backends without preconditions; directory-scan fallback for pre-manifest tables
+- `vacuum_orphans()` cleans staged-but-uncommitted files; `compact_table()` merges small Parquet files (row-budget heuristic, target 128 MiB); `VACUUM <table>` SQL exposed
+- index snapshots stored under `<table_prefix>/.analyticsdb_indexes/` via the same `object_store` abstraction
+- optional `cluster=<id>/` key prefix in managed-table URIs via `ClusterConfig.cluster_id`
+- optional S3 SSE via `ANALYTICSDB_S3_SSE` / `ANALYTICSDB_S3_SSE_KMS_KEY_ID` env vars and `ClusterConfig.s3_sse` / `s3_sse_kms_key_id`
+- **`data/` subdirectory layout adopted** for Parquet files across all write paths (`append_batch`, `write_dataframe_to_table_snapshot`, `execute_insert_select`); `meta/manifest.json` created at table creation and updated atomically on every write; `entry_key()` helper provides backward-compatible reads of both old and new layouts
+- `cli_file_url_storage_root_supports_full_dml_ddl_lifecycle` and `cli_s3_storage_root_supports_full_dml_ddl_lifecycle` CLI tests exercise full DML/DDL lifecycle against `file://` and S3 storage roots; CI MinIO `s3-parity` job provides continuous coverage
+- ADR-001 (object-store consistency) written
+
+Remaining gaps before this phase should be considered `Complete`:
+
+- no Iceberg read path
+- no storage policy engine
+- no cache layers (query results, data blocks)
+- no recovery documentation or operator runbook
 
 ## Phase 7: PostgreSQL Compatibility Expansion
 
@@ -264,11 +303,15 @@ Current evidence:
 
 - prototype query-log records for non-streaming query execution are persisted asynchronously to Parquet and exposed through `system.query_log`
 - query-log behavior has engine SQL coverage and CLI-driven PostgreSQL-wire SQL coverage
+- password credentials stored as Argon2id PHC strings (OsRng salt per user); `CREATE USER` and `ALTER USER ... PASSWORD` hash before writing; legacy plaintext accepted during migration window
 
 Remaining gaps before this phase should be considered `Partial` overall:
 
 - no benchmark gate exists yet for query-log overhead
 - query-log retention, metric enrichment, distributed worker rows, and full Flight SQL stream lifecycle accounting remain incomplete
+- no mTLS intra-cluster yet
+- no `system.audit_log` yet
+- no GCS/Azure SSE equivalent to the S3 SSE wiring
 
 ## Cross-Cutting Rules
 

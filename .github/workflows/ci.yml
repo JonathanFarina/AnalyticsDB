@@ -87,6 +87,49 @@ jobs:
       - name: Release build
         run: cargo build --release --workspace
 
+  s3-parity:
+    name: S3 parity (MinIO)
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minio
+          MINIO_ROOT_PASSWORD: miniominio
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: s3-parity-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Create test bucket
+        run: |
+          curl -sf http://localhost:9000/minio/health/live
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minio:miniominio@localhost:9000 \
+            minio/mc mb local/test-bucket
+      - name: Run S3 parity tests
+        env:
+          ANALYTICSDB_S3_TEST_BUCKET: test-bucket
+          AWS_ACCESS_KEY_ID: minio
+          AWS_SECRET_ACCESS_KEY: miniominio
+          AWS_ENDPOINT_URL: http://localhost:9000
+          AWS_ALLOW_HTTP: "true"
+          AWS_REGION: us-east-1
+        run: cargo test -p analyticsdb-cli --test sql_cli cli_s3_storage_root
+
   web-admin-console:
     runs-on: ubuntu-latest
     steps:

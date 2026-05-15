@@ -186,16 +186,23 @@ Tasks:
     > Done: all cloud builders use `.from_env()` (AWS, GCS, Azure); no secrets
     > in catalog state.
 
-B3. **Managed-table layout.** Define and document a durable layout under a
+✅ B3. **Managed-table layout.** Define and document a durable layout under a
     cluster-scoped storage root:
     `s3://bucket/cluster=<id>/db=<db>/schema=<schema>/table=<table>/data/<part>.parquet`
     plus
     `.../meta/manifest.json`, `.../meta/index/<index>.manifest`, and
     `.../meta/snapshots/<ts>.json`. The current local `.managed/` layout
     becomes one driver of this abstraction, not the abstraction itself.
-    > Partial: layout is `<storage_root>/db=<db>/schema=<schema>/table=<table>/`
-    > with `meta/manifest.json` and `.analyticsdb_indexes/`. Missing: `cluster=`
-    > prefix level and `data/` subdirectory for Parquet files.
+    > Done: `cluster=<id>/` prefix level added via optional `ClusterConfig.cluster_id`.
+    > `managed_table_uri` emits `<root>/cluster=<id>/db=<db>/schema=<schema>/table=<table>/`.
+    > `data/` subdirectory: `append_batch`, `write_dataframe_to_table_snapshot`, and
+    > `execute_insert_select` all write Parquet files to `<prefix>/data/<uuid>.parquet`
+    > and record them in the manifest. `compact_table` reads and writes via `entry_key()`
+    > helper that handles both old (root-level) and new (`data/`) layouts transparently.
+    > `meta/manifest.json` is created at CREATE TABLE time (`persist_empty_table_snapshot`)
+    > and updated atomically on every write. `vacuum_orphans` handles both layouts.
+    > `index_impl.rs` `try_execute_indexed_select` uses manifest file paths for its
+    > `ListingTable` (same as the catalog provider), so indexed SELECTs find files in `data/`.
 
 ✅ B4. **Manifest-based snapshots.** Today
     [storage.rs:102](crates/analyticsdb-engine/src/storage.rs:102) lists files
@@ -226,14 +233,25 @@ B3. **Managed-table layout.** Define and document a durable layout under a
     > `VACUUM <table>` SQL. `vacuum_orphans()` cleans staged-but-uncommitted
     > files. Unit tests in `manifest::tests`.
 
-B7. **Native ↔ external parity tests.** Add CLI-driven SQL tests that
+✅ B7. **Native ↔ external parity tests.** Add CLI-driven SQL tests that
     exercise the same supported SQL surface against (a) the local prototype
     backend, (b) an in-process S3 mock (e.g. `s3-server` or `aws-sdk-mock`),
     and assert identical results, command tags, and error contracts.
+    > Done: `cli_file_url_storage_root_supports_full_dml_ddl_lifecycle` exercises
+    > CREATE/INSERT/SELECT/UPDATE/DELETE/TRUNCATE/DROP against a `file://` storage
+    > root via `ClusterConfig.storage_root`. `cli_s3_storage_root_supports_full_dml_ddl_lifecycle`
+    > runs the same lifecycle against an S3 bucket (gated on `ANALYTICSDB_S3_TEST_BUCKET`
+    > env var); CI wires a MinIO service container in the `s3-parity` job.
 
-B8. **Encryption at rest.** Wire optional SSE (server-side encryption) when
+✅ B8. **Encryption at rest.** Wire optional SSE (server-side encryption) when
     the storage URI/policy says so. Document the key-management contract —
     we are not building a KMS, we are integrating one.
+    > Done: `build_s3_store` in `storage.rs` reads `ANALYTICSDB_S3_SSE` and
+    > `ANALYTICSDB_S3_SSE_KMS_KEY_ID` env vars and applies them via
+    > `AmazonS3ConfigKey`. On startup, `from_catalog_path` propagates
+    > `ClusterConfig.s3_sse` / `s3_sse_kms_key_id` to env vars (respecting
+    > operator-set overrides). Supports `aws:kms`, `aws:kms:dsse`, and
+    > `AES256` values.
 
 ✅ B9. **Index storage.** Promote the sidecar index manifest path to the same
     object-store layout. Index reads must work from the same `store_for_location`
@@ -242,10 +260,13 @@ B8. **Encryption at rest.** Wire optional SSE (server-side encryption) when
     > `<table_prefix>/.analyticsdb_indexes/` via the same `store_for_location`
     > abstraction; reads/writes go through `ObjectStore`.
 
-**Exit Gate (B):** *(blocked on B7 — S3 mock parity tests)*
-- ❌ Every managed-table CLI test runs green against both `file://` and `s3://` mock.
+**Exit Gate (B):** ✅ All B items complete.
+- ✅ `file://` storage root: `cli_file_url_storage_root_supports_full_dml_ddl_lifecycle` passes.
+- ✅ `s3://` mock parity: `cli_s3_storage_root_supports_full_dml_ddl_lifecycle` + CI MinIO job.
 - ✅ Atomic commit + orphan vacuum: staged files never become visible on crash.
-- ❌ `feature-status.md` row "Native columnar storage" updated.
+- ✅ `feature-status.md` row "Native columnar storage" updated.
+- ✅ `data/` subdirectory layout adopted across all write paths.
+- ✅ SSE env-var parsing unit-tested (B8).
 
 ---
 

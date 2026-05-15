@@ -257,6 +257,18 @@ pub async fn replace_manifest(
     Ok(())
 }
 
+/// Returns the object-store key for a manifest entry path relative to `prefix`.
+///
+/// Handles both the new layout (`"data/<file>"` → `<prefix>/data/<file>`) and the
+/// legacy layout (`"<file>"` → `<prefix>/<file>`) so callers never embed the slash split.
+fn entry_key(prefix: &OPath, entry_path: &str) -> OPath {
+    if let Some(bare) = entry_path.strip_prefix("data/") {
+        prefix.clone().join("data").join(bare)
+    } else {
+        prefix.clone().join(entry_path)
+    }
+}
+
 /// Writes `batch` as a new UUID-named Parquet file under `prefix` and updates the manifest.
 pub async fn append_batch(
     store: &Arc<dyn ObjectStore>,
@@ -264,12 +276,13 @@ pub async fn append_batch(
     batch: RecordBatch,
 ) -> Result<()> {
     let filename = format!("{}.parquet", Uuid::now_v7());
-    let key = prefix.clone().join(filename.as_str());
+    let data_path = format!("data/{}", filename);
+    let key = prefix.clone().join("data").join(filename.as_str());
     let bytes = storage::encode_parquet_batches(batch.schema(), std::slice::from_ref(&batch))?;
     let size = bytes.len() as u64;
     let row_count = batch.num_rows() as i64;
     store.put(&key, bytes.into()).await?;
-    append_to_manifest(store, prefix, &filename, size, row_count).await
+    append_to_manifest(store, prefix, &data_path, size, row_count).await
 }
 
 /// Deletes any `.parquet` files under `prefix` that are not listed in the current manifest.
@@ -304,9 +317,15 @@ pub async fn vacuum_orphans(
                     .strip_prefix(&*prefix_str)
                     .unwrap_or(loc)
                     .trim_start_matches('/');
-                // Only consider direct children that are Parquet files; leave
-                // subdirectories (meta/, .analyticsdb_indexes/) untouched.
-                if !relative.contains('/') && relative.ends_with(".parquet") && !committed.contains(relative) {
+                // Candidate orphans are either direct children (old layout) or
+                // one level deep under data/ (new layout). Files under meta/,
+                // .analyticsdb_indexes/, or any other subdirectory are untouched.
+                let is_candidate = if relative.contains('/') {
+                    relative.starts_with("data/") && relative.matches('/').count() == 1
+                } else {
+                    relative.ends_with(".parquet")
+                };
+                if is_candidate && relative.ends_with(".parquet") && !committed.contains(relative) {
                     orphans.push(meta.location);
                 }
             }
@@ -348,7 +367,7 @@ pub async fn compact_table(
     let mut schema: Option<SchemaRef> = None;
 
     for entry in &manifest.files {
-        let key = prefix.clone().join(entry.path.as_str());
+        let key = entry_key(prefix, &entry.path);
         let bytes = match store.get(&key).await {
             Ok(r) => r.bytes().await?,
             Err(OsError::NotFound { .. }) => continue,
@@ -392,17 +411,18 @@ pub async fn compact_table(
 
     let flush = |bin: Vec<RecordBatch>| -> Result<(ManifestEntry, Bytes)> {
         let filename = format!("{}.parquet", Uuid::now_v7());
+        let data_path = format!("data/{}", filename);
         let row_count: i64 = bin.iter().map(|b| b.num_rows() as i64).sum();
         let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &bin)?;
         let size = bytes.len() as u64;
-        Ok((ManifestEntry { path: filename, size, row_count }, bytes))
+        Ok((ManifestEntry { path: data_path, size, row_count }, bytes))
     };
 
     for batch in all_batches {
         let batch_rows = batch.num_rows() as i64;
         if !current_bin.is_empty() && current_rows + batch_rows > row_budget {
             let (entry, bytes) = flush(std::mem::take(&mut current_bin))?;
-            let key = prefix.clone().join(entry.path.as_str());
+            let key = entry_key(prefix, &entry.path);
             store.put(&key, bytes.into()).await?;
             new_entries.push(entry);
             current_rows = 0;
@@ -413,7 +433,7 @@ pub async fn compact_table(
 
     if !current_bin.is_empty() {
         let (entry, bytes) = flush(std::mem::take(&mut current_bin))?;
-        let key = prefix.clone().join(entry.path.as_str());
+        let key = entry_key(prefix, &entry.path);
         store.put(&key, bytes.into()).await?;
         new_entries.push(entry);
     }

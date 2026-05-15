@@ -259,11 +259,34 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub query_log: QueryLogConfig,
     /// Base URI for managed table storage. When set, managed tables are stored at
-    /// `<storage_root>/db=<db>/schema=<schema>/table=<table>`.
+    /// `<storage_root>/db=<db>/schema=<schema>/table=<table>` (or with a
+    /// `cluster=<cluster_id>/` prefix when `cluster_id` is also set).
     /// Supports s3://, gs://, az://, azure://, and file:// URIs.
     /// When not set, defaults to a local `file://` path derived from catalog_path.
     #[serde(default)]
     pub storage_root: Option<String>,
+    /// Optional cluster identifier. When set, managed table URIs include a
+    /// `cluster=<cluster_id>/` path component immediately after the storage root,
+    /// producing the canonical layout:
+    ///   `<storage_root>/cluster=<id>/db=<db>/schema=<schema>/table=<table>`
+    ///
+    /// This allows multiple clusters to share the same storage root (e.g. one S3
+    /// bucket) without path collisions. Omit for single-cluster deployments.
+    #[serde(default)]
+    pub cluster_id: Option<String>,
+    /// Optional server-side encryption for S3-backed managed tables.
+    /// Supported values:
+    ///   - `"AES256"` — SSE-S3 (AWS-managed key, no extra cost)
+    ///   - `"aws:kms"` — SSE-KMS (set `s3_sse_kms_key_id` for a customer-managed key)
+    ///
+    /// Also configurable via the `ANALYTICSDB_S3_SSE` and
+    /// `ANALYTICSDB_S3_SSE_KMS_KEY_ID` environment variables, which take
+    /// precedence over this field.
+    #[serde(default)]
+    pub s3_sse: Option<String>,
+    /// KMS key ARN or alias used when `s3_sse = "aws:kms"`.
+    #[serde(default)]
+    pub s3_sse_kms_key_id: Option<String>,
 }
 
 fn default_query_log_enabled() -> bool {
@@ -2207,27 +2230,34 @@ impl ControlPlane {
 
     /// Returns the base URI for a managed table's storage.
     ///
-    /// If `ClusterConfig::storage_root` is set, uses it as the base.
-    /// Otherwise falls back to a `file://` URI derived from `managed_data_root()`.
+    /// Layout (without `cluster_id`): `<storage_root>/db=<db>/schema=<schema>/table=<table>`
+    /// Layout (with `cluster_id`):    `<storage_root>/cluster=<id>/db=<db>/schema=<schema>/table=<table>`
     ///
-    /// Layout: `<base>/db=<db>/schema=<schema>/table=<table>`
+    /// Falls back to a local `file://` URI derived from `managed_data_root()` when
+    /// `ClusterConfig::storage_root` is not set.
     pub fn managed_table_uri(&self, database: &str, schema: &str, table: &str) -> String {
-        let base = {
+        let (storage_root, cluster_id) = {
             if let Ok(state) = self.state.try_read() {
-                state
+                let (root, cid) = state
                     .config
                     .as_ref()
-                    .and_then(|c| c.storage_root.clone())
+                    .map(|c| (c.storage_root.clone(), c.cluster_id.clone()))
+                    .unwrap_or((None, None));
+                (root, cid)
             } else {
-                None
+                (None, None)
             }
         };
-        let base = base.unwrap_or_else(|| {
+        let base = storage_root.unwrap_or_else(|| {
             let root = self.managed_data_root();
             format!("file://{}", root.to_string_lossy())
         });
         let base = base.trim_end_matches('/');
-        format!("{base}/db={database}/schema={schema}/table={table}")
+        if let Some(ref cid) = cluster_id {
+            format!("{base}/cluster={cid}/db={database}/schema={schema}/table={table}")
+        } else {
+            format!("{base}/db={database}/schema={schema}/table={table}")
+        }
     }
 
     pub async fn managed_table_storage_location(
@@ -3628,6 +3658,9 @@ fn bootstrap_state() -> CatalogState {
         next_available_port_offset: 0,
         query_log: QueryLogConfig::default(),
         storage_root: None,
+        cluster_id: None,
+        s3_sse: None,
+        s3_sse_kms_key_id: None,
     });
 
     CatalogState {

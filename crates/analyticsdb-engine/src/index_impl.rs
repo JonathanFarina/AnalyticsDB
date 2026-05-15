@@ -298,12 +298,27 @@ impl PrototypeEngine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing storage path"))?;
         let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
-        let table_path = listing_table_url_for_storage_location(storage_path)?;
-        let config = datafusion::datasource::listing::ListingTableConfig::new(table_path)
-            .with_listing_options(datafusion::datasource::listing::ListingOptions::new(
-                Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default()),
-            ))
-            .with_schema(full_schema);
+
+        let (store, prefix) = crate::storage::store_for_location(storage_path)?;
+        let committed_files = crate::manifest::list_files(&store, &prefix).await.unwrap_or_default();
+
+        let listing_opts = datafusion::datasource::listing::ListingOptions::new(Arc::new(
+            datafusion::datasource::file_format::parquet::ParquetFormat::default(),
+        ));
+        let config = if committed_files.is_empty() {
+            let table_path = listing_table_url_for_storage_location(storage_path)?;
+            datafusion::datasource::listing::ListingTableConfig::new(table_path)
+                .with_listing_options(listing_opts)
+                .with_schema(full_schema)
+        } else {
+            let urls: Vec<datafusion::datasource::listing::ListingTableUrl> = committed_files
+                .iter()
+                .filter_map(|f| datafusion::datasource::listing::ListingTableUrl::parse(f).ok())
+                .collect();
+            datafusion::datasource::listing::ListingTableConfig::new_with_multi_paths(urls)
+                .with_listing_options(listing_opts)
+                .with_schema(full_schema)
+        };
         let table = datafusion::datasource::listing::ListingTable::try_new(config)?;
         context.register_table("indexed_table", Arc::new(table))?;
 

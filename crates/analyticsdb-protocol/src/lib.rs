@@ -2514,6 +2514,8 @@ fn encoded_single_batch(
     schema: SchemaRef,
     batch: RecordBatch,
 ) -> Result<<AnalyticsFlightSqlService as FlightService>::DoGetStream, Status> {
+    let schema = ensure_compatible_schema(schema);
+    let batch = ensure_compatible_batch(batch).map_err(status_from_error)?;
     Ok(FlightDataEncoderBuilder::new()
         .with_schema(schema)
         .build(stream::once(async {

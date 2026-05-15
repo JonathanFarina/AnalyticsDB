@@ -496,6 +496,26 @@ impl PrototypeEngine {
 
     pub async fn from_catalog_path(catalog_path: &str) -> Result<Self> {
         let control_plane = Arc::new(ControlPlane::from_catalog_path(catalog_path).await?);
+
+        // Propagate SSE config from ClusterConfig into env vars so that every
+        // subsequent `store_for_location` call picks them up.  Env vars already
+        // set by the operator take precedence (the `set_var` calls are no-ops
+        // when the var is already present due to the guard below).
+        if let Some(config) = control_plane.cluster_config().await {
+            if let Some(ref sse) = config.s3_sse {
+                if std::env::var("ANALYTICSDB_S3_SSE").is_err() {
+                    // Safety: single-threaded startup path; no other thread
+                    // reads these vars until the engine is returned.
+                    unsafe { std::env::set_var("ANALYTICSDB_S3_SSE", sse) };
+                }
+            }
+            if let Some(ref key_id) = config.s3_sse_kms_key_id {
+                if std::env::var("ANALYTICSDB_S3_SSE_KMS_KEY_ID").is_err() {
+                    unsafe { std::env::set_var("ANALYTICSDB_S3_SSE_KMS_KEY_ID", key_id) };
+                }
+            }
+        }
+
         let query_log_config = control_plane
             .cluster_config()
             .await
@@ -1293,10 +1313,14 @@ impl PrototypeEngine {
 
             if current_rows >= INSERT_SELECT_PARQUET_ROW_GROUP_SIZE {
                 let schema = current_batch[0].schema();
-                let key = prefix
-                    .clone()
-                    .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
-                storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
+                let filename = format!("{}.parquet", uuid::Uuid::now_v7());
+                let data_path = format!("data/{}", filename);
+                let key = prefix.clone().join("data").join(filename.as_str());
+                let bytes = storage::encode_parquet_batches(schema, &current_batch)?;
+                let size = bytes.len() as u64;
+                let row_count = current_rows as i64;
+                store.put(&key, bytes.into()).await?;
+                crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count).await?;
                 current_batch.clear();
                 current_rows = 0;
             }
@@ -1304,10 +1328,14 @@ impl PrototypeEngine {
 
         if !current_batch.is_empty() {
             let schema = current_batch[0].schema();
-            let key = prefix
-                .clone()
-                .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
-            storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
+            let filename = format!("{}.parquet", uuid::Uuid::now_v7());
+            let data_path = format!("data/{}", filename);
+            let key = prefix.clone().join("data").join(filename.as_str());
+            let bytes = storage::encode_parquet_batches(schema, &current_batch)?;
+            let size = bytes.len() as u64;
+            let row_count = current_rows as i64;
+            store.put(&key, bytes.into()).await?;
+            crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count).await?;
         }
 
         let table_key = format!(

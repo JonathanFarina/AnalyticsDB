@@ -6092,3 +6092,290 @@ fn run_sql_via_protocol(protocol: &str, endpoint: &str, sql: &str) {
     ]);
     command.assert().success();
 }
+
+async fn configure_storage_root(catalog_path: &str, storage_root: &str) {
+    let control_plane = ControlPlane::from_catalog_path(catalog_path)
+        .await
+        .expect("control plane should initialize");
+    let mut config = control_plane
+        .cluster_config()
+        .await
+        .expect("bootstrap config should exist");
+    config.storage_root = Some(storage_root.to_string());
+    control_plane
+        .update_cluster_config(config)
+        .await
+        .expect("storage root config should persist");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_file_url_storage_root_supports_full_dml_ddl_lifecycle() {
+    let catalog_path = temp_catalog_path();
+    let mut storage_dir = std::env::temp_dir();
+    storage_dir.push(format!("analyticsdb-file-url-test-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&storage_dir).expect("storage dir should create");
+    let storage_root = format!("file://{}", storage_dir.display());
+
+    configure_storage_root(&catalog_path, &storage_root).await;
+
+    let (_server, addr) = start_postgres_server(&catalog_path).await;
+
+    // CREATE TABLE with explicit column definitions
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "CREATE TABLE file_url_test (id BIGINT NOT NULL, label TEXT, value DOUBLE PRECISION)",
+    );
+
+    // INSERT rows
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "INSERT INTO file_url_test VALUES (1, 'alpha', 1.5), (2, 'beta', 2.5), (3, 'gamma', 3.5)",
+    );
+
+    // SELECT — verify all rows present
+    let select_out = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT id, label, value FROM file_url_test ORDER BY id",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let select_stdout = String::from_utf8(select_out).expect("stdout should be utf-8");
+    assert!(select_stdout.contains("alpha"), "SELECT should return alpha row");
+    assert!(select_stdout.contains("beta"), "SELECT should return beta row");
+    assert!(select_stdout.contains("gamma"), "SELECT should return gamma row");
+
+    // UPDATE
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "UPDATE file_url_test SET label = 'updated' WHERE id = 2",
+    );
+
+    let after_update_out = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT label FROM file_url_test WHERE id = 2",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after_update_stdout = String::from_utf8(after_update_out).expect("stdout should be utf-8");
+    assert!(
+        after_update_stdout.contains("updated"),
+        "UPDATE should change label to 'updated'"
+    );
+
+    // DELETE
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "DELETE FROM file_url_test WHERE id = 3",
+    );
+
+    let after_delete_out = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT id FROM file_url_test ORDER BY id",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after_delete_stdout =
+        String::from_utf8(after_delete_out).expect("stdout should be utf-8");
+    assert!(
+        !after_delete_stdout.contains("| 3 "),
+        "DELETE should remove id=3, got: {after_delete_stdout}"
+    );
+
+    // TRUNCATE
+    run_sql_via_protocol("postgres", &addr, "TRUNCATE TABLE file_url_test");
+
+    let after_truncate_out = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT COUNT(*) FROM file_url_test",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after_truncate_stdout =
+        String::from_utf8(after_truncate_out).expect("stdout should be utf-8");
+    assert!(
+        after_truncate_stdout.contains('0'),
+        "TRUNCATE should leave 0 rows"
+    );
+
+    // DROP TABLE
+    run_sql_via_protocol("postgres", &addr, "DROP TABLE file_url_test");
+
+    cleanup_catalog_artifacts(&catalog_path);
+    let _ = std::fs::remove_dir_all(&storage_dir);
+}
+
+/// B7 — S3 parity: same DML/DDL lifecycle as the file:// test, run against a
+/// real S3-compatible endpoint.
+///
+/// **Skipped** unless `ANALYTICSDB_S3_TEST_BUCKET` is set (e.g. by a CI job
+/// that starts MinIO with `docker run -e MINIO_ROOT_USER=minio
+/// -e MINIO_ROOT_PASSWORD=miniominio -p 9000:9000 minio/minio server /data`).
+///
+/// Required env vars when running:
+///   ANALYTICSDB_S3_TEST_BUCKET   e.g. "test-bucket"
+///   AWS_ACCESS_KEY_ID            e.g. "minio"
+///   AWS_SECRET_ACCESS_KEY        e.g. "miniominio"
+///   AWS_ENDPOINT_URL             e.g. "http://127.0.0.1:9000"
+///   AWS_ALLOW_HTTP               "true"  (for non-TLS MinIO)
+///   AWS_REGION                   e.g. "us-east-1"
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
+    let bucket = match std::env::var("ANALYTICSDB_S3_TEST_BUCKET") {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "[SKIP] cli_s3_storage_root_supports_full_dml_ddl_lifecycle: \
+                 set ANALYTICSDB_S3_TEST_BUCKET to run S3 parity tests"
+            );
+            return;
+        }
+    };
+
+    let test_prefix = format!("s3-parity-{}", Uuid::now_v7());
+    let storage_root = format!("s3://{}/{}", bucket, test_prefix);
+
+    let catalog_path = temp_catalog_path();
+    configure_storage_root(&catalog_path, &storage_root).await;
+
+    let (_server, addr) = start_postgres_server(&catalog_path).await;
+
+    // CREATE TABLE
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "CREATE TABLE s3_parity_test (id BIGINT NOT NULL, label TEXT)",
+    );
+
+    // INSERT
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "INSERT INTO s3_parity_test VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+    );
+
+    // SELECT — verify rows present
+    let select_out = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query", "--protocol", "postgres", "--endpoint", &addr,
+            "--user", "postgres", "--password", "postgres",
+            "--sql", "SELECT id, label FROM s3_parity_test ORDER BY id",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let select_stdout = String::from_utf8(select_out).expect("stdout should be utf-8");
+    assert!(select_stdout.contains("alpha"), "S3 SELECT should return alpha row");
+    assert!(select_stdout.contains("beta"), "S3 SELECT should return beta row");
+    assert!(select_stdout.contains("gamma"), "S3 SELECT should return gamma row");
+
+    // UPDATE
+    run_sql_via_protocol("postgres", &addr, "UPDATE s3_parity_test SET label = 'updated' WHERE id = 2");
+
+    let after_update = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query", "--protocol", "postgres", "--endpoint", &addr,
+            "--user", "postgres", "--password", "postgres",
+            "--sql", "SELECT label FROM s3_parity_test WHERE id = 2",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(after_update).expect("utf-8").contains("updated"),
+        "S3 UPDATE should change label"
+    );
+
+    // DELETE
+    run_sql_via_protocol("postgres", &addr, "DELETE FROM s3_parity_test WHERE id = 3");
+
+    let after_delete = Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query", "--protocol", "postgres", "--endpoint", &addr,
+            "--user", "postgres", "--password", "postgres",
+            "--sql", "SELECT id FROM s3_parity_test ORDER BY id",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !String::from_utf8(after_delete).expect("utf-8").contains("| 3 "),
+        "S3 DELETE should remove id=3"
+    );
+
+    // TRUNCATE
+    run_sql_via_protocol("postgres", &addr, "TRUNCATE TABLE s3_parity_test");
+
+    // DROP TABLE
+    run_sql_via_protocol("postgres", &addr, "DROP TABLE s3_parity_test");
+
+    cleanup_catalog_artifacts(&catalog_path);
+}

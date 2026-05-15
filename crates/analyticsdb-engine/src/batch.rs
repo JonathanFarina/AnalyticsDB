@@ -139,7 +139,8 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
     let mut manifest_entries = Vec::new();
     for prepared_batch in prepared_batches {
         let filename = format!("{}.parquet", uuid::Uuid::now_v7());
-        let key = prefix.clone().join(filename.as_str());
+        let data_path = format!("data/{}", filename);
+        let key = prefix.clone().join("data").join(filename.as_str());
         let bytes = storage::encode_parquet_batches(
             prepared_batch.schema(),
             std::slice::from_ref(&prepared_batch),
@@ -148,7 +149,7 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
         let entry_row_count = prepared_batch.num_rows() as i64;
         store.put(&key, bytes.into()).await?;
         manifest_entries.push(crate::manifest::ManifestEntry {
-            path: filename,
+            path: data_path,
             size,
             row_count: entry_row_count,
         });

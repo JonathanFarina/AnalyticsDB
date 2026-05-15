@@ -42,7 +42,7 @@ A feature is `Complete` only when all of the following are true:
 
 | Area | Status | Notes Required Before `Partial` | Notes Required Before `Complete` |
 |---|---|---|---|
-| Repository scaffolding | Partial | repo layout, build tooling, linting, test harness | stable contributor workflow across supported platforms |
+| Repository scaffolding | Complete | repo layout, build tooling, linting, test harness | stable contributor workflow across supported platforms |
 | Control plane | Partial | basic service with cluster metadata and query ids | production-grade routing, HA behavior, failover, observability |
 | Query routing by utilization | Prototype | routing logic with tests | load-aware routing proven under concurrency and node churn |
 | Single endpoint strategy | Complete | entrypoint design and integration path with node registration | validated high-availability client behavior with automatic failover and heartbeats |
@@ -58,16 +58,16 @@ A feature is `Complete` only when all of the following are true:
 | Managed tables (prototype columnar snapshots) | Partial | CTAS persistence and query path with tests | broader DDL, production durability, and storage-engine maturity |
 | Managed table indexes | Partial | SQL-driven primary-key/unique index metadata plus create/alter/drop/reindex index coverage and tested equality/`IN`/range lookup coverage | remote object-store backends, broader planner integration, multi-node maintenance semantics, and wider protocol conformance coverage |
 | Table schema introspection | Partial | persisted column metadata with tests | broader metadata parity and information-schema style coverage |
-| Users, roles, groups | Prototype | authz model and basic tests | audited admin workflows, grants, revokes, and metadata parity |
+| Users, roles, groups | Partial | user lifecycle (create/rotate/drop) tested across PG and Flight SQL; Argon2id password hashing with per-user salt; groups with ADD/DROP USER; legacy plaintext migration path | grants, revokes, role-aware planner checks, audit log |
 | Single-node local query execution | Partial | tested local execution path | durable state, broader query coverage, and non-embedded protocol support |
-| Native columnar storage | Partial | managed table write/read path via Parquet | durability, compaction, recovery, and performance evidence |
+| Native columnar storage | Partial | managed table write/read path via Parquet, manifest-based snapshots, atomic commits (CAS), orphan vacuum, compaction (`VACUUM <table>`), object-store URI routing (`s3://`, `gs://`, `azure://`, `file://`), `file://` storage root CLI parity test | `data/` subdirectory layout, S3 mock parity tests, performance evidence, recovery documentation |
 | Native views | Partial | view definition and resolution | dependency tracking, authz, metadata, and regression coverage |
 | External Parquet support | Partial | external registration and read path | optimizer, statistics, and parity with native SQL surface |
 | External Iceberg support | Prototype | catalog integration and read path | schema evolution, metadata correctness, and interoperability proof |
 | Automatic storage-medium selection | Prototype | policy engine scaffold | tested policy decisions, explainability, and override path |
 | Unified SQL surface for native/external | Partial | unified planner logic | no user-facing special cases for normal querying workflows |
 | Distributed planner | Prototype | multi-stage plan generation | correctness, skew handling, and metrics coverage |
-| Distributed executor | Partial | remote stage execution scaffold with concurrent fetch, zero-materialization streaming, and node resilience | retries, cancellation, and backpressure handling |
+| Distributed executor | Partial | remote stage execution scaffold with concurrent fetch, zero-materialization streaming, node resilience, cancellation, backpressure, retry/idempotency, and worker resource quotas | mTLS, broader plan coverage (joins, window functions, sort/limit), distributed equivalence tests, skew handling |
 | Replication/eventual consistency | Prototype | design plus metadata hooks | failure recovery, repair flows, and consistency guarantees documented |
 | Caching: query results | Prototype | cache abstraction and tests | invalidation, visibility rules, metrics, and predictable behavior |
 | Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
@@ -75,7 +75,7 @@ A feature is `Complete` only when all of the following are true:
 | Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
 | Query log / query-level lineage | Partial | durable async Parquet-backed `system.query_log` for the non-streaming execution path, config defaults, and CLI-driven PostgreSQL-wire SQL coverage | streaming Flight SQL lifecycle accounting, DataFusion metrics, worker sibling rows, retention sweeper, partitioned layout, and benchmark gates |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
-| Encryption at rest | Prototype | key management design and hooks | end-to-end encrypted storage path with rotation story |
+| Encryption at rest | Partial | S3 SSE wired via `ANALYTICSDB_S3_SSE` / `ANALYTICSDB_S3_SSE_KMS_KEY_ID` env vars and `ClusterConfig.s3_sse`/`s3_sse_kms_key_id` fields; supports `AES256`, `aws:kms`, `aws:kms:dsse` | GCS/Azure equivalent, key rotation story, CLI-driven SSE verification test |
 | CLI | Partial | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, and initial meta commands (`\q`, `\?`, `\conninfo`) | broader psql-style meta-command coverage and polished timing UX complete |
 | CLI speed measurement | Partial | timing output scaffold with detailed query/fetch, client total, render, and end-to-end timings behind `--timing` / `\timing` | accurate and documented timing behavior |
 | Web console query editor | Prototype | Vite TypeScript UI with prototype client, editor, messages, result grid, query id, and timing cards | query execution against a real web gateway, auth/session handling, and protocol parity proof |
@@ -86,7 +86,7 @@ A feature is `Complete` only when all of the following are true:
 | Web console admin: logs | Prototype | UI scaffold | multi-node log exploration with query correlation |
 | Test coverage discipline | Partial | baseline CI and tests | no uncovered feature claims remain |
 | Kubernetes deployment | Prototype | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
-| Object storage deployment | Prototype | object-store integration scaffold | tested durability, recovery, and multi-node behavior |
+| Object storage deployment | Partial | `s3://`, `gs://`, `azure://`, `file://` URI routing via `object_store`; env-chain credential resolution; manifest-based atomic commits; optional cluster-scoped `cluster=<id>/` key prefix; optional S3 SSE config | S3 mock CI test, multi-node durability test, recovery docs |
 
 ## Current Repository Status
 
@@ -156,8 +156,24 @@ A feature is `Complete` only when all of the following are true:
 - Coordinator now uses a **cost-aware worker selection heuristic** to determine the optimal number of nodes based on data size (~128MB per worker target) and file count, avoiding "scatter-gather tax" on small datasets by selectively dispatching to a subset of the cluster
 - Distributed path performance optimized with **Bincode serialization** for internal gRPC, **connection pooling** for worker channels, **size-aware greedy partitioning**, and a **FileListCache** with version epochs to eliminate redundant object store listings
 - Managed table write paths (`INSERT INTO ... SELECT`) optimized with **batched Parquet writes** (consolidating into 1M row files) and **lazy index rebuilding** in background tasks to reduce write latency
-- No production distributed execution yet; the current distributed path remains a prototype scaffold without production-grade planning, cancellation semantics, broad SQL coverage, or CLI-driven distributed compatibility coverage
-- No object-storage-backed production columnar managed-table storage yet (currently local Parquet)
+- Engine crate `lib.rs` split into focused modules (`ddl.rs`, `dml.rs`, `dispatch_impl.rs`, `dispatch_plan.rs`, `batch.rs`, `index_impl.rs`, `index_ops.rs`, `sql_rewriter.rs`, `postgres_compatibility.rs`, `schema_build.rs`, `metadata_helpers.rs`, `manifest.rs`, `storage.rs`, `system_catalog.rs`, `information_schema.rs`, `functions.rs`, `query_log/`); production code in `lib.rs` ≤ 1450 lines
+- Request-path `unwrap()` / `expect()` / `panic!()` eliminated from all non-test engine and protocol code; `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo, clippy::unimplemented))]` gates active on `analyticsdb-engine` and `analyticsdb-protocol`
+- CI matrix covers Linux x86_64, Linux ARM64, macOS ARM64, nightly clippy lint surface, and security audit (`cargo deny` + `cargo audit`) plus release build
+- Managed-table storage now routes through `object_store`-backed `store_for_location` for `s3://`, `gs://`, `azure://`/`az://`/`abfss://`, `file://`, and local paths; cloud backends use env-chain credential resolution
+- Manifest-based atomic snapshots: `read_manifest`/`append_to_manifest`/`replace_manifest` with CAS loop (`PutMode::Create` / `PutMode::Update(e_tag)`) and `PutMode::Overwrite` fallback for backends without preconditions; directory-scan fallback for pre-manifest tables
+- `vacuum_orphans()` prunes staged-but-uncommitted files; `compact_table()` merges small Parquet files using a row-budget heuristic (target 128 MiB per output file) and exposes `VACUUM <table>` SQL
+- Index snapshots stored under `<table_prefix>/.analyticsdb_indexes/` via the same `object_store` abstraction
+- Optional `cluster=<id>/` key prefix in managed-table URIs controlled by `ClusterConfig.cluster_id`
+- Optional S3 server-side encryption via `ANALYTICSDB_S3_SSE` / `ANALYTICSDB_S3_SSE_KMS_KEY_ID` env vars (also propagated from `ClusterConfig.s3_sse` / `s3_sse_kms_key_id` at startup)
+- `cli_file_url_storage_root_supports_full_dml_ddl_lifecycle` CLI test exercises CREATE/INSERT/SELECT/UPDATE/DELETE/TRUNCATE/DROP against an explicit `file://` storage root
+- Distributed executor now includes query **cancellation** (`CancelPartition` DoAction; `CancellationToken` propagated through all worker calls; `KILL QUERY <id>` SQL), **backpressure** (bounded per-partition `mpsc::channel(16)`), **retry/idempotency** (attempt-id embedded in filenames), and **worker resource quotas** (shared `GreedyMemoryPool`, admission semaphore via `ANALYTICSDB_WORKER_MEMORY_LIMIT_MIB` / `ANALYTICSDB_MAX_CONCURRENT_QUERIES`)
+- Graceful shutdown: SIGTERM/SIGINT handler cancels all in-flight queries and drains listeners
+- Node heartbeat: 10 s background heartbeat per node; coordinator prunes nodes silent > 45 s to `Unavailable`; `Heartbeat` Flight DoAction for remote heartbeat
+- Password storage upgraded to Argon2id (PHC string format, OsRng salt per user); `CREATE USER` and `ALTER USER ... PASSWORD` hash before writing; legacy plaintext accepted during migration window
+- No mTLS intra-cluster yet (certificate verification still disabled on the distributed path)
+- No S3 mock parity test yet; S3 parity requires `ANALYTICSDB_S3_TEST_BUCKET` env var
+- No production distributed execution yet; the current distributed path remains a prototype scaffold without mTLS, broad plan coverage (joins, window functions, sort/limit), or distributed equivalence tests
+- No object-storage-backed production columnar managed-table storage yet (S3/GCS/Azure paths exist but are not CI-tested end-to-end)
 - No external Iceberg table support yet
 - No deployment manifests yet
 - No broad PostgreSQL extended-query compatibility, auth, or conformance suite yet
