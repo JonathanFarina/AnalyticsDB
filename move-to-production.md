@@ -32,9 +32,9 @@ What the engine actually is today:
 - Observability has structured tracing and a `Partial` `system.query_log` for
   the non-streaming path only. There is no metric emission, no per-stage
   metrics, no traces propagated through the distributed path.
-- The engine `lib.rs` is ~8.3k lines and concentrates parsing, planning,
-  catalog dispatch, distributed coordination, and rewriting in one module —
-  this is sustainable for a prototype but is a refactor target before scale.
+- The engine has been decomposed into focused modules (`ddl.rs`, `dispatch_impl.rs`,
+  `dispatch_plan.rs`, `batch.rs`, `index_impl.rs`, `index_ops.rs`, etc.);
+  `lib.rs` production code is ≤ 1450 lines.
 - CLI-driven SQL tests cover a narrow but well-defined PG / Flight SQL parity
   slice. Many SQL surfaces (joins, window functions, types, time/date,
   numeric, geo, JSON) are **untested through the CLI** and therefore cannot be
@@ -543,11 +543,11 @@ G2. **OpenTelemetry traces.** Attach trace ids at admission and propagate
     via gRPC metadata into worker `ExecutePartition` calls so a single trace
     spans coordinator + workers. Document an OTLP collector deployment.
 
-G3. **Query log completeness.** Close the `Partial` gaps called out in
+G3. **Query log completeness.** Close the remaining `Partial` gaps called out in
     [feature-status.md](docs/agents/feature-status.md): streaming Flight SQL
-    finish accounting, DataFusion metric enrichment, retention sweeper,
-    distributed worker sibling rows, partitioned layout. Each gap closure
-    ships with an engine + CLI SQL test.
+    finish accounting, DataFusion stage metric enrichment, retention sweeper,
+    partitioned layout. (Worker sibling rows for distributed reads landed in C6.)
+    Each gap closure ships with an engine + CLI SQL test.
 
 G4. **Audit log** (also covered by D6) must share the same async durable
     pattern.
