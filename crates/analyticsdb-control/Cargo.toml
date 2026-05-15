@@ -8,6 +8,11 @@ version.workspace = true
 analyticsdb-core = { path = "../analyticsdb-core" }
 anyhow.workspace = true
 argon2 = { version = "0.5", features = ["std"] }
+base64.workspace = true
+hmac = { version = "0.12", features = ["std"] }
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+sha2 = "0.10"
+stringprep = "0.1"
 async-trait.workspace = true
 clap.workspace = true
 openraft = { workspace = true, features = ["serde"] }

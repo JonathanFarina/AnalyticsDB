@@ -6,6 +6,8 @@ use analyticsdb_core::SessionContext;
 use anyhow::{bail, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use argon2::Argon2;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -42,6 +44,34 @@ fn verify_password(provided: &str, stored: &str) -> bool {
         // Legacy plaintext comparison — accepted during migration window.
         provided == stored
     }
+}
+
+/// Compute SCRAM-SHA-256 verifier fields for a plaintext password.
+///
+/// Returns `(scram_salt_b64, scram_salted_password_b64)`.
+/// The salt is 16 random bytes; the salted password is
+/// `PBKDF2-HMAC-SHA256(SASLprep(password), salt, 4096)`.
+fn compute_scram_verifier(password: &str) -> Result<(String, String)> {
+    use argon2::password_hash::rand_core::RngCore;
+    use hmac::Hmac;
+    use pbkdf2::pbkdf2;
+    use sha2::Sha256;
+
+    // SASLprep per RFC 4013 — fall back to raw password on error (same as pgwire)
+    let normalized: std::borrow::Cow<str> = stringprep::saslprep(password)
+        .unwrap_or(std::borrow::Cow::Borrowed(password));
+    let pass_bytes = normalized.as_bytes();
+
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let mut salted_password = [0u8; 32];
+    pbkdf2::<Hmac<Sha256>>(pass_bytes, &salt, 4096, &mut salted_password)
+        .map_err(|e| anyhow::anyhow!("PBKDF2 error: {e}"))?;
+
+    Ok((
+        BASE64_STANDARD.encode(salt),
+        BASE64_STANDARD.encode(salted_password),
+    ))
 }
 
 pub(crate) mod catalog_store;
@@ -129,6 +159,12 @@ pub struct CatalogUser {
     pub password_rotated_at_epoch_ms: Option<u128>,
     #[serde(default)]
     pub members: std::collections::BTreeSet<String>,
+    /// Base64-encoded 16-byte random salt for SCRAM-SHA-256 authentication.
+    #[serde(default)]
+    pub scram_salt_b64: Option<String>,
+    /// Base64-encoded `SaltedPassword` = PBKDF2-HMAC-SHA256(SASLprep(password), salt, 4096).
+    #[serde(default)]
+    pub scram_salted_password_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +324,11 @@ pub struct ClusterConfig {
     /// KMS key ARN or alias used when `s3_sse = "aws:kms"`.
     #[serde(default)]
     pub s3_sse_kms_key_id: Option<String>,
+    /// HS256 secret used to sign Flight SQL JWT bearer tokens.
+    /// When absent a random 32-byte key is generated at startup (sessions won't
+    /// survive a server restart).
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
 }
 
 fn default_query_log_enabled() -> bool {
@@ -3519,6 +3560,7 @@ impl ControlPlane {
         }
         // Hash before acquiring the write-lock so the KDF doesn't block DDL writers.
         let hashed = hash_password(password)?;
+        let (scram_salt_b64, scram_salted_password_b64) = compute_scram_verifier(password)?;
         {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
@@ -3538,6 +3580,8 @@ impl ControlPlane {
             user.password = Some(hashed);
             user.password_version += 1;
             user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
+            user.scram_salt_b64 = Some(scram_salt_b64);
+            user.scram_salted_password_b64 = Some(scram_salted_password_b64);
         }
 
         self.persist().await?;
@@ -3561,6 +3605,10 @@ impl ControlPlane {
             .as_deref()
             .map(hash_password)
             .transpose()?;
+        let scram_verifier = password
+            .as_deref()
+            .map(compute_scram_verifier)
+            .transpose()?;
 
         {
             let mut state = self.state.write().await;
@@ -3574,6 +3622,10 @@ impl ControlPlane {
                 bail!("User '{}' already exists", name);
             }
 
+            let (scram_salt_b64, scram_salted_password_b64) = match scram_verifier {
+                Some((s, sp)) => (Some(s), Some(sp)),
+                None => (None, None),
+            };
             let user = CatalogUser {
                 name: name.to_string(),
                 is_admin: false,
@@ -3581,6 +3633,8 @@ impl ControlPlane {
                 password_version: 1,
                 password_rotated_at_epoch_ms: Some(current_epoch_millis()),
                 members: BTreeSet::new(),
+                scram_salt_b64,
+                scram_salted_password_b64,
             };
 
             state.users.insert(name.to_string(), user);
@@ -3647,6 +3701,8 @@ impl ControlPlane {
                 password_version: 1,
                 password_rotated_at_epoch_ms: None,
                 members: BTreeSet::new(),
+                scram_salt_b64: None,
+                scram_salted_password_b64: None,
             };
 
             state.users.insert(name.to_string(), group);
@@ -3755,6 +3811,17 @@ fn bootstrap_state() -> CatalogState {
     );
 
     let mut users = BTreeMap::new();
+
+    // Helper closure: compute SCRAM verifier and return (salt_b64, salted_b64), panicking
+    // only during bootstrap (startup path) which is acceptable.
+    let scram = |pw: &str| -> (Option<String>, Option<String>) {
+        match compute_scram_verifier(pw) {
+            Ok((s, sp)) => (Some(s), Some(sp)),
+            Err(_) => (None, None),
+        }
+    };
+
+    let (pg_scram_salt, pg_scram_sp) = scram("postgres");
     users.insert(
         "postgres".to_string(),
         CatalogUser {
@@ -3764,8 +3831,11 @@ fn bootstrap_state() -> CatalogState {
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
+            scram_salt_b64: pg_scram_salt,
+            scram_salted_password_b64: pg_scram_sp,
         },
     );
+    let (ar_scram_salt, ar_scram_sp) = scram("analytics_reader");
     users.insert(
         "analytics_reader".to_string(),
         CatalogUser {
@@ -3775,8 +3845,11 @@ fn bootstrap_state() -> CatalogState {
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
+            scram_salt_b64: ar_scram_salt,
+            scram_salted_password_b64: ar_scram_sp,
         },
     );
+    let (aa_scram_salt, aa_scram_sp) = scram("analyticsdb_admin");
     users.insert(
         "analyticsdb_admin".to_string(),
         CatalogUser {
@@ -3786,6 +3859,8 @@ fn bootstrap_state() -> CatalogState {
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
+            scram_salt_b64: aa_scram_salt,
+            scram_salted_password_b64: aa_scram_sp,
         },
     );
 
@@ -3806,6 +3881,7 @@ fn bootstrap_state() -> CatalogState {
         cluster_id: None,
         s3_sse: None,
         s3_sse_kms_key_id: None,
+        jwt_secret: None,
     });
 
     CatalogState {
@@ -6322,5 +6398,34 @@ mod tests {
 
             std::fs::remove_dir_all(&dir).ok();
         });
+    }
+
+    /// Verify that `compute_scram_verifier` produces a salt + salted-password
+    /// that reproduces the same value when PBKDF2-HMAC-SHA256 is recomputed
+    /// with the decoded salt.
+    #[test]
+    fn scram_verifier_roundtrip_matches_pbkdf2() {
+        use hmac::Hmac;
+        use pbkdf2::pbkdf2;
+        use sha2::Sha256;
+
+        let password = "hunter2";
+        let (salt_b64, salted_b64) = compute_scram_verifier(password).expect("verifier");
+
+        let salt = BASE64_STANDARD.decode(&salt_b64).expect("decode salt");
+        let stored = BASE64_STANDARD.decode(&salted_b64).expect("decode salted");
+
+        // SASLprep then PBKDF2 — must match what compute_scram_verifier computed.
+        let normalized = stringprep::saslprep(password)
+            .unwrap_or(std::borrow::Cow::Borrowed(password));
+        let mut expected = [0u8; 32];
+        pbkdf2::<Hmac<Sha256>>(normalized.as_bytes(), &salt, 4096, &mut expected)
+            .expect("pbkdf2");
+
+        assert_eq!(stored, expected.as_ref());
+        // Salt should be 16 bytes.
+        assert_eq!(salt.len(), 16);
+        // SaltedPassword should be 32 bytes.
+        assert_eq!(stored.len(), 32);
     }
 }
