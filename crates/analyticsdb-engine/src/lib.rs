@@ -525,6 +525,16 @@ impl PrototypeEngine {
         Arc::clone(&self.control_plane)
     }
 
+    /// Cancels every query that is currently executing on this engine instance.
+    ///
+    /// Called during graceful shutdown so in-flight queries receive an error
+    /// promptly rather than being killed mid-stream by the process exiting.
+    pub fn cancel_all_queries(&self) {
+        for entry in self.active_queries.iter() {
+            entry.value().cancel();
+        }
+    }
+
     /// Executes an `ExecutePartitionRequest` and returns a stream of `RecordBatch`es.
     pub async fn execute_partition_stream(
         &self,

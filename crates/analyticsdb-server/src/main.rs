@@ -416,12 +416,47 @@ async fn run() -> Result<()> {
     println!("\n\x1b[1;32mStartup complete. Ready to accept connections.\x1b[0m");
 
     tokio::select! {
-        _ = flight_handle => {},
-        _ = node_handle => {},
-        _ = pg_handle => {},
+        _ = flight_handle => {
+            warn!("Flight SQL server exited unexpectedly");
+        },
+        _ = node_handle => {
+            warn!("Node communication server exited unexpectedly");
+        },
+        _ = pg_handle => {
+            warn!("PostgreSQL server exited unexpectedly");
+        },
+        _ = shutdown_signal() => {
+            info!("Shutdown signal received — cancelling in-flight queries and stopping");
+            engine.cancel_all_queries();
+        },
     }
 
     Ok(())
+}
+
+/// Resolves when SIGTERM or Ctrl-C (SIGINT) is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("Failed to install SIGTERM handler");
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 #[derive(Parser)]
