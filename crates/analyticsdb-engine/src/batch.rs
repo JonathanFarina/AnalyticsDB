@@ -133,8 +133,9 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
         prepared_batches.push(prepared_batch);
     }
 
-    storage::clear_parquet_files(store, prefix).await?;
-
+    // Write new files first; the manifest update below is the commit point.
+    // Old files remain visible (via the current manifest) until the manifest
+    // is atomically replaced, then vacuum_orphans removes them.
     let mut manifest_entries = Vec::new();
     for prepared_batch in prepared_batches {
         let filename = format!("{}.parquet", uuid::Uuid::now_v7());
@@ -152,7 +153,10 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
             row_count: entry_row_count,
         });
     }
+    // Atomic commit: replace the manifest so new files become visible.
     crate::manifest::replace_manifest(store, prefix, manifest_entries).await?;
+    // Clean up files that are no longer referenced (previous snapshot).
+    crate::manifest::vacuum_orphans(store, prefix).await?;
     Ok(row_count)
 }
 
@@ -212,10 +216,12 @@ pub(crate) async fn persist_empty_table_snapshot(
     prefix: &OPath,
     schema: &SchemaRef,
 ) -> Result<()> {
-    storage::clear_parquet_files(store, prefix).await?;
+    // Write the schema-carrier empty file, commit an empty manifest, then vacuum orphans.
     let key = prefix.clone().join("empty.parquet");
     storage::write_empty_parquet(store, &key, schema).await?;
-    crate::manifest::replace_manifest(store, prefix, Vec::new()).await
+    crate::manifest::replace_manifest(store, prefix, Vec::new()).await?;
+    crate::manifest::vacuum_orphans(store, prefix).await?;
+    Ok(())
 }
 
 pub(crate) fn utf8_record_batch(columns: &[&str], rows: &[Vec<String>]) -> Result<RecordBatch> {

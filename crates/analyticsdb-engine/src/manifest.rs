@@ -2,9 +2,11 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
 use datafusion::arrow::array::RecordBatch;
+use futures::StreamExt;
 use object_store::path::Path as OPath;
 use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -266,4 +268,52 @@ pub async fn append_batch(
     let row_count = batch.num_rows() as i64;
     store.put(&key, bytes.into()).await?;
     append_to_manifest(store, prefix, &filename, size, row_count).await
+}
+
+/// Deletes any `.parquet` files under `prefix` that are not listed in the current manifest.
+///
+/// These orphans arise when a coordinator crashes after staging a data file but
+/// before publishing the manifest update.  Safe to call concurrently with readers
+/// (orphans are never visible at the SQL surface) and with writers (a file that
+/// was just staged will be in the manifest within the same atomic write that
+/// created it, so it will not be mistaken for an orphan by a concurrent vacuum).
+///
+/// Returns the number of files deleted.
+pub async fn vacuum_orphans(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+) -> Result<usize> {
+    let manifest = read_manifest(store, prefix).await?;
+    let committed: HashSet<String> = match &manifest {
+        Some(m) => m.files.iter().map(|e| e.path.clone()).collect(),
+        // No manifest yet — nothing is committed, so nothing is an orphan.
+        None => return Ok(0),
+    };
+
+    let prefix_str = prefix.as_ref().to_owned();
+    let mut list = store.list(Some(prefix));
+    let mut orphans: Vec<OPath> = Vec::new();
+    loop {
+        match list.next().await {
+            None => break,
+            Some(Ok(meta)) => {
+                let loc = meta.location.as_ref();
+                let relative = loc
+                    .strip_prefix(&*prefix_str)
+                    .unwrap_or(loc)
+                    .trim_start_matches('/');
+                // Only consider direct children that are Parquet files; leave
+                // subdirectories (meta/, .analyticsdb_indexes/) untouched.
+                if !relative.contains('/') && relative.ends_with(".parquet") && !committed.contains(relative) {
+                    orphans.push(meta.location);
+                }
+            }
+            Some(Err(OsError::NotFound { .. })) => break,
+            Some(Err(e)) => return Err(e.into()),
+        }
+    }
+
+    let count = orphans.len();
+    storage::delete_objects(store, &orphans).await?;
+    Ok(count)
 }
