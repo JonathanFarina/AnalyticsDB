@@ -356,6 +356,43 @@ async fn run() -> Result<()> {
         );
     }
 
+    // Background heartbeat: this node announces liveness to the control plane
+    // every 10 s so that prune_unhealthy_nodes can identify stale workers.
+    let control_plane_hb = engine.control_plane();
+    let node_id_hb = node_id.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = control_plane_hb.heartbeat(&node_id_hb).await {
+                warn!("Heartbeat failed for node '{}': {}", node_id_hb, e);
+            }
+        }
+    });
+
+    // Background pruner: marks nodes whose heartbeat has gone silent as
+    // Unavailable. Only the node that owns the control plane runs this —
+    // joining compute nodes heartbeat but do not prune.
+    let prune_handle = if cli.join.is_none() {
+        let control_plane_prune = engine.control_plane();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                const DEAD_THRESHOLD_MS: u128 = 45_000;
+                if let Err(e) =
+                    control_plane_prune.prune_unhealthy_nodes(DEAD_THRESHOLD_MS).await
+                {
+                    warn!("Node health pruning failed: {}", e);
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let pg_listener = TcpListener::bind(&pg_addr)
         .await
         .context("Failed to bind PostgreSQL port")?;
@@ -428,6 +465,10 @@ async fn run() -> Result<()> {
         _ = shutdown_signal() => {
             info!("Shutdown signal received — cancelling in-flight queries and stopping");
             engine.cancel_all_queries();
+            heartbeat_handle.abort();
+            if let Some(h) = prune_handle {
+                h.abort();
+            }
         },
     }
 

@@ -1890,6 +1890,17 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             }))));
         }
 
+        if action.r#type == "Heartbeat" {
+            let node_id =
+                std::str::from_utf8(&action.body).map_err(status_from_error)?.to_string();
+            self.engine
+                .control_plane()
+                .heartbeat(&node_id)
+                .await
+                .map_err(status_from_error)?;
+            return Ok(Response::new(Box::pin(stream::empty())));
+        }
+
         Err(Status::unimplemented(format!(
             "Unknown action type: {}",
             action.r#type
