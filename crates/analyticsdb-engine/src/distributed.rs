@@ -146,6 +146,16 @@ pub struct ExecutePartitionWriteRequest {
     pub source_columns: Vec<CatalogColumn>,
     /// Absolute filesystem path prefix under which the worker writes its output files.
     pub write_prefix: String,
+    /// Opaque tag embedded in every output filename for this attempt.
+    ///
+    /// Format: `{query_id}_a{attempt_number}`.  Workers include it as a
+    /// filename prefix so that the coordinator (or a recovery process) can
+    /// identify and delete all staged files for a given attempt by listing
+    /// the prefix and filtering on this tag — useful when the coordinator
+    /// crashes after workers write but before the manifest is updated.
+    /// Empty on old coordinators; workers fall back to a plain UUID filename.
+    #[serde(default)]
+    pub attempt_id: String,
 }
 
 /// Acknowledgment returned by a worker after completing an `ExecutePartitionWrite`.

@@ -598,6 +598,7 @@ impl PrototypeEngine {
                         partition_files: chunk_files,
                         source_columns: source_relation.columns.clone(),
                         write_prefix: target_storage.to_string(),
+                        attempt_id: String::new(), // overwritten by run_distributed_insert
                     };
                     (node, req)
                 })
@@ -664,10 +665,17 @@ impl PrototypeEngine {
             );
             compute_nodes.truncate(optimal_worker_count);
 
-            let worker_tasks = make_tasks(&compute_nodes);
+            let mut worker_tasks = make_tasks(&compute_nodes);
             if worker_tasks.is_empty() {
                 info!("[coordinator] Distributed insert: no work to dispatch.");
                 return Ok(None);
+            }
+
+            // Tag every request with a per-attempt ID so workers embed it in
+            // output filenames, enabling recovery cleanup by prefix scan.
+            let attempt_id = format!("{}_a{}", admission.query_id, attempts);
+            for (_, req) in &mut worker_tasks {
+                req.attempt_id = attempt_id.clone();
             }
 
             // Dispatch all concurrently.
@@ -872,6 +880,7 @@ impl PrototypeEngine {
                         partition_files: Vec::new(),
                         source_columns: Vec::new(),
                         write_prefix: target_storage.to_string(),
+                        attempt_id: String::new(), // overwritten by run_distributed_insert
                     };
                     (node, req)
                 })

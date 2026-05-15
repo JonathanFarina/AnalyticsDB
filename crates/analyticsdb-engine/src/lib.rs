@@ -662,6 +662,15 @@ impl PrototypeEngine {
         let mut current_batch = Vec::new();
         let mut current_rows = 0;
 
+        // Embed the attempt_id in every filename so recovery can identify all
+        // staged files for this attempt by scanning for the prefix, even after
+        // the coordinator crashes before updating the manifest.
+        let file_prefix = if req.attempt_id.is_empty() {
+            String::new()
+        } else {
+            format!("{}__", req.attempt_id)
+        };
+
         for batch in batches {
             let (row_count, prepared) = prepare_batch_for_storage(batch)?;
             if row_count == 0 {
@@ -673,7 +682,7 @@ impl PrototypeEngine {
             total_rows += row_count;
 
             if current_rows >= INSERT_SELECT_PARQUET_ROW_GROUP_SIZE {
-                let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+                let file_name = format!("{}{}.parquet", file_prefix, uuid::Uuid::now_v7());
                 let key = prefix.clone().join(file_name.as_str());
                 let schema = current_batch[0].schema();
                 storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
@@ -684,7 +693,7 @@ impl PrototypeEngine {
         }
 
         if !current_batch.is_empty() {
-            let file_name = format!("{}.parquet", uuid::Uuid::now_v7());
+            let file_name = format!("{}{}.parquet", file_prefix, uuid::Uuid::now_v7());
             let key = prefix.clone().join(file_name.as_str());
             let schema = current_batch[0].schema();
             storage::write_parquet_batches(&store, &key, schema, &current_batch).await?;
@@ -2519,6 +2528,7 @@ FROM generate_series(1, 10) AS s(n)";
             partition_files: src_files,
             source_columns: src_relation.columns.clone(),
             write_prefix,
+            attempt_id: "write-test-1_a1".to_string(),
         };
 
         let ack = engine
