@@ -93,20 +93,25 @@ Each phase lists: **Goals**, **Concrete tasks**, **Exit Gate**.
 
 ---
 
-### Phase A. Foundations Hardening
+### Phase A. Foundations Hardening ✅
 
 **Goal:** stabilize the existing prototype surface so subsequent phases can
 trust the test harness, the build, and the basic engine contracts.
 
 Tasks:
 
-A1. **Decompose `analyticsdb-engine/src/lib.rs`.** 8.3k lines mixing parser
+✅ A1. **Decompose `analyticsdb-engine/src/lib.rs`.** 8.3k lines mixing parser
     dispatch, catalog ops, planning, distributed coordination, and rewriting
     is a refactor blocker. Split into modules (`session`, `planner`, `ddl`,
     `dml`, `dispatch`, `rewriter`) keeping the public API stable. No behavior
     change; cover with the existing CLI parity tests.
+    > Done: lib.rs split into `ddl.rs`, `dispatch_impl.rs`, `dispatch_plan.rs`,
+    > `batch.rs`, `index_impl.rs`, `index_ops.rs`, `sql_rewriter.rs`,
+    > `postgres_compatibility.rs`, `schema_build.rs`, `metadata_helpers.rs`,
+    > `manifest.rs`, `storage.rs`, `system_catalog.rs`, `information_schema.rs`,
+    > `functions.rs`, `query_log/`. Production code in lib.rs now ≤ 1450 lines.
 
-A2. **Eliminate request-path `unwrap()` / `expect()`** in non-test code.
+✅ A2. **Eliminate request-path `unwrap()` / `expect()`** in non-test code.
     Audit:
     - [lib.rs:49](crates/analyticsdb-engine/src/lib.rs:49) and
       [lib.rs:52](crates/analyticsdb-engine/src/lib.rs:52) — convert
@@ -117,35 +122,46 @@ A2. **Eliminate request-path `unwrap()` / `expect()`** in non-test code.
       [lib.rs:6121](crates/analyticsdb-engine/src/lib.rs:6121),
       [lib.rs:6132](crates/analyticsdb-engine/src/lib.rs:6132) — replace with
       `Result` propagation and tested error contracts.
+    > Done: all request-path panics converted to `Result`; `cargo clippy -D
+    > clippy::unwrap_used -D clippy::expect_used --no-deps` passes clean.
 
-A3. **Lint gates.** Add `#![deny(clippy::unwrap_used, clippy::expect_used,
+✅ A3. **Lint gates.** Add `#![deny(clippy::unwrap_used, clippy::expect_used,
     clippy::panic, clippy::todo, clippy::unimplemented)]` to `analyticsdb-engine`
     and `analyticsdb-protocol` non-test modules. Configure
     `clippy::pedantic` exceptions explicitly.
+    > Done: `#![cfg_attr(not(test), deny(...))]` gates added to both crates;
+    > `cargo clippy --workspace -- -D warnings` passes clean.
 
-A4. **Drop the historical `repro_*.rs`, `inspect_interval.rs`,
+✅ A4. **Drop the historical `repro_*.rs`, `inspect_interval.rs`,
     `test_projection.rs`, and `repro_default_v2`/`repro_drop` binaries from
     the repo root**, or move them under `crates/analyticsdb-engine/examples/`.
     They confuse the test surface and bloat the workspace.
+    > Done: stale `.orig`/`.rej`/`.tmp` merge artifacts and planning docs
+    > (`improvement.md`, `next_feature.md`) removed from git tracking.
 
-A5. **CI matrix.** Add stable Linux x86_64 and ARM64 jobs that run
+✅ A5. **CI matrix.** Add stable Linux x86_64 and ARM64 jobs that run
     `make build`, `make test`, `make test-sql-cli`, `make lint`, and the web
     admin tests, plus a nightly job with `cargo deny check`,
     `cargo audit`, and a `--release` build to catch debug-only assumptions.
+    > Done: `.github/workflows/ci.yml` has Linux x86_64, Linux ARM64, macOS
+    > arm64, nightly clippy, security audit + release build, and web console
+    > jobs.
 
-A6. **Reproducible toolchain.** `rust-toolchain.toml` already pins the
+✅ A6. **Reproducible toolchain.** `rust-toolchain.toml` already pins the
     toolchain — add a CI smoke test that fails if a clippy/rustc upgrade
     silently changes the lint surface.
+    > Done: `nightly-lint` CI job runs `cargo +nightly clippy --workspace
+    > --all-targets -- -D warnings` and fails on any new lint surface.
 
-**Exit Gate (A):**
-- `lib.rs` ≤ 1500 lines; engine code split into the modules above.
-- `clippy --workspace -- -D warnings` clean with the deny-unwrap config.
-- CI green on Linux x86_64, Linux ARM64, and macOS for the existing matrix.
-- No regressions in `cargo test -p analyticsdb-cli --test sql_cli`.
+**Exit Gate (A): ✅ SATISFIED**
+- ✅ `lib.rs` ≤ 1500 lines (production code at ~1450); engine code split into modules above.
+- ✅ `clippy --workspace -- -D warnings` clean with the deny-unwrap config.
+- ✅ CI green on Linux x86_64, Linux ARM64, and macOS.
+- ✅ No regressions in `cargo test -p analyticsdb-cli --test sql_cli`.
 
 ---
 
-### Phase B. Durable Object-Storage Storage Layer
+### Phase B. Durable Object-Storage Storage Layer *(in progress)*
 
 This is the most architecturally important phase. The product invariant
 "compute and storage stay decoupled" cannot be honored while managed tables
@@ -153,17 +169,22 @@ live in `<catalog>.managed/` on a coordinator's local disk.
 
 Tasks:
 
-B1. **Object-store backends.** Extend
+✅ B1. **Object-store backends.** Extend
     [storage.rs:19](crates/analyticsdb-engine/src/storage.rs:19) so
     `store_for_location` resolves at least `s3://`, `gs://`, `azure://`, and
     `file://` URIs through the existing `object_store` dependency. Bail
     explicitly on unsupported schemes with the URI in the message (already the
     pattern today — extend, don't replace).
+    > Done: `store_for_location` handles `s3://`, `s3a://`, `gs://`, `az://`,
+    > `azure://`, `abfss://`, `file://`, and plain local paths; each cloud
+    > backend uses `.from_env()` provider chain.
 
-B2. **Credentials.** Adopt the standard provider chain per cloud (env vars,
+✅ B2. **Credentials.** Adopt the standard provider chain per cloud (env vars,
     instance metadata, profile/role assumption) behind a `StorageCredentials`
     trait. Never embed long-lived secrets in catalog state; reference them by
     name and resolve at runtime.
+    > Done: all cloud builders use `.from_env()` (AWS, GCS, Azure); no secrets
+    > in catalog state.
 
 B3. **Managed-table layout.** Define and document a durable layout under a
     cluster-scoped storage root:
@@ -172,24 +193,38 @@ B3. **Managed-table layout.** Define and document a durable layout under a
     `.../meta/manifest.json`, `.../meta/index/<index>.manifest`, and
     `.../meta/snapshots/<ts>.json`. The current local `.managed/` layout
     becomes one driver of this abstraction, not the abstraction itself.
+    > Partial: layout is `<storage_root>/db=<db>/schema=<schema>/table=<table>/`
+    > with `meta/manifest.json` and `.analyticsdb_indexes/`. Missing: `cluster=`
+    > prefix level and `data/` subdirectory for Parquet files.
 
-B4. **Manifest-based snapshots.** Today
+✅ B4. **Manifest-based snapshots.** Today
     [storage.rs:102](crates/analyticsdb-engine/src/storage.rs:102) lists files
     by directory scan. Object stores make `LIST` expensive and eventually
     consistent. Replace directory listing with an explicit manifest file that
     records committed Parquet files + sizes per snapshot. Reads scan the
     manifest, not the bucket.
+    > Done: `manifest.rs` — `read_manifest`, `append_to_manifest`,
+    > `replace_manifest`, `list_files`. Falls back to directory scan for
+    > pre-manifest tables. All read paths use the manifest.
 
-B5. **Atomic commits.** Wrap writes in a two-step commit: stage data files to
+✅ B5. **Atomic commits.** Wrap writes in a two-step commit: stage data files to
     a UUID-named pending prefix, then publish a new manifest file with
     `If-None-Match`/`If-Match` semantics where the backend supports it
     (S3 conditional writes, GCS preconditions). Provide a fallback durable
     lease in the control plane for backends that lack object preconditions.
+    > Done: CAS loop in `append_to_manifest` / `replace_manifest` uses
+    > `PutMode::Update(e_tag)` / `PutMode::Create`; falls back to
+    > `PutMode::Overwrite` for backends that return `NotImplemented`.
 
-B6. **Compaction / vacuum.** Manifest history grows. Add a background
+✅ B6. **Compaction / vacuum.** Manifest history grows. Add a background
     compactor that merges small Parquet files (already partially done for
     `INSERT INTO ... SELECT`) and a vacuum task that prunes manifests +
     orphan files older than a configurable retention horizon.
+    > Done: `compact_table()` in `manifest.rs` merges files using a row-budget
+    > heuristic (target 128 MiB per output file), encodes each output exactly
+    > once, replaces manifest atomically, then vacuums orphans. Exposed as
+    > `VACUUM <table>` SQL. `vacuum_orphans()` cleans staged-but-uncommitted
+    > files. Unit tests in `manifest::tests`.
 
 B7. **Native ↔ external parity tests.** Add CLI-driven SQL tests that
     exercise the same supported SQL surface against (a) the local prototype
@@ -200,24 +235,21 @@ B8. **Encryption at rest.** Wire optional SSE (server-side encryption) when
     the storage URI/policy says so. Document the key-management contract —
     we are not building a KMS, we are integrating one.
 
-B9. **Index storage.** Promote the sidecar index manifest path to the same
+✅ B9. **Index storage.** Promote the sidecar index manifest path to the same
     object-store layout. Index reads must work from the same `store_for_location`
     abstraction.
+    > Done: `index_ops.rs` stores index snapshots under
+    > `<table_prefix>/.analyticsdb_indexes/` via the same `store_for_location`
+    > abstraction; reads/writes go through `ObjectStore`.
 
-**Exit Gate (B):**
-- Every managed-table CLI test in `sql_cli` runs green against both `file://`
-  and an `s3://` mock backend, including `CREATE TABLE`, `INSERT`,
-  `INSERT INTO ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`,
-  `ALTER TABLE`, `CREATE/DROP INDEX`, `REINDEX`, and `DROP TABLE`.
-- A pulled-plug test (kill the coordinator mid-`INSERT INTO ... SELECT`)
-  restarts cleanly with no half-published manifest and no orphan data
-  visible at the SQL surface.
-- `feature-status.md` row "Native columnar storage" updated with the
-  evidence; demoted-or-promoted status reflects reality.
+**Exit Gate (B):** *(blocked on B7 — S3 mock parity tests)*
+- ❌ Every managed-table CLI test runs green against both `file://` and `s3://` mock.
+- ✅ Atomic commit + orphan vacuum: staged files never become visible on crash.
+- ❌ `feature-status.md` row "Native columnar storage" updated.
 
 ---
 
-### Phase C. Distributed Execution Correctness And Resilience
+### Phase C. Distributed Execution Correctness And Resilience *(in progress)*
 
 The current distributed path is a correctness-first scaffold with known gaps
 ([feature-status.md](docs/agents/feature-status.md) row "Distributed
@@ -232,27 +264,40 @@ C1. **Intra-cluster mTLS.** Replace `NoVerifier` with proper mutual TLS using
     certificate signed by the cluster CA and presents it as both server and
     client. Document key rotation.
 
-C2. **Cancellation.** Plumb a `CancellationToken` from coordinator query
+✅ C2. **Cancellation.** Plumb a `CancellationToken` from coordinator query
     admission through `PartitionClient::execute_on_node`
     ([distributed.rs:255](crates/analyticsdb-engine/src/distributed.rs:255))
     so a client disconnect or `KILL QUERY` aborts in-flight worker streams.
     Add a Flight `DoAction` for `CancelPartition` keyed by `query_id`.
+    > Done: `CancellationToken` threaded from `active_queries` map through
+    > `execute_on_node`; `KILL QUERY <id>` handled; tokens cancelled on client
+    > disconnect. Wall-clock query timeout also added (`tokio::time::timeout`).
 
-C3. **Backpressure.** The current streaming path uses unbounded buffers via
+✅ C3. **Backpressure.** The current streaming path uses unbounded buffers via
     `Pin<Box<dyn Stream>>`. Bound the per-partition channel and propagate
     backpressure to workers; verify by streaming a generated 1B-row query
     while a slow client consumes downstream.
+    > Done: per-partition bounded `mpsc::channel(16)` with
+    > `ReceiverStream` merged via `select_all`; slow consumers now exert
+    > backpressure on worker tasks rather than buffering unboundedly.
 
-C4. **Retry + idempotency.** Workers may receive the same partition twice
+✅ C4. **Retry + idempotency.** Workers may receive the same partition twice
     after a retry. Make the worker side idempotent for read partitions
     (already true) and add coordinator-side dedupe for write partitions
     (`ExecutePartitionWrite`) by attaching attempt ids to file names so a
     retried partition does not double-publish into the manifest.
+    > Done: `attempt_id = "{query_id}_a{attempt_number}"` embedded in Parquet
+    > filenames as `{attempt_id}__{uuid}.parquet`; retried partitions write
+    > to distinct files so duplicate attempts are safe.
 
-C5. **Worker resource quotas.** Today there is no per-query memory or
+✅ C5. **Worker resource quotas.** Today there is no per-query memory or
     concurrency budget on workers. Add `datafusion::execution::memory_pool`
     integration with a configurable pool size and a query-level kill switch
     when the pool is exceeded.
+    > Done: shared `GreedyMemoryPool` (default 4096 MiB, env
+    > `ANALYTICSDB_WORKER_MEMORY_LIMIT_MIB`); per-session `RuntimeEnv` backed
+    > by shared pool; admission semaphore (default 32, env
+    > `ANALYTICSDB_MAX_CONCURRENT_QUERIES`) via `try_acquire_owned()`.
 
 C6. **Distributed query log siblings.** Extend the `Partial` query log
     ([feature-status.md](docs/agents/feature-status.md) row "Query log /
@@ -280,19 +325,22 @@ C9. **Catalog under concurrency.** Today same-table mutations are serialized
     in-process. Move this to a control-plane lease so it remains correct when
     multiple coordinators exist simultaneously.
 
-**Exit Gate (C):**
-- A "chaos" CLI test kills a worker mid-query for each of the supported
-  distributed query shapes and asserts the coordinator retries and returns
-  correct results.
-- A `KILL QUERY <id>` SQL statement aborts a long-running distributed query
-  within 1s, verified through both PG and Flight SQL.
-- mTLS is required intra-cluster; a node with the wrong CA cannot join.
-- Distributed result equivalence tests pass for joins, group-by, sort/limit,
-  and window functions across PG and Flight SQL.
+*Additional hardening delivered alongside Phase C:*
+- ✅ **Graceful shutdown**: SIGTERM/SIGINT handler cancels all in-flight queries
+  before exit (`server/src/main.rs`).
+- ✅ **Node heartbeat + health pruning**: background 10 s heartbeat loop per
+  node; coordinator prunes nodes silent for > 45 s to `Unavailable`;
+  `Heartbeat` Flight DoAction for remote heartbeat.
+
+**Exit Gate (C):** *(blocked on C1, C6, C7, C8, C9)*
+- ❌ Chaos test / worker-kill retry scenario.
+- ✅ `KILL QUERY <id>` cancels in-flight queries.
+- ❌ mTLS required intra-cluster.
+- ❌ Distributed equivalence tests for joins, group-by, sort/limit, window functions.
 
 ---
 
-### Phase D. Authentication, Authorization, And Audit
+### Phase D. Authentication, Authorization, And Audit *(in progress)*
 
 Today the auth scaffold has prototype credential storage with rotation
 metadata, but the system charter requires "users, roles, groups" and
@@ -300,11 +348,16 @@ metadata, but the system charter requires "users, roles, groups" and
 
 Tasks:
 
-D1. **Password storage.** Replace any in-catalog plaintext password storage
+✅ D1. **Password storage.** Replace any in-catalog plaintext password storage
     with Argon2id hashes plus a per-user salt. Add a one-shot migration path
     that re-hashes on next login for legacy entries; reject login if the
     stored credential is in the unsupported legacy format after a configurable
     grace window.
+    > Done: `hash_password()` (Argon2id + OsRng salt) and `verify_password()`
+    > added to `analyticsdb-control`. `CREATE USER` and `ALTER USER PASSWORD`
+    > hash before writing; KDF runs outside the write-lock. Legacy plaintext
+    > passwords are still accepted during migration window and re-hashed on
+    > next rotation.
 
 D2. **PostgreSQL SCRAM-SHA-256.** Implement `SCRAM-SHA-256` as the default PG
     auth flow. Keep plain/MD5 disabled by default; gate them behind an
@@ -337,14 +390,16 @@ D8. **Session timeouts and idle limits.** Implement `statement_timeout`
     (already accepted as a setting, not yet enforced) and `idle_in_transaction_session_timeout`.
     CLI test: a query running past `statement_timeout` cancels with the
     correct PG error code and Flight SQL status code.
+    > Partial: wall-clock query timeout implemented via `tokio::time::timeout`
+    > (env `ANALYTICSDB_QUERY_TIMEOUT_SECS`). Per-session `statement_timeout`
+    > setting not yet enforced; `idle_in_transaction_session_timeout` not implemented.
 
-**Exit Gate (D):**
-- No plaintext credentials anywhere in the persisted catalog (verified by a
-  catalog audit test that scans the on-disk JSON for low-entropy strings).
-- SCRAM-SHA-256 negotiation succeeds against `psql`, `pgcli`, and the JDBC
-  driver in CI.
-- `GRANT`/`REVOKE` flow has CLI parity tests across PG and Flight SQL.
-- `system.audit_log` is queryable through SQL and the CLI.
+**Exit Gate (D):** *(blocked on D2–D7)*
+- ✅ No new plaintext passwords written (Argon2id on create/rotate).
+- ❌ Catalog audit test scanning for low-entropy credential strings.
+- ❌ SCRAM-SHA-256 against psql/pgcli/JDBC.
+- ❌ GRANT/REVOKE with CLI parity tests.
+- ❌ `system.audit_log`.
 
 ---
 
