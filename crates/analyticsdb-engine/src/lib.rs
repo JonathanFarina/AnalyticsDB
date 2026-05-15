@@ -283,6 +283,12 @@ pub struct PrototypeEngine {
     file_list_cache: Arc<FileListCache>,
     query_log: Arc<QueryLog>,
     active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Limits the number of queries that can execute concurrently on this node.
+    ///
+    /// Controlled by `ANALYTICSDB_MAX_CONCURRENT_QUERIES` (default: 32).
+    /// Callers that exceed the limit receive an error immediately so they can
+    /// retry or queue on the client side rather than blocking indefinitely.
+    query_semaphore: Arc<tokio::sync::Semaphore>,
     /// Shared memory pool used by all DataFusion session contexts.
     ///
     /// Each session gets its own `RuntimeEnv` (so CacheManager and
@@ -315,6 +321,7 @@ impl Clone for PrototypeEngine {
             file_list_cache: Arc::clone(&self.file_list_cache),
             query_log: Arc::clone(&self.query_log),
             active_queries: Arc::clone(&self.active_queries),
+            query_semaphore: Arc::clone(&self.query_semaphore),
             memory_pool: Arc::clone(&self.memory_pool),
         }
     }
@@ -425,14 +432,17 @@ fn command_outcome(tag: impl Into<String>, rows_affected: u64) -> StatementOutco
 
 /// RAII guard that removes a query's `CancellationToken` from the active-query registry
 /// when the guard is dropped (i.e., when the query completes or returns an error).
+/// Also holds the semaphore permit so the concurrency slot is released on drop.
 struct QueryGuard {
     query_id: String,
     active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for QueryGuard {
     fn drop(&mut self) {
         self.active_queries.remove(&self.query_id);
+        // _permit is dropped here, releasing the semaphore slot.
     }
 }
 
@@ -458,6 +468,14 @@ impl PrototypeEngine {
         Arc::new(GreedyMemoryPool::new(limit_bytes))
     }
 
+    fn build_query_semaphore() -> Arc<tokio::sync::Semaphore> {
+        let max: usize = std::env::var("ANALYTICSDB_MAX_CONCURRENT_QUERIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        Arc::new(tokio::sync::Semaphore::new(max))
+    }
+
     pub fn new() -> Result<Self> {
         let control_plane = Arc::new(ControlPlane::new_bootstrap());
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
@@ -471,6 +489,7 @@ impl PrototypeEngine {
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::disabled()),
             active_queries: Arc::new(dashmap::DashMap::new()),
+            query_semaphore: Self::build_query_semaphore(),
             memory_pool: Self::build_memory_pool(),
         })
     }
@@ -497,6 +516,7 @@ impl PrototypeEngine {
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
             active_queries: Arc::new(dashmap::DashMap::new()),
+            query_semaphore: Self::build_query_semaphore(),
             memory_pool: Self::build_memory_pool(),
         })
     }
@@ -805,6 +825,18 @@ impl PrototypeEngine {
         let original_sql = request.sql.clone();
         let (request, admission, started) = self.prepare_query_request(request).await?;
 
+        // Acquire a concurrency slot.  Returns immediately (non-blocking) so
+        // clients get a fast error when the node is saturated rather than queuing
+        // indefinitely and eventually timing out.
+        let permit = Arc::clone(&self.query_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Server is at maximum query concurrency ({} active); try again later",
+                    self.query_semaphore.available_permits() == 0
+                )
+            })?;
+
         // Register a CancellationToken for this query so KILL QUERY can cancel it.
         let token = tokio_util::sync::CancellationToken::new();
         let query_id = request
@@ -815,6 +847,7 @@ impl PrototypeEngine {
         let _guard = QueryGuard {
             query_id: query_id.clone(),
             active_queries: Arc::clone(&self.active_queries),
+            _permit: permit,
         };
 
         let probe = self
