@@ -128,6 +128,8 @@ use datafusion::physical_plan::RecordBatchStream;
 use datafusion::prelude::{
     col, lit, ParquetReadOptions, SessionConfig, SessionContext as DfSessionContext,
 };
+use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -281,6 +283,14 @@ pub struct PrototypeEngine {
     file_list_cache: Arc<FileListCache>,
     query_log: Arc<QueryLog>,
     active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Shared memory pool used by all DataFusion session contexts.
+    ///
+    /// Each session gets its own `RuntimeEnv` (so CacheManager and
+    /// ObjectStoreRegistry are not shared), but they all draw from this single
+    /// pool so that the total memory used by concurrent queries is bounded.
+    /// Pool size is controlled by `ANALYTICSDB_WORKER_MEMORY_LIMIT_MIB`
+    /// (default 4096 MiB).
+    memory_pool: Arc<dyn MemoryPool>,
 }
 
 impl std::fmt::Debug for PrototypeEngine {
@@ -305,6 +315,7 @@ impl Clone for PrototypeEngine {
             file_list_cache: Arc::clone(&self.file_list_cache),
             query_log: Arc::clone(&self.query_log),
             active_queries: Arc::clone(&self.active_queries),
+            memory_pool: Arc::clone(&self.memory_pool),
         }
     }
 }
@@ -434,6 +445,19 @@ impl PrototypeEngine {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Builds the shared memory pool that all DataFusion session contexts draw from.
+    ///
+    /// Pool size in MiB is read from `ANALYTICSDB_WORKER_MEMORY_LIMIT_MIB`
+    /// (default: 4096 MiB / 4 GiB).
+    fn build_memory_pool() -> Arc<dyn MemoryPool> {
+        let limit_mib: usize = std::env::var("ANALYTICSDB_WORKER_MEMORY_LIMIT_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let limit_bytes = limit_mib.saturating_mul(1024 * 1024);
+        Arc::new(GreedyMemoryPool::new(limit_bytes))
+    }
+
     pub fn new() -> Result<Self> {
         let control_plane = Arc::new(ControlPlane::new_bootstrap());
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
@@ -447,6 +471,7 @@ impl PrototypeEngine {
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::disabled()),
             active_queries: Arc::new(dashmap::DashMap::new()),
+            memory_pool: Self::build_memory_pool(),
         })
     }
 
@@ -472,6 +497,7 @@ impl PrototypeEngine {
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
             active_queries: Arc::new(dashmap::DashMap::new()),
+            memory_pool: Self::build_memory_pool(),
         })
     }
 
@@ -1303,7 +1329,15 @@ impl PrototypeEngine {
         let config = base_session_config()
             .with_default_catalog_and_schema(&session.database, &session.schema);
 
-        let ctx = DfSessionContext::new_with_config(config);
+        // Build a per-session RuntimeEnv backed by the shared memory pool so
+        // that each session has its own CacheManager and ObjectStoreRegistry
+        // (avoiding cross-session state pollution) while still drawing from the
+        // same pool limit that bounds total memory across all concurrent queries.
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&self.memory_pool))
+            .build()
+            .map_err(|e| anyhow::anyhow!("RuntimeEnv build failed: {}", e))?;
+        let ctx = DfSessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
         let databases = self
             .control_plane
