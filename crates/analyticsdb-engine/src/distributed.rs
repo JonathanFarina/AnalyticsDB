@@ -612,6 +612,7 @@ mod tests {
             cluster_id: None,
             s3_sse: None,
             s3_sse_kms_key_id: None,
+            jwt_secret: None,
         };
         // No paths — None
         assert!(load_mtls_config_from_cluster_config(&config).is_none());

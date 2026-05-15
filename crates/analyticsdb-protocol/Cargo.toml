@@ -27,6 +27,8 @@ tracing.workspace = true
 uuid.workspace = true
 async-stream.workspace = true
 bincode.workspace = true
+jsonwebtoken.workspace = true
+rand = "0.9"
 
 [dev-dependencies]
 tokio-postgres.workspace = true

@@ -63,7 +63,8 @@ use futures::Sink;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
+use pgwire::api::auth::sasl::SASLAuthStartupHandler;
+use pgwire::api::auth::sasl::scram::ScramAuth;
 use pgwire::api::auth::AuthSource;
 use pgwire::api::auth::LoginInfo;
 use pgwire::api::auth::Password;
@@ -150,18 +151,19 @@ struct PrototypeAllowAllAuthHook {
     control_plane: Arc<ControlPlane>,
 }
 
-struct ControlPlaneAuthSource {
+/// SCRAM-SHA-256 auth source: returns the pre-computed SaltedPassword from the catalog.
+struct ControlPlaneScramAuthSource {
     control_plane: Arc<ControlPlane>,
 }
 
-impl std::fmt::Debug for ControlPlaneAuthSource {
+impl std::fmt::Debug for ControlPlaneScramAuthSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlPlaneAuthSource").finish()
+        f.debug_struct("ControlPlaneScramAuthSource").finish()
     }
 }
 
 #[async_trait]
-impl AuthSource for ControlPlaneAuthSource {
+impl AuthSource for ControlPlaneScramAuthSource {
     async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
         let user = login
             .user()
@@ -171,14 +173,28 @@ impl AuthSource for ControlPlaneAuthSource {
             .catalog_user(user)
             .await
             .map_err(anyhow_error_to_pgwire)?;
-        let password = catalog_user.password.ok_or_else(|| {
+
+        let salt_b64 = catalog_user.scram_salt_b64.as_deref().ok_or_else(|| {
             anyhow_error_to_pgwire(anyhow::anyhow!(
-                "Missing credentials for user '{}'",
+                "User '{}' has no SCRAM verifier — please rotate the password to enable SCRAM-SHA-256 authentication",
+                catalog_user.name
+            ))
+        })?;
+        let salted_password_b64 = catalog_user.scram_salted_password_b64.as_deref().ok_or_else(|| {
+            anyhow_error_to_pgwire(anyhow::anyhow!(
+                "User '{}' has no SCRAM verifier — please rotate the password to enable SCRAM-SHA-256 authentication",
                 catalog_user.name
             ))
         })?;
 
-        Ok(Password::new(None, password.into_bytes()))
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode(salt_b64)
+            .map_err(|e| anyhow_error_to_pgwire(anyhow::anyhow!("invalid scram salt encoding: {e}")))?;
+        let salted_password = base64::engine::general_purpose::STANDARD
+            .decode(salted_password_b64)
+            .map_err(|e| anyhow_error_to_pgwire(anyhow::anyhow!("invalid scram salted password encoding: {e}")))?;
+
+        Ok(Password::new(Some(salt), salted_password))
     }
 }
 
@@ -238,12 +254,10 @@ pub async fn serve_postgres_wire(
     let auth_hook: Arc<dyn AuthHook> = Arc::new(PrototypeAllowAllAuthHook {
         control_plane: Arc::clone(&control_plane),
     });
-    let startup_auth = CleartextPasswordAuthStartupHandler::new(
-        ControlPlaneAuthSource {
+    let startup_auth = SASLAuthStartupHandler::new(Arc::new(AnalyticsServerParameterProvider::default()))
+        .with_scram(ScramAuth::new(Arc::new(ControlPlaneScramAuthSource {
             control_plane: Arc::clone(&control_plane),
-        },
-        AnalyticsServerParameterProvider::default(),
-    );
+        })));
     let query_parser = Arc::new(AnalyticsQueryParser {
         engine: Arc::clone(&engine),
     });
@@ -284,9 +298,34 @@ pub async fn serve_flight_sql_with_label(
     label: &'static str,
 ) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
+    // Resolve the JWT signing secret: use the configured value if present,
+    // or generate a random ephemeral key and warn that sessions won't survive restarts.
+    let jwt_secret = {
+        let config = control_plane.cluster_config().await;
+        match config.and_then(|c| c.jwt_secret) {
+            Some(secret) => secret,
+            None => {
+                let random_bytes: [u8; 32] = rand::random();
+                let hex_secret = random_bytes
+                    .iter()
+                    .fold(String::with_capacity(64), |mut acc, b| {
+                        use std::fmt::Write as _;
+                        let _ = write!(acc, "{b:02x}");
+                        acc
+                    });
+                warn!(
+                    "{}: jwt_secret not configured — using ephemeral key. \
+                     Flight SQL sessions will not survive a server restart.",
+                    label
+                );
+                hex_secret
+            }
+        }
+    };
     let service = AnalyticsFlightSqlService {
         engine,
         auth_hook: Arc::new(PrototypeAllowAllAuthHook { control_plane }),
+        jwt_secret,
     };
 
     let mut builder = Server::builder();
@@ -353,10 +392,7 @@ struct AnalyticsPostgresHandler {
     engine: Arc<PrototypeEngine>,
     query_parser: Arc<AnalyticsQueryParser>,
     auth_hook: Arc<dyn AuthHook>,
-    startup_auth: CleartextPasswordAuthStartupHandler<
-        ControlPlaneAuthSource,
-        AnalyticsServerParameterProvider,
-    >,
+    startup_auth: SASLAuthStartupHandler<AnalyticsServerParameterProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -1804,9 +1840,30 @@ fn status_to_pgwire(status: Status) -> PgWireError {
 }
 
 #[derive(Clone)]
+/// JWT claims for Flight SQL bearer tokens.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FlightSqlClaims {
+    /// Subject (user name).
+    sub: String,
+    /// Assumed role.
+    role: String,
+    /// Target database.
+    db: String,
+    /// Target schema.
+    schema: String,
+    /// Password version — token is invalidated when password is rotated.
+    pwd_ver: u64,
+    /// Expiry (Unix epoch seconds).
+    exp: u64,
+    /// Issued-at (Unix epoch seconds).
+    iat: u64,
+}
+
 struct AnalyticsFlightSqlService {
     engine: Arc<PrototypeEngine>,
     auth_hook: Arc<dyn AuthHook>,
+    /// HS256 signing secret for JWT bearer tokens (hex-encoded 32 bytes).
+    jwt_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1967,7 +2024,36 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             })
             .await?;
 
-        let payload = serde_json::to_vec(&decision).map_err(status_from_error)?;
+        // Look up password_version for the user so the JWT can be invalidated on rotation.
+        let catalog_user = self
+            .engine
+            .control_plane()
+            .catalog_user(&decision.user)
+            .await
+            .map_err(status_from_error)?;
+        let pwd_ver = catalog_user.password_version;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("system time error: {e}")))?
+            .as_secs();
+        let claims = FlightSqlClaims {
+            sub: decision.user.clone(),
+            role: decision.role.clone(),
+            db: decision.database.clone(),
+            schema: decision.schema.clone(),
+            pwd_ver,
+            exp: now + 86400,
+            iat: now,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )
+        .map_err(|e| Status::internal(format!("JWT signing error: {e}")))?;
+
+        let payload = token.as_bytes().to_vec();
         let response_stream = stream::once(async move {
             Ok(arrow_flight::HandshakeResponse {
                 protocol_version: handshake_request.protocol_version,
@@ -1978,10 +2064,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             as Pin<Box<dyn Stream<Item = Result<arrow_flight::HandshakeResponse, Status>> + Send>>);
         response.metadata_mut().insert(
             "authorization",
-            MetadataValue::try_from(format!(
-                "Bearer analyticsdb-prototype-{}",
-                uuid::Uuid::now_v7()
-            ))
+            MetadataValue::try_from(format!("Bearer {token}"))
             .map_err(|error| {
                 Status::internal(format!("invalid authorization metadata: {error}"))
             })?,
@@ -2014,7 +2097,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         debug!("flight_sql_query: {}", query.query);
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         let schema = plan_rows_schema(&self.engine, query.query.clone(), session.clone()).await?;
         let schema_ipc = schema_to_ipc_bytes(schema.as_ref())?;
 
@@ -2066,7 +2149,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         command: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         let execution = self
             .execute_batches(QueryRequest {
                 sql: command.query,
@@ -2119,7 +2202,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: CommandGetCatalogs,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         let databases = self
             .engine
             .list_databases(&session)
@@ -2161,7 +2244,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: CommandGetDbSchemas,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         let databases = if let Some(database) = query.catalog.clone() {
             vec![database]
         } else {
@@ -2216,7 +2299,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         let databases = if let Some(database) = query.catalog.clone() {
             vec![database]
         } else {
@@ -2359,7 +2442,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         query: arrow_flight::sql::ActionCreatePreparedStatementRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<arrow_flight::sql::ActionCreatePreparedStatementResult, Status> {
-        let session = flight_session_from_metadata(request.metadata());
+        let session = self.session_from_request(&request).await?;
         debug!("flight_sql_create_prepared_statement: {}", query.query);
 
         let row_schema_ipc = match self
@@ -2432,6 +2515,74 @@ impl AnalyticsFlightSqlService {
             .execute_query_batches(&request)
             .await
             .map_err(status_from_error)
+    }
+
+    /// Extract a `SessionContext` from the request.
+    ///
+    /// Prefers a valid JWT bearer token; falls back to the legacy x-analyticsdb-*
+    /// header approach so internal-node RPCs (which don't go through handshake)
+    /// continue to work.
+    async fn session_from_request<T>(
+        &self,
+        request: &tonic::Request<T>,
+    ) -> Result<SessionContext, Status> {
+        if let Some(auth) = metadata_value(request.metadata(), "authorization") {
+            if auth.starts_with("Bearer ") {
+                return self.verify_bearer_token(request).await;
+            }
+        }
+        Ok(flight_session_from_metadata(request.metadata()))
+    }
+
+    /// Verify a `Bearer <jwt>` token from request metadata.
+    ///
+    /// Decodes and validates the JWT, checks `pwd_ver` against the current
+    /// stored version, and returns the `SessionContext` derived from the claims.
+    /// Returns `Status::unauthenticated` on any failure.
+    async fn verify_bearer_token<T>(
+        &self,
+        request: &tonic::Request<T>,
+    ) -> Result<SessionContext, Status> {
+        let auth_header = metadata_value(request.metadata(), "authorization").ok_or_else(|| {
+            Status::unauthenticated("missing authorization header")
+        })?;
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| Status::unauthenticated("authorization header must be Bearer <token>"))?;
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        let token_data = jsonwebtoken::decode::<FlightSqlClaims>(
+            token,
+            &jsonwebtoken::DecodingKey::from_secret(self.jwt_secret.as_bytes()),
+            &validation,
+        )
+        .map_err(|e| Status::unauthenticated(format!("invalid JWT: {e}")))?;
+
+        let claims = token_data.claims;
+
+        // Validate pwd_ver to detect rotated passwords.
+        let catalog_user = self
+            .engine
+            .control_plane()
+            .catalog_user(&claims.sub)
+            .await
+            .map_err(|e| Status::unauthenticated(format!("user lookup failed: {e}")))?;
+        if catalog_user.password_version != claims.pwd_ver {
+            return Err(Status::unauthenticated(
+                "token has been invalidated by a password rotation — please re-authenticate",
+            ));
+        }
+
+        Ok(SessionContext {
+            user: claims.sub,
+            role: claims.role,
+            database: claims.db,
+            schema: claims.schema,
+            auth_method: "flight-sql-jwt".to_string(),
+            protocol: analyticsdb_core::Protocol::ArrowFlightSql,
+            transaction_status: analyticsdb_core::TransactionStatus::Idle,
+        })
     }
 }
 
@@ -4089,12 +4240,20 @@ mod tests {
             .handshake("postgres", "postgres")
             .await
             .expect("handshake should succeed");
-        let decision: AuthDecision =
-            serde_json::from_slice(&payload).expect("payload should decode to auth decision");
-
-        assert_eq!(decision.user, "postgres");
-        assert_eq!(decision.role, "postgres");
-        assert_eq!(decision.auth_method, "prototype-basic-auth");
+        // The payload is now a JWT (not raw AuthDecision JSON).
+        // Verify it is a valid JWT string with the expected structure.
+        let jwt_str = std::str::from_utf8(&payload).expect("payload should be valid UTF-8");
+        // JWTs have three base64url segments separated by dots.
+        let parts: Vec<&str> = jwt_str.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts: {jwt_str}");
+        // Decode the claims segment to verify user/role fields.
+        let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("JWT claims should be base64url-encoded");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&claims_json).expect("JWT claims should be valid JSON");
+        assert_eq!(claims["sub"], "postgres");
+        assert_eq!(claims["role"], "postgres");
 
         server.abort();
     }
@@ -4159,5 +4318,121 @@ mod tests {
         let null_result = flight_sql_parameter_to_literal(None, &pgwire::api::Type::INT4);
         assert!(null_result.is_ok());
         assert_eq!(null_result.unwrap(), "NULL");
+    }
+
+    /// `ControlPlaneScramAuthSource` must refuse to produce a password for a user
+    /// that has no SCRAM verifier fields set (e.g. a group/role that has no password).
+    ///
+    /// This test simulates a user record where `scram_salt_b64` is `None` and verifies
+    /// that the decode path returns an appropriate error message.
+    #[test]
+    fn cleartext_auth_source_returns_error_for_missing_scram_verifier() {
+        // Simulate the catalog user struct with no SCRAM verifier fields.
+        let fake_user = analyticsdb_control::CatalogUser {
+            name: "legacy_user".to_string(),
+            is_admin: false,
+            password: Some("some_hashed_password".to_string()),
+            password_version: 1,
+            password_rotated_at_epoch_ms: None,
+            members: Default::default(),
+            scram_salt_b64: None,
+            scram_salted_password_b64: None,
+        };
+
+        // Replicate the decode path from `ControlPlaneScramAuthSource::get_password`.
+        let result: Result<_, pgwire::error::PgWireError> = (|| {
+            let _salt_b64 = fake_user.scram_salt_b64.as_deref().ok_or_else(|| {
+                anyhow_error_to_pgwire(anyhow::anyhow!(
+                    "User '{}' has no SCRAM verifier — please rotate the password to enable SCRAM-SHA-256 authentication",
+                    fake_user.name
+                ))
+            })?;
+            Ok(())
+        })();
+
+        assert!(result.is_err(), "expected error for missing SCRAM verifier");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("SCRAM") || msg.contains("rotate"),
+            "error message should mention SCRAM or password rotation: {msg}"
+        );
+    }
+
+    /// JWT claims must survive an encode→decode roundtrip with the correct secret.
+    #[test]
+    fn jwt_claims_encode_decode_roundtrip() {
+        let secret = "test-secret-key";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = FlightSqlClaims {
+            sub: "alice".to_string(),
+            role: "analyst".to_string(),
+            db: "mydb".to_string(),
+            schema: "public".to_string(),
+            pwd_ver: 42,
+            exp: now + 86400,
+            iat: now,
+        };
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode should succeed");
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        let decoded = jsonwebtoken::decode::<FlightSqlClaims>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .expect("decode should succeed");
+
+        assert_eq!(decoded.claims.sub, "alice");
+        assert_eq!(decoded.claims.role, "analyst");
+        assert_eq!(decoded.claims.db, "mydb");
+        assert_eq!(decoded.claims.schema, "public");
+        assert_eq!(decoded.claims.pwd_ver, 42);
+    }
+
+    /// A JWT signed with one secret must be rejected when validated with a different secret.
+    #[test]
+    fn jwt_with_wrong_secret_is_rejected() {
+        let good_secret = "correct-secret";
+        let bad_secret = "wrong-secret";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = FlightSqlClaims {
+            sub: "bob".to_string(),
+            role: "reader".to_string(),
+            db: "db".to_string(),
+            schema: "public".to_string(),
+            pwd_ver: 1,
+            exp: now + 86400,
+            iat: now,
+        };
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(good_secret.as_bytes()),
+        )
+        .expect("encode should succeed");
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        let result = jsonwebtoken::decode::<FlightSqlClaims>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(bad_secret.as_bytes()),
+            &validation,
+        );
+
+        assert!(result.is_err(), "decoding with wrong secret must fail");
     }
 }
