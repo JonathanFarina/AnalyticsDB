@@ -331,10 +331,40 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                     }
                 }
 
-                let table_path = ListingTableUrl::parse(storage_path)?;
-                let config = ListingTableConfig::new(table_path)
-                    .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
-                    .with_schema(schema);
+                // Build the table over the specific files listed in the manifest
+                // rather than scanning the directory.  This eliminates a consistency
+                // window where staged files (written but not yet committed to the
+                // manifest) could appear in query results alongside old files.
+                let file_paths = if let Ok((store, prefix)) =
+                    crate::storage::store_for_location(storage_path)
+                {
+                    crate::manifest::list_files(&store, &prefix)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                let config = if file_paths.is_empty() {
+                    // No committed files yet — use the directory URL so the schema
+                    // is still resolved correctly (ListingTable will return zero rows).
+                    let table_path = ListingTableUrl::parse(storage_path)?;
+                    ListingTableConfig::new(table_path)
+                        .with_listing_options(ListingOptions::new(Arc::new(
+                            ParquetFormat::default(),
+                        )))
+                        .with_schema(schema)
+                } else {
+                    let urls: Vec<ListingTableUrl> = file_paths
+                        .iter()
+                        .filter_map(|f| ListingTableUrl::parse(f).ok())
+                        .collect();
+                    ListingTableConfig::new_with_multi_paths(urls)
+                        .with_listing_options(ListingOptions::new(Arc::new(
+                            ParquetFormat::default(),
+                        )))
+                        .with_schema(schema)
+                };
 
                 let table = ListingTable::try_new(config)?;
                 return Ok(Some(Arc::new(table)));
