@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 analyticsdb-core = { path = "../analyticsdb-core" }
 anyhow.workspace = true
+argon2 = { version = "0.5", features = ["std"] }
 async-trait.workspace = true
 clap.workspace = true
 openraft = { workspace = true, features = ["serde"] }

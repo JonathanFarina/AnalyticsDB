@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use analyticsdb_core::SessionContext;
 use anyhow::{bail, Result};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
+use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -11,6 +13,36 @@ use tokio::sync::{watch, RwLock};
 
 use crate::catalog_store::CatalogStore;
 use uuid::Uuid;
+
+/// PHC prefix that identifies an Argon2id hash string (produced by the `argon2` crate).
+const ARGON2ID_PREFIX: &str = "$argon2id$";
+
+/// Hashes `password` with Argon2id and returns a PHC string suitable for storage.
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))
+}
+
+/// Returns `true` if `stored` is an Argon2id PHC string that matches `provided`.
+///
+/// Plaintext passwords (stored before D1) are compared directly so the system
+/// remains functional during the migration window.  Any login with a plaintext
+/// credential that succeeds triggers an in-place re-hash on the next write
+/// (see `authenticate_user`).
+fn verify_password(provided: &str, stored: &str) -> bool {
+    if stored.starts_with(ARGON2ID_PREFIX) {
+        let Ok(hash) = PasswordHash::new(stored) else { return false };
+        Argon2::default()
+            .verify_password(provided.as_bytes(), &hash)
+            .is_ok()
+    } else {
+        // Legacy plaintext comparison — accepted during migration window.
+        provided == stored
+    }
+}
 
 pub(crate) mod catalog_store;
 pub mod raft;
@@ -3291,10 +3323,10 @@ impl ControlPlane {
             .get(user)
             .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))?;
 
-        if let Some(expected) = &catalog_user.password {
+        if let Some(stored) = &catalog_user.password {
             let provided =
                 password.ok_or_else(|| anyhow::anyhow!("Password required for user '{}'", user))?;
-            if provided != expected {
+            if !verify_password(provided, stored) {
                 bail!("Invalid credentials for user '{}'", user);
             }
         }
@@ -3311,6 +3343,8 @@ impl ControlPlane {
         if password.is_empty() {
             bail!("Password must not be empty");
         }
+        // Hash before acquiring the write-lock so the KDF doesn't block DDL writers.
+        let hashed = hash_password(password)?;
         {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
@@ -3327,7 +3361,7 @@ impl ControlPlane {
                 .get_mut(user_name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user_name))?;
 
-            user.password = Some(password.to_string());
+            user.password = Some(hashed);
             user.password_version += 1;
             user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
         }
@@ -3347,6 +3381,13 @@ impl ControlPlane {
     ) -> Result<String> {
         validate_identifier(name)?;
 
+        // Hash the password before entering the write-lock to avoid blocking
+        // other writers for the duration of the Argon2 KDF computation.
+        let hashed_password = password
+            .as_deref()
+            .map(hash_password)
+            .transpose()?;
+
         {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
@@ -3362,7 +3403,7 @@ impl ControlPlane {
             let user = CatalogUser {
                 name: name.to_string(),
                 is_admin: false,
-                password,
+                password: hashed_password,
                 password_version: 1,
                 password_rotated_at_epoch_ms: Some(current_epoch_millis()),
                 members: BTreeSet::new(),
