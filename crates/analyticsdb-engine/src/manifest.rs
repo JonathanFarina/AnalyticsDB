@@ -373,44 +373,49 @@ pub async fn compact_table(
     };
 
     // Bin batches into new files sized around `target_file_bytes`.
+    // We use row count as a proxy for size to avoid double-encoding; each file
+    // is encoded exactly once when flushed.
     let mut new_entries: Vec<ManifestEntry> = Vec::new();
     let mut current_bin: Vec<RecordBatch> = Vec::new();
-    let mut current_size: u64 = 0;
+    let mut current_rows: i64 = 0;
 
-    let flush_bin = |bin: &[RecordBatch], schema: SchemaRef| -> Result<(String, u64, i64)> {
+    // Rough row budget per output file based on the average row size of inputs.
+    let total_rows: i64 = all_batches.iter().map(|b| b.num_rows() as i64).sum();
+    let total_size: u64 = manifest.files.iter().map(|e| e.size).sum();
+    let bytes_per_row = if total_rows > 0 {
+        (total_size as f64 / total_rows as f64).max(1.0)
+    } else {
+        1.0
+    };
+    let row_budget = (target_file_bytes as f64 / bytes_per_row).ceil() as i64;
+    let row_budget = row_budget.max(1);
+
+    let flush = |bin: Vec<RecordBatch>| -> Result<(ManifestEntry, Bytes)> {
         let filename = format!("{}.parquet", Uuid::now_v7());
-        let bytes = storage::encode_parquet_batches(schema, bin)?;
-        let size = bytes.len() as u64;
         let row_count: i64 = bin.iter().map(|b| b.num_rows() as i64).sum();
-        Ok((filename, size, row_count))
+        let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &bin)?;
+        let size = bytes.len() as u64;
+        Ok((ManifestEntry { path: filename, size, row_count }, bytes))
     };
 
     for batch in all_batches {
-        let estimated = storage::encode_parquet_batches(batch.schema(), std::slice::from_ref(&batch))
-            .map(|b| b.len() as u64)
-            .unwrap_or(0);
-
-        if !current_bin.is_empty() && current_size + estimated > target_file_bytes {
-            let (filename, size, row_count) =
-                flush_bin(&current_bin, Arc::clone(&schema))?;
-            let key = prefix.clone().join(filename.as_str());
-            let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &current_bin)?;
+        let batch_rows = batch.num_rows() as i64;
+        if !current_bin.is_empty() && current_rows + batch_rows > row_budget {
+            let (entry, bytes) = flush(std::mem::take(&mut current_bin))?;
+            let key = prefix.clone().join(entry.path.as_str());
             store.put(&key, bytes.into()).await?;
-            new_entries.push(ManifestEntry { path: filename, size, row_count });
-            current_bin.clear();
-            current_size = 0;
+            new_entries.push(entry);
+            current_rows = 0;
         }
-
-        current_size += estimated;
+        current_rows += batch_rows;
         current_bin.push(batch);
     }
 
     if !current_bin.is_empty() {
-        let (filename, size, row_count) = flush_bin(&current_bin, Arc::clone(&schema))?;
-        let key = prefix.clone().join(filename.as_str());
-        let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &current_bin)?;
+        let (entry, bytes) = flush(std::mem::take(&mut current_bin))?;
+        let key = prefix.clone().join(entry.path.as_str());
         store.put(&key, bytes.into()).await?;
-        new_entries.push(ManifestEntry { path: filename, size, row_count });
+        new_entries.push(entry);
     }
 
     let written = new_entries.len();
