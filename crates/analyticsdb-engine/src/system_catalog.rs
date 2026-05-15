@@ -288,54 +288,11 @@ impl SchemaProvider for AnalyticsSchemaProvider {
         if relation.kind == analyticsdb_control::CatalogRelationKind::Table {
             if let Some(storage_path) = &relation.storage_path {
                 let mut schema = catalog_relation_to_schema(&relation);
-                let infer_context = DfSessionContext::new();
-                if let Ok(inferred_config) =
-                    ListingTableConfig::new(ListingTableUrl::parse(storage_path)?)
-                        .with_listing_options(ListingOptions::new(Arc::new(
-                            ParquetFormat::default(),
-                        )))
-                        .infer_schema(&infer_context.state())
-                        .await
-                {
-                    if let Some(inferred_schema) = inferred_config.file_schema {
-                        schema = refine_utf8_catalog_schema_with_inferred(schema, &inferred_schema);
-                    }
-                }
-                if schema
-                    .fields()
-                    .iter()
-                    .any(|field| matches!(field.data_type(), DataType::Utf8))
-                {
-                    if let Ok((store, prefix)) = crate::storage::store_for_location(storage_path) {
-                        if let Ok(files) = crate::manifest::list_files(&store, &prefix).await
-                        {
-                            if !files.is_empty() {
-                                if let Ok(sample_df) = infer_context
-                                    .read_parquet(
-                                        files.iter().map(String::as_str).collect::<Vec<_>>(),
-                                        Default::default(),
-                                    )
-                                    .await
-                                {
-                                    if let Ok(limited_df) = sample_df.limit(0, Some(1024)) {
-                                        if let Ok(sample_batches) = limited_df.collect().await {
-                                            schema = refine_utf8_catalog_schema_with_sample(
-                                                schema,
-                                                &sample_batches,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
 
-                // Build the table over the specific files listed in the manifest
-                // rather than scanning the directory.  This eliminates a consistency
-                // window where staged files (written but not yet committed to the
-                // manifest) could appear in query results alongside old files.
-                let file_paths = if let Ok((store, prefix)) =
+                // Resolve committed file paths from the manifest once and reuse
+                // them for both schema inference and the final ListingTable,
+                // so neither step scans the directory (avoiding stale staged files).
+                let committed_files: Vec<String> = if let Ok((store, prefix)) =
                     crate::storage::store_for_location(storage_path)
                 {
                     crate::manifest::list_files(&store, &prefix)
@@ -345,9 +302,54 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                     Vec::new()
                 };
 
-                let config = if file_paths.is_empty() {
-                    // No committed files yet — use the directory URL so the schema
-                    // is still resolved correctly (ListingTable will return zero rows).
+                let infer_context = DfSessionContext::new();
+                if !committed_files.is_empty() {
+                    if let Ok(inferred_config) =
+                        ListingTableConfig::new_with_multi_paths(
+                            committed_files
+                                .iter()
+                                .filter_map(|f| ListingTableUrl::parse(f).ok())
+                                .collect(),
+                        )
+                        .with_listing_options(ListingOptions::new(Arc::new(
+                            ParquetFormat::default(),
+                        )))
+                        .infer_schema(&infer_context.state())
+                        .await
+                    {
+                        if let Some(inferred_schema) = inferred_config.file_schema {
+                            schema =
+                                refine_utf8_catalog_schema_with_inferred(schema, &inferred_schema);
+                        }
+                    }
+                }
+                if schema
+                    .fields()
+                    .iter()
+                    .any(|field| matches!(field.data_type(), DataType::Utf8))
+                    && !committed_files.is_empty()
+                {
+                    if let Ok(sample_df) = infer_context
+                        .read_parquet(
+                            committed_files.iter().map(String::as_str).collect::<Vec<_>>(),
+                            Default::default(),
+                        )
+                        .await
+                    {
+                        if let Ok(limited_df) = sample_df.limit(0, Some(1024)) {
+                            if let Ok(sample_batches) = limited_df.collect().await {
+                                schema =
+                                    refine_utf8_catalog_schema_with_sample(schema, &sample_batches);
+                            }
+                        }
+                    }
+                }
+
+                // Build the table over `committed_files` (already fetched above).
+                let config = if committed_files.is_empty() {
+                    // No committed files yet — fall back to the directory URL so
+                    // the schema is still resolved correctly and the table returns
+                    // zero rows rather than an error.
                     let table_path = ListingTableUrl::parse(storage_path)?;
                     ListingTableConfig::new(table_path)
                         .with_listing_options(ListingOptions::new(Arc::new(
@@ -355,7 +357,7 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                         )))
                         .with_schema(schema)
                 } else {
-                    let urls: Vec<ListingTableUrl> = file_paths
+                    let urls: Vec<ListingTableUrl> = committed_files
                         .iter()
                         .filter_map(|f| ListingTableUrl::parse(f).ok())
                         .collect();
