@@ -32,10 +32,10 @@ impl PrototypeEngine {
             | MetadataStatement::InformationSchemaReferentialConstraints { .. }
             | MetadataStatement::CreateUser { .. }
             | MetadataStatement::DropUser { .. }
+            | MetadataStatement::AlterUserPassword { .. }
             | MetadataStatement::CreateGroup { .. }
             | MetadataStatement::AlterGroup { .. }
-            | MetadataStatement::DropGroup { .. }
-            | MetadataStatement::AlterUserPassword { .. } => match statement {
+            | MetadataStatement::DropGroup { .. } => match statement {
                 MetadataStatement::InformationSchemaSchemata { sql } => {
                     let columns = [
                         "catalog_name",
@@ -313,6 +313,81 @@ impl PrototypeEngine {
                         ),
                         rows_outcome(),
                         request.session.clone(),
+                    )
+                }
+                MetadataStatement::CreateUser { ref name, .. } => {
+                    let user_name = name.clone();
+                    let (message, new_session) = self
+                        .control_plane
+                        .execute_metadata_statement(&request.session, &statement)
+                        .await?;
+                    self.audit_log.log_event(
+                        crate::audit_log::AuditLogRecord::success(
+                            crate::audit_log::AuditEventType::CreateUser,
+                            &request.session.user,
+                            &request.session.role,
+                            &format!("CREATE USER {user_name}"),
+                            "user",
+                            &user_name,
+                            "embedded",
+                        ),
+                    );
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        message,
+                        command_outcome("CREATE USER", 0),
+                        new_session,
+                    )
+                }
+                MetadataStatement::DropUser { ref name, .. } => {
+                    let user_name = name.clone();
+                    let (message, new_session) = self
+                        .control_plane
+                        .execute_metadata_statement(&request.session, &statement)
+                        .await?;
+                    self.audit_log.log_event(
+                        crate::audit_log::AuditLogRecord::success(
+                            crate::audit_log::AuditEventType::DropUser,
+                            &request.session.user,
+                            &request.session.role,
+                            &format!("DROP USER {user_name}"),
+                            "user",
+                            &user_name,
+                            "embedded",
+                        ),
+                    );
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        message,
+                        command_outcome("DROP USER", 0),
+                        new_session,
+                    )
+                }
+                MetadataStatement::AlterUserPassword { ref name, .. } => {
+                    let user_name = name.clone();
+                    let (message, new_session) = self
+                        .control_plane
+                        .execute_metadata_statement(&request.session, &statement)
+                        .await?;
+                    self.audit_log.log_event(
+                        crate::audit_log::AuditLogRecord::success(
+                            crate::audit_log::AuditEventType::AlterUser,
+                            &request.session.user,
+                            &request.session.role,
+                            &format!("ALTER USER {user_name} PASSWORD"),
+                            "user",
+                            &user_name,
+                            "embedded",
+                        ),
+                    );
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        message,
+                        command_outcome("ALTER USER", 0),
+                        new_session,
                     )
                 }
                 _ => {
@@ -840,6 +915,18 @@ impl PrototypeEngine {
                     .await?;
                 self.rebuild_all_index_snapshots(&request.session, &relation)
                     .await?;
+
+                self.audit_log.log_event(
+                    crate::audit_log::AuditLogRecord::success(
+                        crate::audit_log::AuditEventType::CreateTable,
+                        &request.session.user,
+                        &request.session.role,
+                        &format!("CREATE TABLE {name}"),
+                        "table",
+                        &name,
+                        "embedded",
+                    ),
+                );
 
                 (
                     Arc::new(Schema::empty()),
@@ -2017,6 +2104,18 @@ impl PrototypeEngine {
                     )
                     .await?;
 
+                self.audit_log.log_event(
+                    crate::audit_log::AuditLogRecord::success(
+                        crate::audit_log::AuditEventType::DropTable,
+                        &request.session.user,
+                        &request.session.role,
+                        &format!("DROP TABLE {name}"),
+                        "table",
+                        &name,
+                        "embedded",
+                    ),
+                );
+
                 (
                     Arc::new(Schema::empty()),
                     Vec::new(),
@@ -2091,6 +2190,89 @@ impl PrototypeEngine {
                     request.session.clone(),
                 )
             }
+            MetadataStatement::GrantPrivilege {
+                ref grantee,
+                ref object_type,
+                ref object_name,
+                ref privilege,
+            } => {
+                // Qualify the object name with the session's database and schema
+                // so that grants stored in the catalogue always use fully-qualified
+                // names that match what the planner produces in check_table_access.
+                let qualified_name = if object_type == "table" {
+                    qualify_grant_object_name(object_name, &request.session)
+                } else {
+                    object_name.clone()
+                };
+                let qualified_statement = MetadataStatement::GrantPrivilege {
+                    grantee: grantee.clone(),
+                    object_type: object_type.clone(),
+                    object_name: qualified_name.clone(),
+                    privilege: privilege.clone(),
+                };
+                let (message, new_session) = self
+                    .control_plane
+                    .execute_metadata_statement(&request.session, &qualified_statement)
+                    .await?;
+                self.audit_log.log_event(
+                    crate::audit_log::AuditLogRecord::success(
+                        crate::audit_log::AuditEventType::GrantPrivilege,
+                        &request.session.user,
+                        &request.session.role,
+                        &format!("GRANT {privilege} ON {object_type} {qualified_name} TO {grantee}"),
+                        object_type,
+                        &qualified_name,
+                        "embedded",
+                    ),
+                );
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    message,
+                    command_outcome("GRANT", 0),
+                    new_session,
+                )
+            }
+            MetadataStatement::RevokePrivilege {
+                ref grantee,
+                ref object_type,
+                ref object_name,
+                ref privilege,
+            } => {
+                let qualified_name = if object_type == "table" {
+                    qualify_grant_object_name(object_name, &request.session)
+                } else {
+                    object_name.clone()
+                };
+                let qualified_statement = MetadataStatement::RevokePrivilege {
+                    grantee: grantee.clone(),
+                    object_type: object_type.clone(),
+                    object_name: qualified_name.clone(),
+                    privilege: privilege.clone(),
+                };
+                let (message, new_session) = self
+                    .control_plane
+                    .execute_metadata_statement(&request.session, &qualified_statement)
+                    .await?;
+                self.audit_log.log_event(
+                    crate::audit_log::AuditLogRecord::success(
+                        crate::audit_log::AuditEventType::RevokePrivilege,
+                        &request.session.user,
+                        &request.session.role,
+                        &format!("REVOKE {privilege} ON {object_type} {qualified_name} FROM {grantee}"),
+                        object_type,
+                        &qualified_name,
+                        "embedded",
+                    ),
+                );
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    message,
+                    command_outcome("REVOKE", 0),
+                    new_session,
+                )
+            }
             MetadataStatement::KillQuery { query_id } => {
                 if let Some(entry) = self.active_queries.get(&query_id) {
                     entry.value().cancel();
@@ -2120,5 +2302,17 @@ impl PrototypeEngine {
             outcome,
             execution_time_ms: started.elapsed().as_millis(),
         })
+    }
+}
+
+/// Qualify a GRANT object name with the session's database and schema
+/// so that it matches the fully-qualified names used during planner authorization.
+fn qualify_grant_object_name(name: &str, session: &analyticsdb_core::SessionContext) -> String {
+    let parts: Vec<&str> = name.split('.').collect();
+    match parts.as_slice() {
+        [table] => format!("{}.{}.{}", session.database, session.schema, table),
+        [schema, table] => format!("{}.{}.{}", session.database, schema, table),
+        [database, schema, table] => format!("{database}.{schema}.{table}"),
+        _ => name.to_string(),
     }
 }

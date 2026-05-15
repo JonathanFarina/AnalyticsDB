@@ -147,6 +147,7 @@ pub mod distributed;
 pub mod functions;
 pub(crate) mod manifest;
 pub mod postgres_compatibility;
+pub mod audit_log;
 pub mod query_log;
 pub mod sql_rewriter;
 pub mod storage;
@@ -191,6 +192,7 @@ pub(crate) use index_ops::*;
 pub(crate) use metadata_helpers::*;
 pub(crate) use schema_build::*;
 
+use audit_log::AuditLog;
 use functions::register_postgres_functions;
 use query_log::QueryLog;
 use system_catalog::{PgCatalogSchemaProvider, SystemSchemaProvider};
@@ -318,6 +320,7 @@ pub struct PrototypeEngine {
     partition_client: Arc<PartitionClient>,
     file_list_cache: Arc<FileListCache>,
     query_log: Arc<QueryLog>,
+    pub audit_log: Arc<AuditLog>,
     active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     /// Limits the number of queries that can execute concurrently on this node.
     ///
@@ -343,6 +346,7 @@ impl std::fmt::Debug for PrototypeEngine {
             .field("partition_client", &"<partition client>")
             .field("file_list_cache", &"<file list cache>")
             .field("query_log", &self.query_log.root_location())
+            .field("audit_log", &self.audit_log.root_location())
             .finish()
     }
 }
@@ -356,6 +360,7 @@ impl Clone for PrototypeEngine {
             partition_client: Arc::clone(&self.partition_client),
             file_list_cache: Arc::clone(&self.file_list_cache),
             query_log: Arc::clone(&self.query_log),
+            audit_log: Arc::clone(&self.audit_log),
             active_queries: Arc::clone(&self.active_queries),
             query_semaphore: Arc::clone(&self.query_semaphore),
             memory_pool: Arc::clone(&self.memory_pool),
@@ -524,6 +529,7 @@ impl PrototypeEngine {
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::disabled()),
+            audit_log: Arc::new(AuditLog::disabled()),
             active_queries: Arc::new(dashmap::DashMap::new()),
             query_semaphore: Self::build_query_semaphore(),
             memory_pool: Self::build_memory_pool(),
@@ -561,6 +567,10 @@ impl PrototypeEngine {
             .managed_data_root()
             .join("system")
             .join("query_log");
+        let audit_log_root = control_plane
+            .managed_data_root()
+            .join("system")
+            .join("audit_log");
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
         partition_client.set_compute_eligible(true);
         if let Some(config) = &cluster_config {
@@ -576,6 +586,7 @@ impl PrototypeEngine {
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
+            audit_log: Arc::new(AuditLog::new(audit_log::AuditLogConfig::default(), audit_log_root)),
             active_queries: Arc::new(dashmap::DashMap::new()),
             query_semaphore: Self::build_query_semaphore(),
             memory_pool: Self::build_memory_pool(),
@@ -584,6 +595,45 @@ impl PrototypeEngine {
 
     pub fn control_plane(&self) -> Arc<ControlPlane> {
         Arc::clone(&self.control_plane)
+    }
+
+    /// Check whether the session's role has the given privilege on the specified table.
+    ///
+    /// Admin users bypass all privilege checks.  For non-admin users, queries
+    /// the catalogue store for a matching grant row.  Returns an error with
+    /// the PostgreSQL-compatible message `permission denied for table <name>` when
+    /// access is denied (SQLSTATE 42501).
+    async fn check_table_access(
+        &self,
+        session: &SessionContext,
+        table_name: &str,
+        privilege: &str,
+    ) -> Result<()> {
+        // Fetch the user record to determine admin status.
+        let is_admin = self
+            .control_plane
+            .catalog_user(&session.user)
+            .await
+            .map(|u| u.is_admin)
+            .unwrap_or(false);
+
+        if is_admin {
+            return Ok(());
+        }
+
+        let granted = self
+            .control_plane
+            .check_privilege(&session.role, "table", table_name, privilege)
+            .await?;
+
+        if granted {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "permission denied for table {}",
+                table_name
+            ))
+        }
     }
 
     /// Cancels every query that is currently executing on this engine instance.
@@ -1054,6 +1104,12 @@ impl PrototypeEngine {
             return Ok(result);
         }
 
+        // D5: Object-level authorization check before executing DML.
+        if let Some((table_name, privilege)) = extract_dml_table_and_privilege(&request.sql, &request.session) {
+            self.check_table_access(&request.session, &table_name, &privilege)
+                .await?;
+        }
+
         let session = request.session.clone();
         let context = self.create_session_context(&session).await?;
         let dataframe = context.sql(&request.sql).await.map_err(sanitize_error)?;
@@ -1197,6 +1253,12 @@ impl PrototypeEngine {
             .await?
         {
             return Ok(result);
+        }
+
+        // D5: Object-level authorization check before executing DML (stream path).
+        if let Some((table_name, privilege)) = extract_dml_table_and_privilege(&request.sql, &request.session) {
+            self.check_table_access(&request.session, &table_name, &privilege)
+                .await?;
         }
 
         let session = request.session.clone();
@@ -1555,8 +1617,9 @@ impl PrototypeEngine {
                     &self.control_plane,
                 )));
                 provider.register_schema("pg_catalog", pg_catalog)?;
-                let system_schema = Arc::new(SystemSchemaProvider::new(
+                let system_schema = Arc::new(SystemSchemaProvider::new_with_audit_log(
                     self.query_log.root_location().to_string(),
+                    Some(self.audit_log.root_location().to_string()),
                 ));
                 provider.register_schema("system", system_schema)?;
             }
@@ -1569,6 +1632,85 @@ impl PrototypeEngine {
         let mut cache = self.session_context_cache.write().await;
         cache.insert(key, ctx.clone());
         Ok(ctx)
+    }
+}
+
+/// Extract the primary table name and required privilege from a DML SQL statement.
+///
+/// Returns `Some((qualified_table_name, privilege))` for SELECT/INSERT/UPDATE/DELETE
+/// statements. Returns `None` for DDL or unrecognized statements.
+///
+/// Only the first/primary table is checked (multi-table authorization is a follow-up).
+fn extract_dml_table_and_privilege(
+    sql: &str,
+    session: &SessionContext,
+) -> Option<(String, String)> {
+    let dialect = PostgreSqlDialect {};
+    let Ok(statements) =
+        Parser::parse_sql(&dialect, sql.trim().trim_end_matches(';'))
+    else {
+        return None;
+    };
+
+    let stmt = statements.into_iter().next()?;
+
+    match &stmt {
+        Statement::Query(query) => {
+            // SELECT — extract the first FROM table.
+            let table_name = extract_first_select_table(query.body.as_ref(), session)?;
+            Some((table_name, "SELECT".to_string()))
+        }
+        Statement::Insert(insert) => {
+            let table_obj = match &insert.table {
+                sqlparser::ast::TableObject::TableName(n) => n,
+                _ => return None,
+            };
+            let name = qualify_table_name(&table_obj.to_string(), session);
+            Some((name, "INSERT".to_string()))
+        }
+        Statement::Update(update) => {
+            let name = qualify_table_name(&update.table.relation.to_string(), session);
+            Some((name, "UPDATE".to_string()))
+        }
+        Statement::Delete(del) => {
+            // del.from is a FromTable enum
+            let tables = match &del.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+                sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+            };
+            let name = tables.first().map(|f| qualify_table_name(&f.relation.to_string(), session))?;
+            Some((name, "DELETE".to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn extract_first_select_table(body: &SetExpr, session: &SessionContext) -> Option<String> {
+    match body {
+        SetExpr::Select(select) => {
+            let first = select.from.first()?;
+            Some(qualify_table_factor(&first.relation, session))
+        }
+        SetExpr::Query(q) => extract_first_select_table(q.body.as_ref(), session),
+        SetExpr::SetOperation { left, .. } => extract_first_select_table(left.as_ref(), session),
+        _ => None,
+    }
+}
+
+fn qualify_table_factor(factor: &TableFactor, session: &SessionContext) -> String {
+    match factor {
+        TableFactor::Table { name, .. } => qualify_table_name(&name.to_string(), session),
+        _ => String::new(),
+    }
+}
+
+fn qualify_table_name(name: &str, session: &SessionContext) -> String {
+    let parts: Vec<&str> = name.split('.').collect();
+    match parts.as_slice() {
+        [table] => format!("{}.{}.{}", session.database, session.schema, table),
+        [schema, table] => format!("{}.{}.{}", session.database, schema, table),
+        [database, schema, table] => format!("{database}.{schema}.{table}"),
+        _ => name.to_string(),
     }
 }
 
@@ -2958,5 +3100,133 @@ FROM generate_series(1, 10) AS s(n)";
             calculate_optimal_worker_count(100 * 1024 * 1024, 20, 20),
             10
         );
+    }
+
+    // ---- D5: object-level authorization tests ----
+
+    fn temp_sqlite_catalog_path() -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "analyticsdb-engine-authz-test-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unprivileged_role_cannot_select_without_grant() {
+        let catalog_path = temp_sqlite_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let admin_session = SessionContext::default();
+
+        // Create a table as admin.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE orders (id INTEGER, name TEXT)".to_string(),
+                session: admin_session.clone(),
+                query_id: None,
+            })
+            .await
+            .expect("create table should succeed");
+
+        // Create an unprivileged user.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE USER alice PASSWORD 'secret'".to_string(),
+                session: admin_session.clone(),
+                query_id: None,
+            })
+            .await
+            .expect("create user should succeed");
+
+        // Try SELECT as alice (no grant).
+        let alice_session = SessionContext {
+            user: "alice".to_string(),
+            role: "alice".to_string(),
+            ..SessionContext::default()
+        };
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT * FROM orders".to_string(),
+                session: alice_session,
+                query_id: None,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "unprivileged user should be denied SELECT"
+        );
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("permission denied for table"),
+            "error should mention permission denied: {}",
+            msg
+        );
+
+        cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn granted_role_can_select_after_grant() {
+        let catalog_path = temp_sqlite_catalog_path();
+        let engine = PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize");
+        let admin_session = SessionContext::default();
+
+        // Create a table as admin.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE TABLE products (id INTEGER, name TEXT)".to_string(),
+                session: admin_session.clone(),
+                query_id: None,
+            })
+            .await
+            .expect("create table should succeed");
+
+        // Create an unprivileged user.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "CREATE USER bob PASSWORD 'secret'".to_string(),
+                session: admin_session.clone(),
+                query_id: None,
+            })
+            .await
+            .expect("create user should succeed");
+
+        // Grant SELECT.
+        engine
+            .execute_query(&QueryRequest {
+                sql: "GRANT SELECT ON TABLE products TO bob".to_string(),
+                session: admin_session.clone(),
+                query_id: None,
+            })
+            .await
+            .expect("grant should succeed");
+
+        // Now bob can SELECT.
+        let bob_session = SessionContext {
+            user: "bob".to_string(),
+            role: "bob".to_string(),
+            ..SessionContext::default()
+        };
+        let result = engine
+            .execute_query(&QueryRequest {
+                sql: "SELECT * FROM products".to_string(),
+                session: bob_session,
+                query_id: None,
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "bob should be able to SELECT after grant: {:?}",
+            result.err()
+        );
+
+        cleanup_catalog_artifacts(&catalog_path);
     }
 }

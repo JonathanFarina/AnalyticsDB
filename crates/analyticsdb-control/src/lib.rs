@@ -708,6 +708,18 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
     },
+    GrantPrivilege {
+        grantee: String,
+        object_type: String,
+        object_name: String,
+        privilege: String,
+    },
+    RevokePrivilege {
+        grantee: String,
+        object_type: String,
+        object_name: String,
+        privilege: String,
+    },
 }
 
 pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
@@ -1135,6 +1147,46 @@ impl ControlPlane {
                     *if_exists,
                 )
                 .await?
+            }
+            MetadataStatement::GrantPrivilege {
+                grantee,
+                object_type,
+                object_name,
+                privilege,
+            } => {
+                {
+                    let state = self.state.read().await;
+                    let user = state
+                        .users
+                        .get(&session.user)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", session.user))?;
+                    if !user.is_admin {
+                        bail!("permission denied: only admin can grant privileges");
+                    }
+                }
+                self.grant_privilege(grantee, object_type, object_name, privilege, &session.user)
+                    .await?;
+                format!("GRANT")
+            }
+            MetadataStatement::RevokePrivilege {
+                grantee,
+                object_type,
+                object_name,
+                privilege,
+            } => {
+                {
+                    let state = self.state.read().await;
+                    let user = state
+                        .users
+                        .get(&session.user)
+                        .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", session.user))?;
+                    if !user.is_admin {
+                        bail!("permission denied: only admin can revoke privileges");
+                    }
+                }
+                self.revoke_privilege(grantee, object_type, object_name, privilege)
+                    .await?;
+                format!("REVOKE")
             }
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
@@ -3353,6 +3405,60 @@ impl ControlPlane {
             .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", user))
     }
 
+    /// Grant a privilege on an object to a grantee. Only SQLite-backed catalogs
+    /// persist grants; the JSON backend is a no-op.
+    pub async fn grant_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+        granted_by: &str,
+    ) -> Result<()> {
+        let Some(path) = &self.catalog_path else {
+            return Ok(());
+        };
+        let store = catalog_store::open_store(path)?;
+        store
+            .grant_privilege(grantee, object_type, object_name, privilege, granted_by)
+            .await
+    }
+
+    /// Revoke a privilege on an object from a grantee.
+    pub async fn revoke_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+    ) -> Result<()> {
+        let Some(path) = &self.catalog_path else {
+            return Ok(());
+        };
+        let store = catalog_store::open_store(path)?;
+        store
+            .revoke_privilege(grantee, object_type, object_name, privilege)
+            .await
+    }
+
+    /// Check whether `grantee` holds `privilege` on `object_name`.
+    /// Returns `true` for non-SQLite catalogs (permissive default).
+    pub async fn check_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+    ) -> Result<bool> {
+        let Some(path) = &self.catalog_path else {
+            return Ok(true);
+        };
+        let store = catalog_store::open_store(path)?;
+        store
+            .check_privilege(grantee, object_type, object_name, privilege)
+            .await
+    }
+
     pub async fn authorize_role_assumption(&self, user: &str, role: &str) -> Result<()> {
         let state = self.state.read().await;
         let catalog_user = state
@@ -4488,6 +4594,80 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                     drop_func.drop_behavior,
                     Some(sqlparser::ast::DropBehavior::Cascade)
                 ),
+            })
+        }
+        sqlparser::ast::Statement::Grant(grant) => {
+            // Parse: GRANT <privilege> ON TABLE <table> TO <role>
+            let privilege = match &grant.privileges {
+                sqlparser::ast::Privileges::All { .. } => "ALL".to_string(),
+                sqlparser::ast::Privileges::Actions(actions) => actions
+                    .first()
+                    .map(|a| a.to_string().to_uppercase())
+                    .unwrap_or_default(),
+            };
+
+            let (object_type, object_name) = match &grant.objects {
+                Some(sqlparser::ast::GrantObjects::Tables(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("table".to_string(), name)
+                }
+                Some(sqlparser::ast::GrantObjects::Schemas(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("schema".to_string(), name)
+                }
+                Some(sqlparser::ast::GrantObjects::Databases(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("database".to_string(), name)
+                }
+                _ => return None,
+            };
+
+            let grantee = grant.grantees.first().and_then(|g| {
+                g.name.as_ref().map(|n| n.to_string())
+            })?;
+
+            Some(MetadataStatement::GrantPrivilege {
+                grantee,
+                object_type,
+                object_name,
+                privilege,
+            })
+        }
+        sqlparser::ast::Statement::Revoke(revoke) => {
+            // Parse: REVOKE <privilege> ON TABLE <table> FROM <role>
+            let privilege = match &revoke.privileges {
+                sqlparser::ast::Privileges::All { .. } => "ALL".to_string(),
+                sqlparser::ast::Privileges::Actions(actions) => actions
+                    .first()
+                    .map(|a| a.to_string().to_uppercase())
+                    .unwrap_or_default(),
+            };
+
+            let (object_type, object_name) = match &revoke.objects {
+                Some(sqlparser::ast::GrantObjects::Tables(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("table".to_string(), name)
+                }
+                Some(sqlparser::ast::GrantObjects::Schemas(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("schema".to_string(), name)
+                }
+                Some(sqlparser::ast::GrantObjects::Databases(names)) => {
+                    let name = names.first().map(|n| n.to_string()).unwrap_or_default();
+                    ("database".to_string(), name)
+                }
+                _ => return None,
+            };
+
+            let grantee = revoke.grantees.first().and_then(|g| {
+                g.name.as_ref().map(|n| n.to_string())
+            })?;
+
+            Some(MetadataStatement::RevokePrivilege {
+                grantee,
+                object_type,
+                object_name,
+                privilege,
             })
         }
         _ => parse_metadata_statement_fallback(sql),

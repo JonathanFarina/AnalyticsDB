@@ -34,11 +34,24 @@ pub struct SystemSchemaProvider {
 
 impl SystemSchemaProvider {
     pub fn new(query_log_root_location: String) -> Self {
+        Self::new_with_audit_log(query_log_root_location, None)
+    }
+
+    pub fn new_with_audit_log(
+        query_log_root_location: String,
+        audit_log_root_location: Option<String>,
+    ) -> Self {
         let mut tables: BTreeMap<String, Arc<dyn TableProvider>> = BTreeMap::new();
         tables.insert(
             "query_log".to_string(),
             Arc::new(QueryLogListingTable::new(query_log_root_location)),
         );
+        if let Some(audit_root) = audit_log_root_location {
+            tables.insert(
+                "audit_log".to_string(),
+                Arc::new(AuditLogListingTable::new(audit_root)),
+            );
+        }
         Self { tables }
     }
 }
@@ -151,6 +164,97 @@ impl TableProvider for QueryLogListingTable {
             // format!("file://{}", file) produces file:///data/... — a valid
             // local-filesystem URL that DataFusion's built-in LocalFileSystem
             // object store can handle.
+            let url = format!("file://{}", file);
+            table_paths.push(ListingTableUrl::parse(url)?);
+        }
+
+        let mut listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        listing_options.file_extension = ".parquet".to_string();
+
+        let config = ListingTableConfig::new_with_multi_paths(table_paths)
+            .with_listing_options(listing_options)
+            .with_schema(Arc::clone(&self.schema));
+        let table = ListingTable::try_new(config)?;
+        table.scan(_state, projection, filters, limit).await
+    }
+}
+
+// ---- Audit log system table ----
+
+#[derive(Debug)]
+struct AuditLogListingTable {
+    root_location: String,
+    schema: SchemaRef,
+}
+
+impl AuditLogListingTable {
+    fn new(root_location: String) -> Self {
+        Self {
+            root_location,
+            schema: crate::audit_log::schema(),
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for AuditLogListingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let local_path = self
+            .root_location
+            .strip_prefix("file://")
+            .unwrap_or(&self.root_location);
+
+        let abs_root = {
+            let p = std::path::Path::new(local_path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?
+                    .join(p)
+            }
+        };
+
+        let mut all_files = Vec::new();
+        fn collect_files(path: &std::path::Path, files: &mut Vec<String>) {
+            if path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        collect_files(&entry.path(), files);
+                    }
+                }
+            } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+        collect_files(&abs_root, &mut all_files);
+
+        if all_files.is_empty() {
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                Arc::clone(&self.schema),
+            )));
+        }
+
+        let mut table_paths = Vec::new();
+        for file in all_files {
             let url = format!("file://{}", file);
             table_paths.push(ListingTableUrl::parse(url)?);
         }

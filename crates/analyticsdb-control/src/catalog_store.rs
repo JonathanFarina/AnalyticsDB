@@ -57,6 +57,46 @@ pub trait CatalogStore: Send + Sync + std::fmt::Debug {
     async fn release_lease(&self, _relation_key: &str, _holder_node_id: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Grant a privilege on an object to a grantee.
+    ///
+    /// The JSON backend is a no-op (single-user assumption).
+    async fn grant_privilege(
+        &self,
+        _grantee: &str,
+        _object_type: &str,
+        _object_name: &str,
+        _privilege: &str,
+        _granted_by: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Revoke a privilege on an object from a grantee.
+    ///
+    /// The JSON backend is a no-op.
+    async fn revoke_privilege(
+        &self,
+        _grantee: &str,
+        _object_type: &str,
+        _object_name: &str,
+        _privilege: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether `grantee` holds `privilege` on `object_name`.
+    ///
+    /// The JSON backend always returns `true` (single-user / permissive default).
+    async fn check_privilege(
+        &self,
+        _grantee: &str,
+        _object_type: &str,
+        _object_name: &str,
+        _privilege: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 /// Choose a backend based on the path extension. Defaults to JSON for
@@ -174,6 +214,15 @@ impl SqliteCatalogStore {
                 relation_key  TEXT PRIMARY KEY,
                 holder_node_id TEXT NOT NULL,
                 expires_ms    INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS object_permissions (
+                grantee      TEXT NOT NULL,
+                object_type  TEXT NOT NULL,
+                object_name  TEXT NOT NULL,
+                privilege    TEXT NOT NULL,
+                granted_by   TEXT NOT NULL,
+                granted_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (grantee, object_type, object_name, privilege)
             );
             "#,
         )?;
@@ -316,6 +365,91 @@ impl CatalogStore for SqliteCatalogStore {
                 params![key, holder],
             )?;
             Ok(())
+        })
+        .await?
+    }
+
+    async fn grant_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+        granted_by: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let grantee = grantee.to_string();
+        let object_type = object_type.to_string();
+        let object_name = object_name.to_string();
+        let privilege = privilege.to_string();
+        let granted_by = granted_by.to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = Self::new(path);
+            let conn = store.open_conn()?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            conn.execute(
+                "INSERT OR REPLACE INTO object_permissions
+                 (grantee, object_type, object_name, privilege, granted_by, granted_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![grantee, object_type, object_name, privilege, granted_by, now_ms],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn revoke_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let grantee = grantee.to_string();
+        let object_type = object_type.to_string();
+        let object_name = object_name.to_string();
+        let privilege = privilege.to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = Self::new(path);
+            let conn = store.open_conn()?;
+            conn.execute(
+                "DELETE FROM object_permissions
+                 WHERE grantee = ?1 AND object_type = ?2 AND object_name = ?3 AND privilege = ?4",
+                params![grantee, object_type, object_name, privilege],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn check_privilege(
+        &self,
+        grantee: &str,
+        object_type: &str,
+        object_name: &str,
+        privilege: &str,
+    ) -> Result<bool> {
+        let path = self.path.clone();
+        let grantee = grantee.to_string();
+        let object_type = object_type.to_string();
+        let object_name = object_name.to_string();
+        let privilege = privilege.to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = Self::new(path);
+            let conn = store.open_conn()?;
+            // Check for exact privilege match or ALL privilege on the object.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM object_permissions
+                 WHERE grantee = ?1 AND object_type = ?2 AND object_name = ?3
+                   AND (privilege = ?4 OR privilege = 'ALL')",
+                params![grantee, object_type, object_name, privilege],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
         .await?
     }
@@ -583,6 +717,98 @@ mod tests {
                 .await
                 .expect("json acquire");
             assert!(ok);
+        });
+    }
+
+    #[test]
+    fn sqlite_grant_and_check_privilege() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_path("priv1.db");
+            let store = SqliteCatalogStore::new(path.clone());
+
+            // Grant SELECT on a table to alice.
+            store
+                .grant_privilege("alice", "table", "postgres.public.orders", "SELECT", "admin")
+                .await
+                .expect("grant");
+
+            // alice should now have SELECT.
+            let has = store
+                .check_privilege("alice", "table", "postgres.public.orders", "SELECT")
+                .await
+                .expect("check");
+            assert!(has, "alice should have SELECT after grant");
+
+            // bob should not have SELECT.
+            let not_has = store
+                .check_privilege("bob", "table", "postgres.public.orders", "SELECT")
+                .await
+                .expect("check bob");
+            assert!(!not_has, "bob should not have SELECT");
+
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("db-wal")).ok();
+            std::fs::remove_file(path.with_extension("db-shm")).ok();
+        });
+    }
+
+    #[test]
+    fn sqlite_revoke_removes_privilege() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_path("priv2.db");
+            let store = SqliteCatalogStore::new(path.clone());
+
+            store
+                .grant_privilege("alice", "table", "postgres.public.orders", "SELECT", "admin")
+                .await
+                .expect("grant");
+
+            let has = store
+                .check_privilege("alice", "table", "postgres.public.orders", "SELECT")
+                .await
+                .expect("check after grant");
+            assert!(has);
+
+            store
+                .revoke_privilege("alice", "table", "postgres.public.orders", "SELECT")
+                .await
+                .expect("revoke");
+
+            let has_after = store
+                .check_privilege("alice", "table", "postgres.public.orders", "SELECT")
+                .await
+                .expect("check after revoke");
+            assert!(!has_after, "alice should not have SELECT after revoke");
+
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("db-wal")).ok();
+            std::fs::remove_file(path.with_extension("db-shm")).ok();
+        });
+    }
+
+    #[test]
+    fn json_store_privilege_check_always_true() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_path("priv.json");
+            let store = JsonCatalogStore::new(path);
+            // JsonCatalogStore always grants (no-op implementation).
+            let ok = store
+                .check_privilege("anyone", "table", "any.table", "SELECT")
+                .await
+                .expect("json check");
+            assert!(ok, "JsonCatalogStore should always return true for check_privilege");
         });
     }
 }
