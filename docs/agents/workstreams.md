@@ -311,7 +311,6 @@ Remaining gaps before this phase should be considered `Partial` overall:
 
 - no benchmark gate exists yet for query-log overhead
 - query-log retention, metric enrichment, distributed worker rows, and full Flight SQL stream lifecycle accounting remain incomplete
-- no mTLS intra-cluster yet
 - no `system.audit_log` yet
 - no GCS/Azure SSE equivalent to the S3 SSE wiring
 

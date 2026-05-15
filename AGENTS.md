@@ -111,8 +111,8 @@ Everything beyond that remains early-stage. In particular:
 - prototype role-assumption checks now exist at session admission, but no full role/group authorization model exists yet
 - Flight SQL now supports the full bind/execute/close protocol cycle for prepared statements, enabling JDBC/ODBC connectivity
 - broad Flight SQL `SqlInfo` coverage exists for core server identification and SQL dialect metadata
-- no roles/groups implementation exists yet
-- no object-storage-backed production columnar managed-table storage exists yet (Parquet files are currently stored in a local `.managed` directory)
+- prototype role-assumption is implemented at session admission; full role/group authorization model (GRANT/REVOKE hierarchy, row-level security) is not yet complete
+- columnar managed-table storage uses local `.managed` Parquet directories; production object-storage backing (S3/GCS/Azure) is wired via `object_store` but not yet the default deployment target
 
 ## Required Behaviors For Agents
 

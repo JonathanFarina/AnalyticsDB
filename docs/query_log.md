@@ -1,6 +1,6 @@
 # Query Log
 
-Status: `Production`
+Status: `Partial`
 
 AnalyticsDB provides a durable query log. Each logged query is written asynchronously to local Parquet files under the catalog-managed data root, utilizing a `YYYY/MM/DD/` partitioned layout, and is exposed through SQL as:
 

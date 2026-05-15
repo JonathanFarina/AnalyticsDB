@@ -214,4 +214,4 @@ Commands are grouped by their current coverage status. Status values are unchang
 | SET SESSION AUTHORIZATION | - |  |
 | SET TRANSACTION | - |  |
 | UNLISTEN | - |  |
-| VACUUM | - |  |
+| VACUUM | Partial | `VACUUM <table>` triggers compaction; full PostgreSQL VACUUM semantics (analyze, freeze, full) not implemented |
