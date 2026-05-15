@@ -273,13 +273,14 @@ pub async fn serve_flight_sql(
     engine: Arc<PrototypeEngine>,
     tls_config: Option<(Vec<u8>, Vec<u8>)>,
 ) -> anyhow::Result<()> {
-    serve_flight_sql_with_label(listener, engine, tls_config, "Flight SQL").await
+    serve_flight_sql_with_label(listener, engine, tls_config, None, "Flight SQL").await
 }
 
 pub async fn serve_flight_sql_with_label(
     listener: TcpListener,
     engine: Arc<PrototypeEngine>,
-    tls_config: Option<(Vec<u8>, Vec<u8>)>,
+    tls_config: Option<(Vec<u8>, Vec<u8>)>,  // (cert_pem, key_pem) for server identity
+    ca_cert: Option<Vec<u8>>,                 // PEM CA cert; when set, enables mTLS (requires client certs)
     label: &'static str,
 ) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
@@ -291,16 +292,26 @@ pub async fn serve_flight_sql_with_label(
     let mut builder = Server::builder();
 
     let router = if let Some((cert, key)) = tls_config {
-        info!("{}: Starting with TLS enabled", label);
         let identity = tonic::transport::Identity::from_pem(cert, key);
+        let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+        if let Some(ca_pem) = ca_cert {
+            let ca = tonic::transport::Certificate::from_pem(ca_pem);
+            server_tls = server_tls.client_ca_root(ca);
+            info!("{}: Starting with mTLS enabled (client certificate required)", label);
+        } else {
+            info!("{}: Starting with TLS enabled", label);
+        }
         builder
-            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?
+            .tls_config(server_tls)?
             .add_service(
                 FlightServiceServer::new(service)
                     .max_decoding_message_size(usize::MAX)
                     .max_encoding_message_size(usize::MAX),
             )
     } else {
+        if ca_cert.is_some() {
+            warn!("{}: CA cert provided but no server identity configured — mTLS requires a server cert/key; ignoring CA cert", label);
+        }
         if label == "Flight SQL" || label == "Client Flight SQL" {
             warn!("{}: Starting in PLAINTEXT mode (insecure)", label);
         } else {

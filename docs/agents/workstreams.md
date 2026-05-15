@@ -194,10 +194,10 @@ Current evidence:
 - **worker resource quotas**: shared `GreedyMemoryPool` (default 4096 MiB) per session `RuntimeEnv`; admission semaphore (default 32 concurrent queries)
 - **graceful shutdown**: SIGTERM/SIGINT handler cancels all in-flight queries before exit
 - **node heartbeat**: 10 s background heartbeat; coordinator prunes nodes silent > 45 s to `Unavailable`
+- **intra-cluster mTLS**: `NoVerifier` removed; `ClusterMtlsConfig` uses tonic `ClientTlsConfig` with cluster CA + leaf identity; server node-channel enforces client cert via `client_ca_root()`; `analyticsdb ca init` generates CA + leaf certs (ECDSA P-256); `tls_ca_cert_path` in `ClusterConfig`
 
 Remaining gaps before this phase should be considered `Complete`:
 
-- no mTLS intra-cluster (certificate verification currently disabled)
 - no distributed equivalence tests for joins, group-by, sort/limit, window functions
 - no distributed query log sibling rows
 - no skew-aware partitioner using Parquet row-group statistics

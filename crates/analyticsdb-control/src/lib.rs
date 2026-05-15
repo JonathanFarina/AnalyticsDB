@@ -255,6 +255,7 @@ pub struct ClusterConfig {
     pub tls_cert_path: Option<String>,
     #[serde(alias = "tls_key")]
     pub tls_key_path: Option<String>,
+    pub tls_ca_cert_path: Option<String>,
     pub next_available_port_offset: u16,
     #[serde(default)]
     pub query_log: QueryLogConfig,
@@ -3655,6 +3656,7 @@ fn bootstrap_state() -> CatalogState {
         catalog_path: DEFAULT_CATALOG_PATH.to_string(),
         tls_cert_path: None,
         tls_key_path: None,
+        tls_ca_cert_path: None,
         next_available_port_offset: 0,
         query_log: QueryLogConfig::default(),
         storage_root: None,

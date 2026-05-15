@@ -417,7 +417,13 @@ async fn run() -> Result<()> {
         _ => anyhow::bail!("Both --tls-cert and --tls-key must be provided to enable TLS"),
     };
 
-    // Client-facing Flight SQL uses TLS when cert/key paths are configured.
+    // Load CA cert bytes when configured.
+    let ca_cert_bytes: Option<Vec<u8>> = match &final_tls_ca_cert {
+        Some(path) => Some(std::fs::read(path)?),
+        None => None,
+    };
+
+    // Client-facing Flight SQL uses TLS but does NOT require client certs.
     let flight_tls_config = tls_config.clone();
 
     let engine_for_flight = Arc::clone(&engine);
@@ -426,6 +432,7 @@ async fn run() -> Result<()> {
             flight_listener,
             engine_for_flight,
             flight_tls_config,
+            None,
             "Client Flight SQL",
         )
         .await
@@ -434,10 +441,19 @@ async fn run() -> Result<()> {
         }
     });
 
+    // Intra-cluster node channel: when TLS is configured, also require client certs (mTLS).
+    let node_tls_config = tls_config.clone();
+    let node_ca_cert = ca_cert_bytes.clone();
     let engine_for_node = Arc::clone(&engine);
     let node_handle = tokio::spawn(async move {
-        if let Err(e) =
-            serve_flight_sql_with_label(node_listener, engine_for_node, None, "Node channel").await
+        if let Err(e) = serve_flight_sql_with_label(
+            node_listener,
+            engine_for_node,
+            node_tls_config,
+            node_ca_cert,
+            "Node channel",
+        )
+        .await
         {
             error!("Node communication server error: {}", e);
         }

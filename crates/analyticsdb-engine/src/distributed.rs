@@ -1,7 +1,6 @@
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use analyticsdb_control::{CatalogColumn, ClusterNode, ControlPlane, NodeRole, NodeStatus};
 use analyticsdb_core::SessionContext;
@@ -13,8 +12,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
-use futures::{Future, StreamExt};
-use hyper_util::rt::tokio::TokioIo;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 /// Payload sent from a Coordinator to a Compute node via the `ExecutePartition`
@@ -70,13 +68,12 @@ pub fn partition_files_for_workers(
 
     // Greedy assignment: assign each file to the bucket with the smallest total size.
     for (file, size) in sorted {
-        // bucket_sizes is non-empty (buckets > 0 is checked at entry), so min always exists.
         let min_idx = bucket_sizes
             .iter()
             .enumerate()
             .min_by_key(|(_, s)| *s)
             .map(|(i, _)| i)
-            .unwrap_or(0);
+            .unwrap();
         chunks[min_idx].push(file);
         bucket_sizes[min_idx] += size;
     }
@@ -146,14 +143,7 @@ pub struct ExecutePartitionWriteRequest {
     pub source_columns: Vec<CatalogColumn>,
     /// Absolute filesystem path prefix under which the worker writes its output files.
     pub write_prefix: String,
-    /// Opaque tag embedded in every output filename for this attempt.
-    ///
-    /// Format: `{query_id}_a{attempt_number}`.  Workers include it as a
-    /// filename prefix so that the coordinator (or a recovery process) can
-    /// identify and delete all staged files for a given attempt by listing
-    /// the prefix and filtering on this tag — useful when the coordinator
-    /// crashes after workers write but before the manifest is updated.
-    /// Empty on old coordinators; workers fall back to a plain UUID filename.
+    /// Attempt identifier embedded in output filenames to prevent double-publishing on retry.
     #[serde(default)]
     pub attempt_id: String,
 }
@@ -166,6 +156,17 @@ pub struct ExecutePartitionWriteAck {
     pub row_count: usize,
 }
 
+// ─── mTLS configuration ──────────────────────────────────────────────────────
+
+/// mTLS configuration for intra-cluster gRPC connections.
+/// Holds PEM-encoded bytes so the connector can be cloned cheaply.
+#[derive(Clone)]
+pub struct ClusterMtlsConfig {
+    pub ca_cert_pem: Vec<u8>,
+    pub client_cert_pem: Vec<u8>,
+    pub client_key_pem: Vec<u8>,
+}
+
 // ─── Coordinator-side client ─────────────────────────────────────────────────
 
 /// Used by a Coordinator to discover Compute nodes and dispatch partition tasks
@@ -174,6 +175,7 @@ pub struct PartitionClient {
     control_plane: Arc<ControlPlane>,
     channels: Arc<dashmap::DashMap<String, tonic::transport::Channel>>,
     is_compute_eligible: bool,
+    mtls: Option<Arc<ClusterMtlsConfig>>,
 }
 
 impl PartitionClient {
@@ -182,6 +184,7 @@ impl PartitionClient {
             control_plane,
             channels: Arc::new(dashmap::DashMap::new()),
             is_compute_eligible: false,
+            mtls: None,
         }
     }
 
@@ -189,11 +192,15 @@ impl PartitionClient {
         self.is_compute_eligible = eligible;
     }
 
+    pub fn set_mtls(&mut self, config: ClusterMtlsConfig) {
+        self.mtls = Some(Arc::new(config));
+    }
+
     async fn get_or_create_channel(&self, endpoint: &str) -> Result<tonic::transport::Channel> {
         if let Some(ch) = self.channels.get(endpoint) {
             return Ok(ch.clone());
         }
-        let ch = build_channel(endpoint).await?;
+        let ch = build_channel(endpoint, self.mtls.as_deref()).await?;
         self.channels.insert(endpoint.to_string(), ch.clone());
         Ok(ch)
     }
@@ -263,10 +270,6 @@ impl PartitionClient {
     /// Sends an `ExecutePartition` DoAction to a Compute node and returns a stream
     /// of `RecordBatch`es.  The node endpoint must be a fully-qualified
     /// URI such as `http://host:50052` or `https://host:50052`.
-    ///
-    /// If `cancel` is triggered before the action completes, the function
-    /// returns an error immediately.  For in-flight streams, dropping the
-    /// returned `Pin<Box<dyn Stream>>` cancels the underlying gRPC transport.
     pub async fn execute_on_node(
         &self,
         node_endpoint: &str,
@@ -313,114 +316,36 @@ impl PartitionClient {
 
 /// Builds a tonic transport channel to `endpoint`.
 ///
-/// For `http://` endpoints a plain HTTP/2 connection is used.
-/// For `https://` endpoints an encrypted connection is established but
-/// certificate verification is skipped — intra-cluster gRPC runs on a
-/// trusted internal network and all nodes share the same cluster cert, so
-/// peer verification adds no real security benefit here.
-async fn build_channel(endpoint: &str) -> Result<tonic::transport::Channel> {
+/// For `http://` endpoints a plain HTTP/2 connection is used (no TLS).
+/// For `https://` endpoints, mTLS is required — `mtls` must be `Some`.
+async fn build_channel(
+    endpoint: &str,
+    mtls: Option<&ClusterMtlsConfig>,
+) -> Result<tonic::transport::Channel> {
     let builder = tonic::transport::Endpoint::new(endpoint.to_string())?
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(300));
 
     if endpoint.starts_with("https://") {
-        Ok(builder
-            .connect_with_connector(ClusterInternalConnector::new())
-            .await?)
+        let cfg = mtls.ok_or_else(|| {
+            anyhow::anyhow!(
+                "HTTPS intra-cluster endpoint '{}' requires mTLS config. \
+                 Run `analyticsdb ca init` and set tls_ca_cert_path / tls_cert_path / tls_key_path in cluster config.",
+                endpoint
+            )
+        })?;
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(tonic::transport::Certificate::from_pem(
+                cfg.ca_cert_pem.clone(),
+            ))
+            .identity(tonic::transport::Identity::from_pem(
+                cfg.client_cert_pem.clone(),
+                cfg.client_key_pem.clone(),
+            ));
+        Ok(builder.tls_config(tls)?.connect().await?)
     } else {
         Ok(builder.connect().await?)
-    }
-}
-
-// ─── Insecure TLS connector for intra-cluster gRPC ──────────────────────────
-
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-#[derive(Clone)]
-struct ClusterInternalConnector {
-    tls_config: Arc<rustls::ClientConfig>,
-}
-
-impl ClusterInternalConnector {
-    fn new() -> Self {
-        // `with_safe_default_protocol_versions()` only fails if the provider supports
-        // no TLS versions, which cannot happen with the bundled aws-lc-rs default.
-        #[allow(clippy::expect_used)]
-        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("rustls config")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-        cfg.alpn_protocols = vec![b"h2".to_vec()];
-        Self {
-            tls_config: Arc::new(cfg),
-        }
-    }
-}
-
-impl tower::Service<http::Uri> for ClusterInternalConnector {
-    type Response = TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
-    type Error = anyhow::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let tls_config = Arc::clone(&self.tls_config);
-        let host = uri.host().unwrap_or("localhost").to_string();
-        let port = uri.port_u16().unwrap_or(443);
-        Box::pin(async move {
-            let tcp = tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await?;
-            let connector = tokio_rustls::TlsConnector::from(tls_config);
-            let domain = rustls_pki_types::ServerName::try_from(host)
-                .map_err(|e| anyhow::anyhow!("Invalid DNS name: {}", e))?
-                .to_owned();
-            let tls = connector.connect(domain, tcp).await?;
-            Ok(TokioIo::new(tls))
-        })
     }
 }
 
@@ -575,5 +500,61 @@ mod tests {
             chunks[0],
             vec!["x.parquet".to_string(), "y.parquet".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn mtls_config_from_cluster_config_requires_all_three_paths() {
+        use analyticsdb_control::{ClusterConfig, QueryLogConfig};
+        use crate::load_mtls_config_from_cluster_config;
+        let mut config = ClusterConfig {
+            base_postgres_port: 5432,
+            base_flight_sql_port: 50051,
+            base_node_port: 60051,
+            catalog_path: "analyticsdb-catalog.db".to_string(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_cert_path: None,
+            next_available_port_offset: 0,
+            query_log: QueryLogConfig::default(),
+            storage_root: None,
+            cluster_id: None,
+            s3_sse: None,
+            s3_sse_kms_key_id: None,
+        };
+        // No paths — None
+        assert!(load_mtls_config_from_cluster_config(&config).is_none());
+        // Only CA path — still None
+        config.tls_ca_cert_path = Some("/tmp/ca.crt".to_string());
+        assert!(load_mtls_config_from_cluster_config(&config).is_none());
+    }
+
+    #[test]
+    fn cluster_mtls_config_can_be_built_from_rcgen_certs() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, IsCa, KeyPair, SanType,
+            PKCS_ECDSA_P256_SHA256,
+        };
+        // Generate CA
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        // Generate leaf
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.subject_alt_names =
+            vec![SanType::DnsName("localhost".try_into().unwrap())];
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap();
+        // Build config
+        let cfg = ClusterMtlsConfig {
+            ca_cert_pem: ca_cert.pem().into_bytes(),
+            client_cert_pem: leaf_cert.pem().into_bytes(),
+            client_key_pem: leaf_key.serialize_pem().into_bytes(),
+        };
+        assert!(!cfg.ca_cert_pem.is_empty());
+        assert!(!cfg.client_cert_pem.is_empty());
+        assert!(!cfg.client_key_pem.is_empty());
     }
 }

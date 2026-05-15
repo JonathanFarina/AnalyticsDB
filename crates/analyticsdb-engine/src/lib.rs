@@ -167,6 +167,22 @@ pub use distributed::{
     PartitionClient,
 };
 
+fn load_mtls_config_from_cluster_config(
+    config: &analyticsdb_control::ClusterConfig,
+) -> Option<crate::distributed::ClusterMtlsConfig> {
+    let ca_path = config.tls_ca_cert_path.as_ref()?;
+    let cert_path = config.tls_cert_path.as_ref()?;
+    let key_path = config.tls_key_path.as_ref()?;
+    let ca = std::fs::read(ca_path).ok()?;
+    let cert = std::fs::read(cert_path).ok()?;
+    let key = std::fs::read(key_path).ok()?;
+    Some(crate::distributed::ClusterMtlsConfig {
+        ca_cert_pem: ca,
+        client_cert_pem: cert,
+        client_key_pem: key,
+    })
+}
+
 // Re-export submodule items so that `use super::*` in child modules
 // pulls everything into scope.
 pub(crate) use batch::*;
@@ -516,10 +532,10 @@ impl PrototypeEngine {
             }
         }
 
-        let query_log_config = control_plane
-            .cluster_config()
-            .await
-            .map(|config| config.query_log)
+        let cluster_config = control_plane.cluster_config().await;
+        let query_log_config = cluster_config
+            .as_ref()
+            .map(|config| config.query_log.clone())
             .unwrap_or_default();
         let query_log_root = control_plane
             .managed_data_root()
@@ -527,6 +543,11 @@ impl PrototypeEngine {
             .join("query_log");
         let mut partition_client = PartitionClient::new(Arc::clone(&control_plane));
         partition_client.set_compute_eligible(true);
+        if let Some(config) = &cluster_config {
+            if let Some(mtls_config) = load_mtls_config_from_cluster_config(config) {
+                partition_client.set_mtls(mtls_config);
+            }
+        }
         let partition_client = Arc::new(partition_client);
         Ok(Self {
             control_plane,

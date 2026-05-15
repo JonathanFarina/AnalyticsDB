@@ -24,8 +24,8 @@ What the engine actually is today:
   `<catalog>.managed/` plus sidecar index manifests. There is no object-store
   durability path in production use.
 - Distributed execution is a single coordinator dispatching `ExecutePartition`
-  Flight DoActions to compute workers over an intra-cluster TLS channel that
-  **disables certificate verification** ([distributed.rs:295-365](crates/analyticsdb-engine/src/distributed.rs:295)).
+  Flight DoActions to compute workers over an intra-cluster mTLS channel
+  (`ClusterMtlsConfig`; `NoVerifier` removed; `analyticsdb ca init` provisions certs).
 - Auth is a prototype: password rotation works, but there is no production
   credential storage, no role/group model, no audit trail, and no key rotation
   story for cluster TLS.
@@ -280,10 +280,21 @@ which is fine for a prototype but must not ship.
 
 Tasks:
 
-C1. **Intra-cluster mTLS.** Replace `NoVerifier` with proper mutual TLS using
+✅ C1. **Intra-cluster mTLS.** Replace `NoVerifier` with proper mutual TLS using
     a cluster CA distributed via the control plane. Each node gets a leaf
     certificate signed by the cluster CA and presents it as both server and
     client. Document key rotation.
+    > Done: `NoVerifier` / `ClusterInternalConnector` removed from engine and
+    > server. `ClusterMtlsConfig` struct holds PEM-encoded CA cert + leaf
+    > cert/key; `PartitionClient::build_channel` uses tonic `ClientTlsConfig`
+    > with `.ca_certificate()` + `.identity()` for HTTPS endpoints and errors
+    > clearly for misconfigured nodes. Server node-channel uses
+    > `ServerTlsConfig::client_ca_root()` to require client certs (mTLS).
+    > `analyticsdb ca init` CLI subcommand generates CA + leaf certs (rcgen,
+    > ECDSA P-256) with configurable SANs. `tls_ca_cert_path` added to
+    > `ClusterConfig`. Committed private keys removed from repo and added to
+    > `.gitignore`. Unit tests: `mtls_config_from_cluster_config_requires_all_three_paths`
+    > and `cluster_mtls_config_can_be_built_from_rcgen_certs`.
 
 ✅ C2. **Cancellation.** Plumb a `CancellationToken` from coordinator query
     admission through `PartitionClient::execute_on_node`
@@ -353,10 +364,10 @@ C9. **Catalog under concurrency.** Today same-table mutations are serialized
   node; coordinator prunes nodes silent for > 45 s to `Unavailable`;
   `Heartbeat` Flight DoAction for remote heartbeat.
 
-**Exit Gate (C):** *(blocked on C1, C6, C7, C8, C9)*
+**Exit Gate (C):** *(blocked on C6, C7, C8, C9)*
 - ❌ Chaos test / worker-kill retry scenario.
 - ✅ `KILL QUERY <id>` cancels in-flight queries.
-- ❌ mTLS required intra-cluster.
+- ✅ mTLS required intra-cluster (`analyticsdb ca init` + `tls_ca_cert_path`).
 - ❌ Distributed equivalence tests for joins, group-by, sort/limit, window functions.
 
 ---

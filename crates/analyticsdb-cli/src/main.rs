@@ -3,6 +3,10 @@ use analyticsdb_engine::PrototypeEngine;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use clap::{Parser, Subcommand, ValueEnum};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType,
+    PKCS_ECDSA_P256_SHA256,
+};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use futures::StreamExt;
@@ -33,7 +37,95 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Query(options) => run_query(options).await,
         Commands::Interactive(options) => run_interactive(options).await,
+        Commands::Ca(opts) => match opts.command {
+            CaCommands::Init(init_opts) => run_ca_init(&init_opts),
+        },
     }
+}
+
+fn run_ca_init(opts: &CaInitOptions) -> Result<()> {
+    let output_dir = std::path::Path::new(&opts.output);
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory '{}'", opts.output))?;
+
+    // Build CA cert
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "AnalyticsDB Cluster CA");
+    ca_params.not_before = time::OffsetDateTime::now_utc();
+    ca_params.not_after =
+        time::OffsetDateTime::now_utc() + time::Duration::days(opts.validity_days as i64);
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .context("failed to generate CA key pair")?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .context("failed to self-sign CA certificate")?;
+
+    // Build leaf cert
+    let mut leaf_params = CertificateParams::default();
+    let mut sans = vec![
+        SanType::DnsName("localhost".try_into().context("invalid SAN: localhost")?),
+        SanType::IpAddress("127.0.0.1".parse().context("invalid SAN: 127.0.0.1")?),
+        SanType::DnsName(
+            "*.analyticsdb.local"
+                .try_into()
+                .context("invalid SAN: *.analyticsdb.local")?,
+        ),
+    ];
+    for h in &opts.hostname {
+        sans.push(SanType::DnsName(
+            h.as_str().try_into().with_context(|| format!("invalid hostname SAN: {h}"))?,
+        ));
+    }
+    leaf_params.subject_alt_names = sans;
+    leaf_params.not_before = time::OffsetDateTime::now_utc();
+    leaf_params.not_after =
+        time::OffsetDateTime::now_utc() + time::Duration::days(opts.validity_days as i64);
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .context("failed to generate leaf key pair")?;
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .context("failed to sign leaf certificate with CA")?;
+
+    // Write files
+    let ca_crt_path = output_dir.join("ca.crt");
+    let ca_key_path = output_dir.join("ca.key");
+    let server_crt_path = output_dir.join("server.crt");
+    let server_key_path = output_dir.join("server.key");
+
+    std::fs::write(&ca_crt_path, ca_cert.pem())
+        .with_context(|| format!("failed to write {}", ca_crt_path.display()))?;
+    std::fs::write(&ca_key_path, ca_key.serialize_pem())
+        .with_context(|| format!("failed to write {}", ca_key_path.display()))?;
+    std::fs::write(&server_crt_path, leaf_cert.pem())
+        .with_context(|| format!("failed to write {}", server_crt_path.display()))?;
+    std::fs::write(&server_key_path, leaf_key.serialize_pem())
+        .with_context(|| format!("failed to write {}", server_key_path.display()))?;
+
+    println!("Generated CA and server certificates in '{}':", opts.output);
+    println!("  ca.crt     — CA certificate (trust anchor for all cluster nodes)");
+    println!("  ca.key     — CA private key (keep secret; used only to issue new certs)");
+    println!("  server.crt — Server/client leaf certificate (used by each node)");
+    println!("  server.key — Leaf private key");
+    println!();
+    println!("Add to your cluster-config.json:");
+    println!(
+        "  \"tls_ca_cert_path\": \"{}\",",
+        ca_crt_path.display()
+    );
+    println!(
+        "  \"tls_cert_path\":    \"{}\",",
+        server_crt_path.display()
+    );
+    println!(
+        "  \"tls_key_path\":     \"{}\"",
+        server_key_path.display()
+    );
+
+    Ok(())
 }
 
 async fn run_query(options: QueryOptions) -> Result<()> {
@@ -990,6 +1082,32 @@ struct Cli {
 enum Commands {
     Query(QueryOptions),
     Interactive(InteractiveOptions),
+    Ca(CaOptions),
+}
+
+#[derive(Debug, Parser)]
+struct CaOptions {
+    #[command(subcommand)]
+    command: CaCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum CaCommands {
+    /// Generate a self-signed CA and a leaf certificate signed by that CA.
+    Init(CaInitOptions),
+}
+
+#[derive(Clone, Debug, Parser)]
+struct CaInitOptions {
+    /// Directory to write generated certificate files into.
+    #[arg(long, default_value = "./certs")]
+    output: String,
+    /// Certificate validity in days.
+    #[arg(long, default_value_t = 365)]
+    validity_days: u32,
+    /// Additional hostnames to include as Subject Alternative Names (repeatable).
+    #[arg(long, default_value = "localhost", action = clap::ArgAction::Append)]
+    hostname: Vec<String>,
 }
 
 #[derive(Clone, Debug, Parser)]
