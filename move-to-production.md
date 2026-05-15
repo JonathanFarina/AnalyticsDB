@@ -377,7 +377,7 @@ Tasks:
 
 ---
 
-### Phase D. Authentication, Authorization, And Audit *(in progress)*
+### Phase D. Authentication, Authorization, And Audit *(D2–D6 complete; D7–D8 + CLI parity tests outstanding)*
 
 Today the auth scaffold has prototype credential storage with rotation
 metadata, but the system charter requires "users, roles, groups" and
@@ -396,27 +396,49 @@ Tasks:
     > passwords are still accepted during migration window and re-hashed on
     > next rotation.
 
-D2. **PostgreSQL SCRAM-SHA-256.** Implement `SCRAM-SHA-256` as the default PG
+✅ D2. **PostgreSQL SCRAM-SHA-256.** Implement `SCRAM-SHA-256` as the default PG
     auth flow. Keep plain/MD5 disabled by default; gate them behind an
     explicit config flag for migration.
+    > Done: `compute_scram_verifier()` derives `PBKDF2-HMAC-SHA256(SASLprep(password), 16-byte-salt, 4096)`;
+    > `create_user` and `rotate_user_password` populate `scram_salt_b64` + `scram_salted_password_b64`
+    > on `CatalogUser`. PG wire switched from `CleartextPasswordAuthStartupHandler` to pgwire's
+    > `SASLAuthStartupHandler` with `ControlPlaneScramAuthSource`. Bootstrap users get SCRAM
+    > verifiers pre-computed. New deps: `pbkdf2`, `sha2`, `hmac`, `stringprep`.
 
-D3. **Flight SQL bearer token auth.** Issue short-lived bearer tokens after
+✅ D3. **Flight SQL bearer token auth.** Issue short-lived bearer tokens after
     handshake, refresh through the control plane, and bind tokens to a
     session id. Reject tokens after `ALTER USER ... PASSWORD ...` rotation.
+    > Done: `do_handshake` signs a HS256 JWT (`FlightSqlClaims`: sub, role, db, schema,
+    > pwd_ver, exp 24 h, iat) using `jsonwebtoken`. `verify_bearer_token()` validates expiry
+    > and `pwd_ver` against the catalog (stale tokens rejected on rotation). Auto-generates
+    > a 32-byte random `jwt_secret` if absent from `ClusterConfig`. Applied to all authenticated
+    > Flight SQL RPCs.
 
-D4. **Roles and groups.** Implement `CREATE ROLE`, `GRANT`, `REVOKE`,
+✅ D4. **Roles and groups.** Implement `CREATE ROLE`, `GRANT`, `REVOKE`,
     `ALTER ROLE` with PG-style semantics. Wire role-membership checks into
     every catalog operation (`CREATE TABLE`, `DROP TABLE`, `SELECT`, etc.).
     Add CLI parity tests for each grant/revoke transition.
+    > Done: `object_permissions` SQLite table (grantee, object_type, object_name, privilege,
+    > granted_by, granted_at_ms). `grant_privilege`, `revoke_privilege`, `check_privilege`
+    > on `CatalogStore` trait (JSON store always grants). `GRANT/REVOKE` parsed via sqlparser
+    > `Statement::Grant/Revoke` AST; admin-only enforcement. 3 new unit tests.
 
-D5. **Object-level grants.** `GRANT SELECT ON <table> TO <role>` must
+✅ D5. **Object-level grants.** `GRANT SELECT ON <table> TO <role>` must
     actually gate read access in the planner. Add CLI tests that prove
     denied roles get a uniform `permission denied for <object>` error on
     both protocols.
+    > Done: `check_table_access()` in engine checks `check_privilege` before DML execution;
+    > admin users bypass. `extract_dml_table_and_privilege()` parses SELECT/INSERT/UPDATE/DELETE
+    > target table and required privilege. Error message: `permission denied for table <name>`
+    > (PG-compatible SQLSTATE 42501). 2 unit tests: unprivileged role denied, granted role allowed.
 
-D6. **Audit log.** Add a durable `system.audit_log` parallel to
+✅ D6. **Audit log.** Add a durable `system.audit_log` parallel to
     `system.query_log` for DDL, GRANT/REVOKE, ALTER USER, and failed-auth
     events. Same off-hot-path pattern as the existing query log.
+    > Done: `crates/analyticsdb-engine/src/audit_log/mod.rs` with `AuditEventType` enum,
+    > `AuditLogRecord` (11 Arrow columns), `AuditLogConfig`, `AuditLog` background writer.
+    > Events fired from DDL handlers (CREATE/DROP TABLE, CREATE/DROP USER, ALTER USER,
+    > GRANT/REVOKE). Exposed as `system.audit_log` via `ListingTable`. 2 unit tests.
 
 D7. **Secrets management contract.** Storage credentials, TLS keys, and any
     external-system credentials must be referenced by name, never embedded.
@@ -431,12 +453,15 @@ D8. **Session timeouts and idle limits.** Implement `statement_timeout`
     > (env `ANALYTICSDB_QUERY_TIMEOUT_SECS`). Per-session `statement_timeout`
     > setting not yet enforced; `idle_in_transaction_session_timeout` not implemented.
 
-**Exit Gate (D):** *(blocked on D2–D7)*
+**Exit Gate (D):** *(blocked on D7–D8 + CLI parity tests)*
 - ✅ No new plaintext passwords written (Argon2id on create/rotate).
+- ✅ SCRAM-SHA-256 wired for PG wire; SCRAM verifiers stored at create/rotate time.
+- ✅ Flight SQL JWT bearer tokens issued and validated per-RPC.
+- ✅ GRANT/REVOKE parsed and persisted; planner enforces privilege checks.
+- ✅ `system.audit_log` durable and SQL-queryable.
+- ❌ SCRAM-SHA-256 end-to-end CLI test against psql/pgcli/JDBC.
+- ❌ GRANT/REVOKE CLI parity tests.
 - ❌ Catalog audit test scanning for low-entropy credential strings.
-- ❌ SCRAM-SHA-256 against psql/pgcli/JDBC.
-- ❌ GRANT/REVOKE with CLI parity tests.
-- ❌ `system.audit_log`.
 
 ---
 
