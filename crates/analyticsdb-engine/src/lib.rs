@@ -280,6 +280,7 @@ pub struct PrototypeEngine {
     partition_client: Arc<PartitionClient>,
     file_list_cache: Arc<FileListCache>,
     query_log: Arc<QueryLog>,
+    active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 impl std::fmt::Debug for PrototypeEngine {
@@ -303,6 +304,7 @@ impl Clone for PrototypeEngine {
             partition_client: Arc::clone(&self.partition_client),
             file_list_cache: Arc::clone(&self.file_list_cache),
             query_log: Arc::clone(&self.query_log),
+            active_queries: Arc::clone(&self.active_queries),
         }
     }
 }
@@ -410,6 +412,19 @@ fn command_outcome(tag: impl Into<String>, rows_affected: u64) -> StatementOutco
     }
 }
 
+/// RAII guard that removes a query's `CancellationToken` from the active-query registry
+/// when the guard is dropped (i.e., when the query completes or returns an error).
+struct QueryGuard {
+    query_id: String,
+    active_queries: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        self.active_queries.remove(&self.query_id);
+    }
+}
+
 impl PrototypeEngine {
     pub async fn local_node_id(&self) -> String {
         self.control_plane
@@ -431,6 +446,7 @@ impl PrototypeEngine {
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::disabled()),
+            active_queries: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -455,6 +471,7 @@ impl PrototypeEngine {
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
+            active_queries: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -471,6 +488,7 @@ impl PrototypeEngine {
             &QueryRequest {
                 sql: req.sql.clone(),
                 session: req.session.clone(),
+                query_id: None,
             },
             &req.query_id,
             &req.initial_query_id,
@@ -576,6 +594,7 @@ impl PrototypeEngine {
             &QueryRequest {
                 sql: req.sql.clone(),
                 session: req.session.clone(),
+                query_id: None,
             },
             &req.query_id,
             &req.initial_query_id,
@@ -750,6 +769,19 @@ impl PrototypeEngine {
     pub async fn execute_query(&self, request: &QueryRequest) -> Result<QueryExecutionResult> {
         let original_sql = request.sql.clone();
         let (request, admission, started) = self.prepare_query_request(request).await?;
+
+        // Register a CancellationToken for this query so KILL QUERY can cancel it.
+        let token = tokio_util::sync::CancellationToken::new();
+        let query_id = request
+            .query_id
+            .clone()
+            .unwrap_or_else(|| admission.query_id.clone());
+        self.active_queries.insert(query_id.clone(), token.clone());
+        let _guard = QueryGuard {
+            query_id: query_id.clone(),
+            active_queries: Arc::clone(&self.active_queries),
+        };
+
         let probe = self
             .query_log
             .start_probe(&request, &admission, &original_sql);
@@ -1373,7 +1405,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "SELECT 1 AS logged_value".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("logged query should execute");
 
@@ -1383,7 +1416,8 @@ FROM generate_series(1, 1000000) AS s(n)
                 .execute_query(&QueryRequest {
                     sql: "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 1 AS logged_value' ORDER BY event_time_us LIMIT 1".to_string(),
                     session: session.clone(),
-                })
+                    query_id: None,
+})
                 .await
                 .expect("query log should be readable");
             rows = result.to_query_response().rows;
@@ -1422,7 +1456,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "SELECT * FROM generate_series(1, 100)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("query should execute");
 
@@ -1431,7 +1466,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query_stream(&QueryRequest {
                 sql: "SELECT * FROM generate_series(1, 50) AS t2".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("stream query should execute");
 
@@ -1447,7 +1483,8 @@ FROM generate_series(1, 1000000) AS s(n)
                 .execute_query(&QueryRequest {
                     sql: "SELECT query, read_rows, result_rows FROM system.query_log ORDER BY event_time_us".to_string(),
                     session: session.clone(),
-                })
+                    query_id: None,
+})
                 .await
                 .expect("query log should be readable");
             rows = result.to_query_response().rows;
@@ -1549,7 +1586,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("table should be created");
 
@@ -1560,11 +1598,13 @@ FROM generate_series(1, 1000000) AS s(n)
         let request_a = QueryRequest {
             sql: "INSERT INTO customers VALUES (1, 'one')".to_string(),
             session: session_a,
-        };
+            query_id: None,
+};
         let request_b = QueryRequest {
             sql: "INSERT INTO customers VALUES (1, 'duplicate')".to_string(),
             session: session_b,
-        };
+            query_id: None,
+};
 
         let (insert_a, insert_b) = tokio::join!(
             engine_a.execute_query(&request_a),
@@ -1587,6 +1627,7 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "SELECT id, name FROM customers WHERE id = 1".to_string(),
                 session,
+                query_id: None,
             })
             .await
             .expect("indexed select should succeed");
@@ -1613,7 +1654,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1621,7 +1663,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "INSERT INTO customers VALUES (1, 'one'), (2, 'two')".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1631,7 +1674,8 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "CREATE UNIQUE INDEX CONCURRENTLY customers_name_idx ON customers (name)"
                     .to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("CREATE UNIQUE INDEX CONCURRENTLY should succeed");
 
@@ -1644,7 +1688,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "SELECT id, name FROM customers WHERE name = 'one'".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("Query should succeed");
         let response = result.to_query_response();
@@ -1671,7 +1716,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE test_idx (id INT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1679,7 +1725,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "CREATE INDEX test_idx_idx ON test_idx (id)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1687,7 +1734,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "SELECT relname, indisvalid FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid WHERE relname = 'test_idx_idx'".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("Query should succeed");
 
@@ -1714,7 +1762,8 @@ FROM generate_series(1, 1000000) AS s(n)
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1730,7 +1779,8 @@ FROM generate_series(1, 1000) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: sql.to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await;
 
         cleanup_catalog_artifacts(&catalog_path);
@@ -1751,7 +1801,8 @@ FROM generate_series(1, 1000) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -1817,14 +1868,16 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_name TEXT NOT NULL, order_value NUMERIC(12,2) NOT NULL, date_of_purchase DATE NOT NULL)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("orders table should be created");
         engine
             .execute_query(&QueryRequest {
                 sql: "INSERT INTO orders (id, customer_name, order_value, date_of_purchase) SELECT 1, 'A', CAST(10.50 AS NUMERIC(12,2)), CAST('2024-01-15' AS DATE) UNION ALL SELECT 2, 'B', CAST(20.25 AS NUMERIC(12,2)), CAST('2019-06-01' AS DATE)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("orders should be inserted");
 
@@ -2022,7 +2075,8 @@ FROM generate_series(1, 10) AS s(n)";
         let request = QueryRequest {
             sql: "SELECT COUNT(*) FROM customers".to_string(),
             session: session.clone(),
-        };
+            query_id: None,
+};
         let admission = QueryAdmission {
             query_id: "test-distributed-count-finalize".to_string(),
             coordinator_node_id: "coord-test".to_string(),
@@ -2086,7 +2140,8 @@ FROM generate_series(1, 10) AS s(n)";
         let request = QueryRequest {
             sql: "SELECT COUNT(*) FROM customers".to_string(),
             session: session.clone(),
-        };
+            query_id: None,
+};
         let admission = QueryAdmission {
             query_id: "test-distributed-partial-count-finalize".to_string(),
             coordinator_node_id: "coord-test".to_string(),
@@ -2163,7 +2218,8 @@ FROM generate_series(1, 10) AS s(n)";
         let request = QueryRequest {
             sql: "SELECT COUNT(*) AS n, SUM(amount) AS total, AVG(amount) AS avg_amount, MIN(id) AS first_id, MAX(id) AS last_id FROM customers".to_string(),
             session: session.clone(),
-        };
+            query_id: None,
+};
         let admission = QueryAdmission {
             query_id: "test-distributed-multi-agg-finalize".to_string(),
             coordinator_node_id: "coord-test".to_string(),
@@ -2371,7 +2427,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE dist_test (id INT, val TEXT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -2379,7 +2436,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "INSERT INTO dist_test SELECT 1, 'hello'".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -2388,7 +2446,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "SELECT * FROM dist_test".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("local fallback should succeed");
 
@@ -2415,7 +2474,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE write_src (n INT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
         engine
@@ -2423,7 +2483,8 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "INSERT INTO write_src SELECT * FROM generate_series(1, 5) AS s(n)"
                     .to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -2486,21 +2547,24 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE ins_src (x INT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
         engine
             .execute_query(&QueryRequest {
                 sql: "INSERT INTO ins_src SELECT * FROM generate_series(1, 3) AS s(x)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
         engine
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE ins_dst (x INT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -2509,7 +2573,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "INSERT INTO ins_dst SELECT * FROM ins_src".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("local insert fallback should succeed");
 
@@ -2538,7 +2603,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "CREATE TABLE fail_test (id INT)".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
         engine
@@ -2546,7 +2612,8 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "INSERT INTO fail_test SELECT * FROM generate_series(1, 10) AS s(id)"
                     .to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .unwrap();
 
@@ -2569,7 +2636,8 @@ FROM generate_series(1, 10) AS s(n)";
             .execute_query(&QueryRequest {
                 sql: "SELECT * FROM fail_test".to_string(),
                 session: session.clone(),
-            })
+                query_id: None,
+})
             .await
             .expect("Query should succeed via fallback despite bogus node");
 

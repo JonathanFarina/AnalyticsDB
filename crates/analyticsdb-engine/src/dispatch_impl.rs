@@ -151,7 +151,14 @@ impl PrototypeEngine {
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
                 dispatch_futures.push(async move {
-                    match pc.execute_on_node(&endpoint, req).await {
+                    match pc
+                        .execute_on_node(
+                            &endpoint,
+                            req,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                    {
                         Ok(stream) => Ok((node_id, stream)),
                         Err(e) => Err((node_id, e)),
                     }

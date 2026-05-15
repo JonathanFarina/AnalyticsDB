@@ -2037,6 +2037,23 @@ impl PrototypeEngine {
                     request.session.clone(),
                 )
             }
+            MetadataStatement::KillQuery { query_id } => {
+                if let Some(entry) = self.active_queries.get(&query_id) {
+                    entry.value().cancel();
+                    (
+                        Arc::new(Schema::empty()),
+                        Vec::new(),
+                        format!("Query '{}' cancelled.", query_id),
+                        command_outcome("KILL", 1),
+                        request.session.clone(),
+                    )
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "No active query with id '{}'",
+                        query_id
+                    ));
+                }
+            }
         };
 
         Ok(QueryExecutionResult {

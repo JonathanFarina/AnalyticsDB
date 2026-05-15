@@ -205,7 +205,7 @@ async fn run_embedded_query(
     session: SessionContext,
     catalog_path: String,
 ) -> Result<QueryResponse> {
-    let request = QueryRequest { sql, session };
+    let request = QueryRequest { sql, session, query_id: None };
     let engine = PrototypeEngine::from_catalog_path(&catalog_path).await?;
 
     let result = engine.execute_query(&request).await?;

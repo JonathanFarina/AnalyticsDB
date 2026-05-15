@@ -253,10 +253,15 @@ impl PartitionClient {
     /// Sends an `ExecutePartition` DoAction to a Compute node and returns a stream
     /// of `RecordBatch`es.  The node endpoint must be a fully-qualified
     /// URI such as `http://host:50052` or `https://host:50052`.
+    ///
+    /// If `cancel` is triggered before the action completes, the function
+    /// returns an error immediately.  For in-flight streams, dropping the
+    /// returned `Pin<Box<dyn Stream>>` cancels the underlying gRPC transport.
     pub async fn execute_on_node(
         &self,
         node_endpoint: &str,
         req: &ExecutePartitionRequest,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<RecordBatch>> + Send>>> {
         let channel = self.get_or_create_channel(node_endpoint).await?;
         let mut client = FlightServiceClient::new(channel)
@@ -268,7 +273,17 @@ impl PartitionClient {
             body: bincode::serialize(req)?.into(),
         };
 
-        let stream = client.do_action(action).await?.into_inner();
+        // Race the DoAction call against cancellation so that a KILL QUERY
+        // issued before or during connection establishment aborts promptly.
+        let action_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(anyhow::anyhow!("Query cancelled"));
+            }
+            result = client.do_action(action) => result,
+        };
+
+        let stream = action_result?.into_inner();
         let batch_stream = stream.then(|result| async move {
             match result {
                 Ok(flight_result) => match ipc_bytes_to_batches(&flight_result.body) {

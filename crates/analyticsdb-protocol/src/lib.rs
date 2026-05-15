@@ -550,6 +550,7 @@ impl SimpleQueryHandler for AnalyticsPostgresHandler {
             QueryRequest {
                 sql: query.to_string(),
                 session: postgres_session_from_client(client),
+                query_id: None,
             },
         )
         .await?;
@@ -588,6 +589,7 @@ impl QueryParser for AnalyticsQueryParser {
             let request = QueryRequest {
                 sql: described_sql,
                 session: postgres_session_from_client(client),
+                query_id: None,
             };
             match self
                 .engine
@@ -670,6 +672,7 @@ impl ExtendedQueryHandler for AnalyticsPostgresHandler {
             QueryRequest {
                 sql: rendered_sql,
                 session: postgres_session_from_client(client),
+                query_id: None,
             },
         )
         .await?;
@@ -1754,7 +1757,7 @@ async fn plan_rows_schema(
     session: SessionContext,
 ) -> Result<SchemaRef, Status> {
     let schema = engine
-        .plan_query_schema(&QueryRequest { sql, session })
+        .plan_query_schema(&QueryRequest { sql, session, query_id: None })
         .await
         .map_err(status_from_error)?;
 
@@ -2013,6 +2016,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .execute_query_stream(&QueryRequest {
                 sql: payload.sql,
                 session: payload.session,
+                query_id: None,
             })
             .await
             .map_err(status_from_error)?;
@@ -2045,6 +2049,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .execute_batches(QueryRequest {
                 sql: command.query,
                 session,
+                query_id: None,
             })
             .await?;
 
@@ -2061,6 +2066,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .execute_batches(QueryRequest {
                 sql: payload.sql,
                 session: payload.session,
+                query_id: None,
             })
             .await?;
 
@@ -2339,6 +2345,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             .plan_query_schema(&QueryRequest {
                 sql: query.query.clone(),
                 session: session.clone(),
+                query_id: None,
             })
             .await
         {
@@ -3797,6 +3804,7 @@ mod tests {
                     protocol: Protocol::Embedded,
                     ..SessionContext::default()
                 },
+                query_id: None,
             })
             .await
             .expect("table should be created");
@@ -3875,6 +3883,7 @@ mod tests {
                         protocol: Protocol::Embedded,
                         ..SessionContext::default()
                     },
+                    query_id: None,
                 })
                 .await
                 .expect("setup SQL should succeed");

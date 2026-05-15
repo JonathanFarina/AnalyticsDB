@@ -644,6 +644,9 @@ pub enum MetadataStatement {
     Begin,
     Commit,
     Rollback,
+    KillQuery {
+        query_id: String,
+    },
 }
 
 pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
@@ -1088,7 +1091,8 @@ impl ControlPlane {
             | MetadataStatement::DropTable { .. }
             | MetadataStatement::DropView { .. }
             | MetadataStatement::DropDatabase { .. }
-            | MetadataStatement::DropSchema { .. } => {
+            | MetadataStatement::DropSchema { .. }
+            | MetadataStatement::KillQuery { .. } => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases => {
@@ -4993,6 +4997,21 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
 
     if upper.starts_with("REINDEX ") {
         return parse_reindex_statement(trimmed);
+    }
+
+    if upper.starts_with("KILL QUERY ") {
+        let raw_id = trimmed["KILL QUERY ".len()..].trim();
+        // Strip optional surrounding single or double quotes.
+        let query_id = if (raw_id.starts_with('\'') && raw_id.ends_with('\''))
+            || (raw_id.starts_with('"') && raw_id.ends_with('"'))
+        {
+            raw_id[1..raw_id.len() - 1].to_string()
+        } else {
+            raw_id.to_string()
+        };
+        if !query_id.is_empty() {
+            return Some(MetadataStatement::KillQuery { query_id });
+        }
     }
 
     None

@@ -48,6 +48,8 @@ impl Default for SessionContext {
 pub struct QueryRequest {
     pub sql: String,
     pub session: SessionContext,
+    #[serde(default)]
+    pub query_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
