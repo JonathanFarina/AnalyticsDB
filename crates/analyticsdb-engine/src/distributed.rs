@@ -46,13 +46,18 @@ pub struct ExecutePartitionRequest {
     pub source_columns: Vec<CatalogColumn>,
 }
 
-/// Splits `files` into at most `num_workers` chunks using greedy size-aware assignment.
+/// Splits `files` into at most `num_workers` chunks using greedy weight-aware assignment.
+///
+/// Each entry is `(path, byte_size, row_count)`.  When all files have `row_count > 0`
+/// the row count is used as the balancing weight; otherwise `byte_size` is used as a
+/// fallback.  This prevents a single large (by bytes) but tiny (by rows) file from
+/// monopolising a worker when row counts are available.
 ///
 /// Empty chunks are never emitted — if `files.len() < num_workers` the returned
 /// Vec will have fewer entries than `num_workers`.  Returns an empty Vec when
 /// `files` is empty.
 pub fn partition_files_for_workers(
-    files: Vec<(String, u64)>,
+    files: Vec<(String, u64, i64)>,
     num_workers: usize,
 ) -> Vec<Vec<String>> {
     if files.is_empty() || num_workers == 0 {
@@ -60,22 +65,31 @@ pub fn partition_files_for_workers(
     }
     let buckets = num_workers.min(files.len());
     let mut chunks: Vec<Vec<String>> = (0..buckets).map(|_| Vec::new()).collect();
-    let mut bucket_sizes: Vec<u64> = vec![0; buckets];
+    let mut bucket_weights: Vec<u64> = vec![0; buckets];
 
-    // Sort by size descending
-    let mut sorted = files;
+    // Use row_count as weight when all files have row_count > 0; otherwise byte_size.
+    let use_rows = files.iter().all(|(_, _, rows)| *rows > 0);
+
+    // Sort by weight descending for greedy assignment.
+    let mut sorted: Vec<(String, u64)> = files
+        .into_iter()
+        .map(|(path, size, rows)| {
+            let weight = if use_rows { rows as u64 } else { size };
+            (path, weight)
+        })
+        .collect();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-    // Greedy assignment: assign each file to the bucket with the smallest total size.
-    for (file, size) in sorted {
-        let min_idx = bucket_sizes
+    // Greedy assignment: assign each file to the bucket with the smallest total weight.
+    for (file, weight) in sorted {
+        let min_idx = bucket_weights
             .iter()
             .enumerate()
-            .min_by_key(|(_, s)| *s)
+            .min_by_key(|(_, w)| *w)
             .map(|(i, _)| i)
             .unwrap();
         chunks[min_idx].push(file);
-        bucket_sizes[min_idx] += size;
+        bucket_weights[min_idx] += weight;
     }
     chunks
 }
@@ -437,12 +451,12 @@ mod tests {
     #[test]
     fn partition_files_size_aware_balanced() {
         let files = vec![
-            ("f1.parquet".to_string(), 100),
-            ("f2.parquet".to_string(), 100),
-            ("f3.parquet".to_string(), 100),
-            ("f4.parquet".to_string(), 100),
-            ("f5.parquet".to_string(), 100),
-            ("f6.parquet".to_string(), 100),
+            ("f1.parquet".to_string(), 100, 0),
+            ("f2.parquet".to_string(), 100, 0),
+            ("f3.parquet".to_string(), 100, 0),
+            ("f4.parquet".to_string(), 100, 0),
+            ("f5.parquet".to_string(), 100, 0),
+            ("f6.parquet".to_string(), 100, 0),
         ];
         let chunks = partition_files_for_workers(files, 3);
         assert_eq!(chunks.len(), 3);
@@ -455,10 +469,10 @@ mod tests {
     #[test]
     fn partition_files_size_aware_greedy() {
         let files = vec![
-            ("large.parquet".to_string(), 1000),
-            ("small1.parquet".to_string(), 100),
-            ("small2.parquet".to_string(), 100),
-            ("small3.parquet".to_string(), 100),
+            ("large.parquet".to_string(), 1000, 0),
+            ("small1.parquet".to_string(), 100, 0),
+            ("small2.parquet".to_string(), 100, 0),
+            ("small3.parquet".to_string(), 100, 0),
         ];
         // 2 workers:
         // Worker 1 should get large.parquet (1000)
@@ -480,7 +494,10 @@ mod tests {
 
     #[test]
     fn partition_files_fewer_files_than_workers() {
-        let files = vec![("a.parquet".to_string(), 10), ("b.parquet".to_string(), 10)];
+        let files = vec![
+            ("a.parquet".to_string(), 10, 0),
+            ("b.parquet".to_string(), 10, 0),
+        ];
         let chunks = partition_files_for_workers(files, 5);
         assert_eq!(chunks.len(), 2);
     }
@@ -493,13 +510,88 @@ mod tests {
 
     #[test]
     fn partition_files_single_worker() {
-        let files = vec![("x.parquet".to_string(), 10), ("y.parquet".to_string(), 10)];
+        let files = vec![
+            ("x.parquet".to_string(), 10, 0),
+            ("y.parquet".to_string(), 10, 0),
+        ];
         let chunks = partition_files_for_workers(files.clone(), 1);
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0],
             vec!["x.parquet".to_string(), "y.parquet".to_string()]
         );
+    }
+
+    #[test]
+    fn partition_files_skew_regression_detects_worst_case_imbalance() {
+        // 10 files: one giant (1000 rows), nine tiny (1 row each). Total = 1009 rows.
+        // With 3 workers, fair share is ~336 rows each.
+        // The skew-aware partitioner should place the 1000-row file on one worker
+        // and distribute the nine tiny files across the others, keeping the worst
+        // worker well within 3× fair share.
+        let mut files: Vec<(String, u64, i64)> = vec![
+            ("big.parquet".to_string(), 1, 1000), // huge by rows, tiny by bytes
+        ];
+        for i in 1..10 {
+            files.push((format!("small{i}.parquet"), 1, 1));
+        }
+
+        let chunks = partition_files_for_workers(files, 3);
+
+        // Compute per-worker row totals.
+        let row_counts_by_name: std::collections::HashMap<String, i64> = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("big.parquet".to_string(), 1000_i64);
+            for i in 1..10_i64 {
+                m.insert(format!("small{i}.parquet"), 1);
+            }
+            m
+        };
+
+        let worker_rows: Vec<i64> = chunks
+            .iter()
+            .map(|chunk| chunk.iter().map(|f| row_counts_by_name[f]).sum())
+            .collect();
+
+        let total_rows: i64 = worker_rows.iter().sum();
+        let n = chunks.len() as f64;
+        let fair_share = total_rows as f64 / n;
+        let max_rows = *worker_rows.iter().max().unwrap() as f64;
+        let skew_ratio = max_rows / fair_share;
+
+        assert!(
+            skew_ratio <= 3.0,
+            "Skew ratio {skew_ratio:.2} exceeds 3.0 — row-count balancing not working. \
+             Worker rows: {worker_rows:?}"
+        );
+    }
+
+    #[test]
+    fn partition_files_falls_back_to_size_when_row_counts_absent() {
+        // All row_counts are 0 → byte_size must be used as the weight.
+        // One large file (1000 bytes) and three small ones (100 bytes each).
+        // With 2 workers the large file should end up alone.
+        let files = vec![
+            ("large.parquet".to_string(), 1000_u64, 0_i64),
+            ("small1.parquet".to_string(), 100, 0),
+            ("small2.parquet".to_string(), 100, 0),
+            ("small3.parquet".to_string(), 100, 0),
+        ];
+        let chunks = partition_files_for_workers(files, 2);
+        assert_eq!(chunks.len(), 2);
+
+        let large_in_chunk0 = chunks[0].contains(&"large.parquet".to_string());
+        let large_in_chunk1 = chunks[1].contains(&"large.parquet".to_string());
+        assert!(large_in_chunk0 ^ large_in_chunk1, "large.parquet must be in exactly one chunk");
+
+        // The chunk that has large.parquet should contain only it (greedy: 1000 > 300).
+        if large_in_chunk0 {
+            assert_eq!(chunks[0].len(), 1, "large file should be alone");
+            assert_eq!(chunks[1].len(), 3);
+        } else {
+            assert_eq!(chunks[1].len(), 1, "large file should be alone");
+            assert_eq!(chunks[0].len(), 3);
+        }
     }
 
     #[tokio::test]

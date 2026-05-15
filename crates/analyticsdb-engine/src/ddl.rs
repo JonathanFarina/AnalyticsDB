@@ -350,7 +350,7 @@ impl PrototypeEngine {
                         unique,
                     )
                     .await?;
-                let relation_lock = self.relation_lock(&preview_relation).await;
+                let relation_lock = self.relation_lock(&preview_relation).await?;
                 let _write_guard = relation_lock.write().await;
                 let (idx_store, idx_prefix) = table_store_prefix(&preview_relation)?;
                 let version = uuid::Uuid::now_v7().to_string();
@@ -399,7 +399,7 @@ impl PrototypeEngine {
                         name,
                     )
                     .await?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 let new_name = match operation {
@@ -475,7 +475,7 @@ impl PrototypeEngine {
                     Err(error) => return Err(error),
                 };
                 if let Some(relation) = &relation {
-                    let relation_lock = self.relation_lock(relation).await;
+                    let relation_lock = self.relation_lock(relation).await?;
                     let _write_guard = relation_lock.write().await;
 
                     let (message, _new_session) = self
@@ -524,7 +524,7 @@ impl PrototypeEngine {
                             name,
                         )
                         .await?;
-                    let relation_lock = self.relation_lock(&relation).await;
+                    let relation_lock = self.relation_lock(&relation).await?;
                     let _write_guard = relation_lock.write().await;
 
                     self.invalidate_session_contexts().await;
@@ -563,7 +563,7 @@ impl PrototypeEngine {
                             name,
                         )
                         .await?;
-                    let relation_lock = self.relation_lock(&relation).await;
+                    let relation_lock = self.relation_lock(&relation).await?;
                     let _write_guard = relation_lock.write().await;
 
                     self.rebuild_all_index_snapshots(&request.session, &relation)
@@ -874,7 +874,7 @@ impl PrototypeEngine {
                     )
                 })?;
                 let (store, prefix) = storage::store_for_location(storage_location)?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 let column_definitions: Vec<TableColumnDefinition> = relation
@@ -957,7 +957,7 @@ impl PrototypeEngine {
                     )
                 })?;
                 let (store, prefix) = storage::store_for_location(storage_location)?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 let context = self.create_session_context(&request.session).await?;
@@ -1046,7 +1046,7 @@ impl PrototypeEngine {
                     )
                 })?;
                 let (store, prefix) = storage::store_for_location(storage_location)?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 let context = self.create_session_context(&request.session).await?;
@@ -1109,7 +1109,7 @@ impl PrototypeEngine {
                     )
                 })?;
                 let (store, prefix) = storage::store_for_location(storage_location)?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 let column_definitions: Vec<TableColumnDefinition> = relation
@@ -1162,7 +1162,7 @@ impl PrototypeEngine {
                     )
                 })?;
                 let (store, prefix) = storage::store_for_location(storage_location)?;
-                let relation_lock = self.relation_lock(&relation).await;
+                let relation_lock = self.relation_lock(&relation).await?;
                 let _write_guard = relation_lock.write().await;
 
                 const TARGET_FILE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
@@ -1257,7 +1257,7 @@ impl PrototypeEngine {
                     }
                     AlterTableOperation::AddConstraint { constraint } => {
                         // ...
-                        let relation_lock = self.relation_lock(&relation).await;
+                        let relation_lock = self.relation_lock(&relation).await?;
                         let _write_guard = relation_lock.write().await;
                         let catalog_constraints = catalog_constraints_from_definitions(
                             &name,
@@ -1341,7 +1341,7 @@ impl PrototypeEngine {
                         )
                     }
                     AlterTableOperation::RenameTable { new_name } => {
-                        let relation_lock = self.relation_lock(&relation).await;
+                        let relation_lock = self.relation_lock(&relation).await?;
                         let _write_guard = relation_lock.write().await;
                         // 1. Rename catalog metadata
                         self.control_plane
@@ -1433,7 +1433,7 @@ impl PrototypeEngine {
                         )
                     }
                     AlterTableOperation::RenameColumn { old_name, new_name } => {
-                        let relation_lock = self.relation_lock(&relation).await;
+                        let relation_lock = self.relation_lock(&relation).await?;
                         let _write_guard = relation_lock.write().await;
 
                         let message = self
@@ -1994,7 +1994,7 @@ impl PrototypeEngine {
                 };
 
                 if let Some(rel) = relation {
-                    let relation_lock = self.relation_lock(&rel).await;
+                    let relation_lock = self.relation_lock(&rel).await?;
                     let _write_guard = relation_lock.write().await;
                     // For managed tables, delete all storage objects
                     if rel.external_format.is_none() {

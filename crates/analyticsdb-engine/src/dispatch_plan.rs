@@ -158,29 +158,64 @@ pub(crate) fn rewrite_sql_for_partition(sql: &str, source_table: &str) -> Option
     }
 }
 
-pub(crate) fn distributed_aggregate_plan(sql: &str, source_table: &str) -> Option<(String, String)> {
+pub(crate) fn distributed_aggregate_plan(
+    sql: &str,
+    _source_table: &str,
+) -> Option<(String, String)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let mut partition_sql = rewrite_sql_for_partition(trimmed, source_table)?;
 
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, &partition_sql).ok()?;
-    let statement = statements.get_mut(0)?;
-    let Statement::Query(ref mut query) = statement else {
+    let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.into_iter().next()?;
+    let Statement::Query(query) = statement else {
         return None;
     };
-    let SetExpr::Select(ref mut select) = *query.body else {
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
         return None;
     };
-    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
-        || select.having.is_some()
-        || select.distinct.is_some()
-    {
+    if select.having.is_some() || select.distinct.is_some() {
+        return None;
+    }
+
+    let group_by_exprs: Vec<String> = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
+            exprs.iter().map(|e| e.to_string()).collect()
+        }
+        _ => return None,
+    };
+    let has_group_by = !group_by_exprs.is_empty();
+
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|w| format!("WHERE {w}"))
+        .unwrap_or_default();
+
+    let group_by_clause = if has_group_by {
+        format!("GROUP BY {}", group_by_exprs.join(", "))
+    } else {
+        String::new()
+    };
+
+    let has_any_agg = select.projection.iter().any(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => return false,
+        };
+        aggregate_expr_parts(expr).is_some()
+    });
+    if !has_any_agg {
         return None;
     }
 
     let mut worker_items = Vec::new();
     let mut final_items = Vec::new();
-    for (idx, item) in select.projection.iter().enumerate() {
+    let mut agg_idx = 0usize;
+
+    for item in &select.projection {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, quote_sql_identifier(&expr.to_string())),
             SelectItem::ExprWithAlias { expr, alias } => {
@@ -188,74 +223,196 @@ pub(crate) fn distributed_aggregate_plan(sql: &str, source_table: &str) -> Optio
             }
             _ => return None,
         };
-        let aggregate = aggregate_expr_parts(expr)?;
-        let output = format!("__adb_agg_{idx}");
-        match aggregate.function.as_str() {
-            "count" => {
-                worker_items.push(format!(
-                    "COUNT({}) AS {}",
-                    aggregate.argument,
-                    quote_sql_identifier(&output)
-                ));
-                final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+
+        if let Some(aggregate) = aggregate_expr_parts(expr) {
+            let output = format!("__adb_agg_{agg_idx}");
+            agg_idx += 1;
+            match aggregate.function.as_str() {
+                "count" => {
+                    worker_items.push(format!(
+                        "COUNT({}) AS {}",
+                        aggregate.argument,
+                        quote_sql_identifier(&output)
+                    ));
+                    final_items
+                        .push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+                }
+                "sum" => {
+                    worker_items.push(format!(
+                        "SUM({}) AS {}",
+                        aggregate.argument,
+                        quote_sql_identifier(&output)
+                    ));
+                    final_items
+                        .push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+                }
+                "min" => {
+                    worker_items.push(format!(
+                        "MIN({}) AS {}",
+                        aggregate.argument,
+                        quote_sql_identifier(&output)
+                    ));
+                    final_items
+                        .push(format!("MIN({}) AS {alias}", quote_sql_identifier(&output)));
+                }
+                "max" => {
+                    worker_items.push(format!(
+                        "MAX({}) AS {}",
+                        aggregate.argument,
+                        quote_sql_identifier(&output)
+                    ));
+                    final_items
+                        .push(format!("MAX({}) AS {alias}", quote_sql_identifier(&output)));
+                }
+                "avg" => {
+                    let sum_output = format!("{output}_sum");
+                    let count_output = format!("{output}_count");
+                    worker_items.push(format!(
+                        "SUM({}) AS {}, COUNT({}) AS {}",
+                        aggregate.argument,
+                        quote_sql_identifier(&sum_output),
+                        aggregate.argument,
+                        quote_sql_identifier(&count_output)
+                    ));
+                    final_items.push(format!(
+                        "SUM({}) / SUM({}) AS {alias}",
+                        quote_sql_identifier(&sum_output),
+                        quote_sql_identifier(&count_output)
+                    ));
+                }
+                _ => return None,
             }
-            "sum" => {
-                worker_items.push(format!(
-                    "SUM({}) AS {}",
-                    aggregate.argument,
-                    quote_sql_identifier(&output)
-                ));
-                final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
-            }
-            "min" => {
-                worker_items.push(format!(
-                    "MIN({}) AS {}",
-                    aggregate.argument,
-                    quote_sql_identifier(&output)
-                ));
-                final_items.push(format!("MIN({}) AS {alias}", quote_sql_identifier(&output)));
-            }
-            "max" => {
-                worker_items.push(format!(
-                    "MAX({}) AS {}",
-                    aggregate.argument,
-                    quote_sql_identifier(&output)
-                ));
-                final_items.push(format!("MAX({}) AS {alias}", quote_sql_identifier(&output)));
-            }
-            "avg" => {
-                let sum_output = format!("{output}_sum");
-                let count_output = format!("{output}_count");
-                worker_items.push(format!(
-                    "SUM({}) AS {}, COUNT({}) AS {}",
-                    aggregate.argument,
-                    quote_sql_identifier(&sum_output),
-                    aggregate.argument,
-                    quote_sql_identifier(&count_output)
-                ));
-                final_items.push(format!(
-                    "SUM({}) / SUM({}) AS {alias}",
-                    quote_sql_identifier(&sum_output),
-                    quote_sql_identifier(&count_output)
-                ));
-            }
-            _ => return None,
+        } else if has_group_by {
+            let col_name = quote_sql_identifier(&expr.to_string());
+            worker_items.push(format!("{expr} AS {col_name}"));
+            final_items.push(format!("{col_name} AS {alias}"));
+        } else {
+            return None;
         }
     }
 
-    select.projection = vec![SelectItem::UnnamedExpr(Expr::Value(
-        sqlparser::ast::Value::Number("1".to_string(), false).into(),
-    ))];
-    partition_sql = statement.to_string();
-    let re = regex::Regex::new(r"(?is)^\s*SELECT\s+1\s+FROM\s+").ok()?;
-    let worker_sql = re
-        .replace(
-            &partition_sql,
-            format!("SELECT {} FROM ", worker_items.join(", ")).as_str(),
-        )
-        .to_string();
-    let final_sql = format!("SELECT {} FROM __partition__", final_items.join(", "));
+    let worker_select = worker_items.join(", ");
+    let final_select = final_items.join(", ");
+
+    let worker_sql = match (where_clause.is_empty(), group_by_clause.is_empty()) {
+        (true, true) => format!("SELECT {worker_select} FROM __partition__"),
+        (true, false) => format!("SELECT {worker_select} FROM __partition__ {group_by_clause}"),
+        (false, true) => format!("SELECT {worker_select} FROM __partition__ {where_clause}"),
+        (false, false) => format!(
+            "SELECT {worker_select} FROM __partition__ {where_clause} {group_by_clause}"
+        ),
+    };
+
+    let final_sql = if group_by_clause.is_empty() {
+        format!("SELECT {final_select} FROM __partition__")
+    } else {
+        format!("SELECT {final_select} FROM __partition__ {group_by_clause}")
+    };
+
     Some((worker_sql, final_sql))
+}
+
+pub(crate) fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
+    projection.iter().any(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => return false,
+        };
+        aggregate_expr_parts(expr).is_some()
+    })
+}
+
+pub(crate) fn has_window_functions(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, trimmed) else {
+        return false;
+    };
+    let Some(Statement::Query(query)) = statements.into_iter().next() else {
+        return false;
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return false;
+    };
+    select.projection.iter().any(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => return false,
+        };
+        if let Expr::Function(f) = expr {
+            return f.over.is_some();
+        }
+        false
+    })
+}
+
+/// 2-phase DISTINCT: both worker and coordinator run `SELECT DISTINCT … FROM __partition__`.
+pub(crate) fn distributed_distinct_plan(
+    sql: &str,
+    source_table: &str,
+) -> Option<(String, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.into_iter().next()?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    if select.distinct.is_none() || select.having.is_some() {
+        return None;
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => return None,
+        _ => {}
+    }
+    if projection_has_aggregate(&select.projection) {
+        return None;
+    }
+
+    let rewritten = rewrite_sql_for_partition(trimmed, source_table)?;
+    Some((rewritten.clone(), rewritten))
+}
+
+/// 2-phase ORDER BY / LIMIT: workers return their local top-N, coordinator re-sorts.
+pub(crate) fn distributed_order_limit_plan(
+    sql: &str,
+    source_table: &str,
+) -> Option<(String, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
+    let statement = statements.into_iter().next()?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    if query.order_by.is_none() && query.limit_clause.is_none() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    if select.distinct.is_some() {
+        return None;
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => return None,
+        _ => {}
+    }
+    if projection_has_aggregate(&select.projection) {
+        return None;
+    }
+
+    let rewritten = rewrite_sql_for_partition(trimmed, source_table)?;
+    Some((rewritten.clone(), rewritten))
 }
 
 pub(crate) fn quote_sql_identifier(identifier: &str) -> String {
@@ -510,4 +667,164 @@ pub(crate) async fn delete_written_files(store: &Arc<dyn ObjectStore>, files: &[
         .filter_map(|p| object_store::path::Path::parse(p.trim_start_matches('/')).ok())
         .collect();
     storage::delete_objects(store, &keys).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distributed_aggregate_plan_supports_group_by() {
+        let sql =
+            "SELECT department, COUNT(*) as cnt, SUM(salary) as total FROM employees GROUP BY department";
+        let (worker_sql, final_sql) =
+            distributed_aggregate_plan(sql, "employees").expect("should produce a plan");
+        assert!(
+            worker_sql.contains("__partition__"),
+            "worker_sql should reference __partition__"
+        );
+        assert!(
+            worker_sql.contains("GROUP BY"),
+            "worker_sql should have GROUP BY: {worker_sql}"
+        );
+        assert!(
+            final_sql.contains("__partition__"),
+            "final_sql should reference __partition__"
+        );
+        assert!(
+            final_sql.contains("GROUP BY"),
+            "final_sql should have GROUP BY: {final_sql}"
+        );
+        assert!(
+            worker_sql.contains("COUNT(*)"),
+            "worker_sql should use COUNT(*): {worker_sql}"
+        );
+        assert!(
+            final_sql.contains("SUM"),
+            "final_sql should use SUM to finalize counts: {final_sql}"
+        );
+    }
+
+    #[test]
+    fn distributed_aggregate_plan_plain_aggregate_no_group_by() {
+        let sql = "SELECT COUNT(*) AS n FROM customers";
+        let (worker_sql, final_sql) =
+            distributed_aggregate_plan(sql, "customers").expect("should produce a plan");
+        assert!(worker_sql.contains("__partition__"));
+        assert!(!worker_sql.contains("GROUP BY"));
+        assert!(final_sql.contains("__partition__"));
+        assert!(!final_sql.contains("GROUP BY"));
+    }
+
+    #[test]
+    fn distributed_aggregate_plan_rejects_no_aggregate() {
+        let sql = "SELECT id, name FROM customers";
+        assert!(
+            distributed_aggregate_plan(sql, "customers").is_none(),
+            "non-aggregate SELECT without GROUP BY should not produce a plan"
+        );
+    }
+
+    #[test]
+    fn distributed_aggregate_plan_rejects_distinct() {
+        let sql = "SELECT DISTINCT COUNT(*) FROM customers";
+        assert!(distributed_aggregate_plan(sql, "customers").is_none());
+    }
+
+    #[test]
+    fn distributed_aggregate_plan_rejects_having() {
+        let sql = "SELECT department, COUNT(*) as cnt FROM employees GROUP BY department HAVING COUNT(*) > 5";
+        assert!(distributed_aggregate_plan(sql, "employees").is_none());
+    }
+
+    #[test]
+    fn distributed_distinct_plan_works() {
+        let sql = "SELECT DISTINCT status FROM orders";
+        let (worker_sql, final_sql) =
+            distributed_distinct_plan(sql, "orders").expect("should produce a plan");
+        assert!(worker_sql.contains("__partition__"), "worker_sql: {worker_sql}");
+        assert!(final_sql.contains("__partition__"), "final_sql: {final_sql}");
+        assert_eq!(worker_sql, final_sql);
+        assert!(
+            worker_sql.to_uppercase().contains("DISTINCT"),
+            "worker_sql should be DISTINCT: {worker_sql}"
+        );
+    }
+
+    #[test]
+    fn distributed_distinct_plan_rejects_non_distinct() {
+        assert!(distributed_distinct_plan("SELECT status FROM orders", "orders").is_none());
+    }
+
+    #[test]
+    fn distributed_distinct_plan_rejects_aggregate() {
+        assert!(distributed_distinct_plan("SELECT DISTINCT COUNT(*) FROM orders", "orders").is_none());
+    }
+
+    #[test]
+    fn distributed_distinct_plan_rejects_group_by() {
+        assert!(distributed_distinct_plan(
+            "SELECT DISTINCT status FROM orders GROUP BY status",
+            "orders"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn distributed_order_limit_plan_works() {
+        let sql = "SELECT id FROM orders ORDER BY id LIMIT 10";
+        let (worker_sql, final_sql) =
+            distributed_order_limit_plan(sql, "orders").expect("should produce a plan");
+        assert!(worker_sql.contains("__partition__"), "worker_sql: {worker_sql}");
+        assert!(final_sql.contains("__partition__"), "final_sql: {final_sql}");
+        assert_eq!(worker_sql, final_sql);
+        assert!(worker_sql.to_uppercase().contains("ORDER BY"), "worker_sql: {worker_sql}");
+        assert!(worker_sql.contains("LIMIT"), "worker_sql: {worker_sql}");
+    }
+
+    #[test]
+    fn distributed_order_limit_plan_order_only() {
+        let sql = "SELECT id FROM orders ORDER BY id";
+        assert!(distributed_order_limit_plan(sql, "orders").is_some());
+    }
+
+    #[test]
+    fn distributed_order_limit_plan_rejects_no_order_or_limit() {
+        assert!(distributed_order_limit_plan("SELECT id FROM orders", "orders").is_none());
+    }
+
+    #[test]
+    fn distributed_order_limit_plan_rejects_distinct() {
+        assert!(distributed_order_limit_plan(
+            "SELECT DISTINCT id FROM orders ORDER BY id LIMIT 5",
+            "orders"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn distributed_order_limit_plan_rejects_aggregate() {
+        assert!(distributed_order_limit_plan(
+            "SELECT COUNT(*) FROM orders ORDER BY COUNT(*) LIMIT 5",
+            "orders"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn has_window_functions_detects_over_clause() {
+        assert!(has_window_functions(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM emp"
+        ));
+    }
+
+    #[test]
+    fn has_window_functions_plain_select_returns_false() {
+        assert!(!has_window_functions("SELECT id, name FROM customers"));
+    }
+
+    #[test]
+    fn has_window_functions_aggregate_returns_false() {
+        assert!(!has_window_functions("SELECT COUNT(*) FROM customers"));
+    }
 }

@@ -195,13 +195,15 @@ Current evidence:
 - **graceful shutdown**: SIGTERM/SIGINT handler cancels all in-flight queries before exit
 - **node heartbeat**: 10 s background heartbeat; coordinator prunes nodes silent > 45 s to `Unavailable`
 - **intra-cluster mTLS**: `NoVerifier` removed; `ClusterMtlsConfig` uses tonic `ClientTlsConfig` with cluster CA + leaf identity; server node-channel enforces client cert via `client_ca_root()`; `analyticsdb ca init` generates CA + leaf certs (ECDSA P-256); `tls_ca_cert_path` in `ClusterConfig`
+- **distributed query log siblings**: `execute_partition` (read path) now records worker-side `QueryProbe` rows in `system.query_log` with `is_initial_query = false`
+- **distributed plan coverage**: GROUP BY aggregates (2-phase), DISTINCT (2-phase dedup), and ORDER BY/LIMIT (local top-N then re-sort) all handled; window functions blocked from distribution
+- **skew-aware partitioner**: `partition_files_for_workers` balances by Parquet row count when available; falls back to byte size; skew regression test added
+- **catalog concurrency**: `DistributedRelationLock` acquires a SQLite advisory lease (`table_leases` table) for 30 s; all `relation_lock()` call sites propagate `Result`; JSON catalog always grants
 
 Remaining gaps before this phase should be considered `Complete`:
 
-- no distributed equivalence tests for joins, group-by, sort/limit, window functions
-- no distributed query log sibling rows
-- no skew-aware partitioner using Parquet row-group statistics
-- no catalog concurrency for multi-coordinator setups
+- no chaos / worker-kill retry integration test
+- no distributed equivalence tests run from the CLI test suite
 
 ## Phase 6: Storage Maturity
 

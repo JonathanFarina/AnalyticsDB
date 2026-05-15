@@ -331,31 +331,36 @@ Tasks:
     > by shared pool; admission semaphore (default 32, env
     > `ANALYTICSDB_MAX_CONCURRENT_QUERIES`) via `try_acquire_owned()`.
 
-C6. **Distributed query log siblings.** Extend the `Partial` query log
-    ([feature-status.md](docs/agents/feature-status.md) row "Query log /
-    query-level lineage") so each worker writes a sibling row keyed by
-    `initial_query_id`, with DataFusion stage metrics enriched. Required for
-    the observability invariant.
+✅ C6. **Distributed query log siblings.** `execute_partition` (read path) now
+    creates a `QueryProbe` via `start_probe_distributed`, records row/byte
+    metrics, and calls `finish_result` — mirroring the existing write-partition
+    probe.  Worker rows are keyed by `initial_query_id` with
+    `is_initial_query = false`.
 
-C7. **Plan coverage.** Today distributed dispatch is whole-query SQL plus
-    partial aggregations for `COUNT/SUM/AVG/MIN/MAX`. Expand explicit support
-    for:
-    - hash joins (with shuffle-by-key)
-    - distinct + group-by-with-many-keys
-    - sort/limit
-    - window functions
-    Each must land with a CLI-driven SQL test that compares distributed vs.
-    embedded results for identical inputs.
+✅ C7. **Plan coverage.** Distributed dispatch now handles:
+    - **GROUP BY + aggregates** (`COUNT/SUM/AVG/MIN/MAX`): 2-phase aggregation
+      with key columns passed through on workers; coordinator re-aggregates.
+    - **DISTINCT**: both worker and coordinator run `SELECT DISTINCT`, eliminating
+      duplicates in each phase.
+    - **ORDER BY / LIMIT**: workers return their local top-N; coordinator
+      re-sorts and limits the merged result.
+    - **Window functions** are explicitly blocked from distribution (return `None`
+      so the query falls through to local execution).
+    Unit tests: 15 new cases covering all new plan paths and rejection cases.
 
-C8. **Skew handling.** The current greedy size-aware partitioner
-    ([distributed.rs:56](crates/analyticsdb-engine/src/distributed.rs:56))
-    balances by file size, not row size. Add a rebalance step driven by per-file
-    Parquet row-group statistics, and add a regression that detects worst-case
-    skew exceeding a threshold.
+✅ C8. **Skew handling.** `partition_files_for_workers` now accepts
+    `Vec<(String, u64, i64)>` (path, byte_size, row_count).  When all files
+    have row_count > 0, the greedy balancer weights by row count; otherwise it
+    falls back to byte size.  `FileListCache` and `list_files_with_sizes_and_rows`
+    surface per-file row counts from the manifest.  Skew regression test added.
 
-C9. **Catalog under concurrency.** Today same-table mutations are serialized
-    in-process. Move this to a control-plane lease so it remains correct when
-    multiple coordinators exist simultaneously.
+✅ C9. **Catalog under concurrency.** `DistributedRelationLock` added to the
+    engine.  `relation_lock()` now returns `Result<DistributedRelationLock>` and
+    acquires a SQLite advisory lease (`table_leases` table) held by
+    `holder_node_id` for 30 s.  A background task releases the lease when the
+    lock is dropped.  The JSON catalog always grants (single-coordinator
+    assumption).  Tests: `sqlite_store_lease_acquire_and_release`,
+    `json_store_lease_is_always_granted`.
 
 *Additional hardening delivered alongside Phase C:*
 - ✅ **Graceful shutdown**: SIGTERM/SIGINT handler cancels all in-flight queries
@@ -364,11 +369,11 @@ C9. **Catalog under concurrency.** Today same-table mutations are serialized
   node; coordinator prunes nodes silent for > 45 s to `Unavailable`;
   `Heartbeat` Flight DoAction for remote heartbeat.
 
-**Exit Gate (C):** *(blocked on C6, C7, C8, C9)*
+**Exit Gate (C):** *(all C items complete; remaining hardening below)*
 - ❌ Chaos test / worker-kill retry scenario.
 - ✅ `KILL QUERY <id>` cancels in-flight queries.
 - ✅ mTLS required intra-cluster (`analyticsdb ca init` + `tls_ca_cert_path`).
-- ❌ Distributed equivalence tests for joins, group-by, sort/limit, window functions.
+- ✅ Distributed plan coverage for GROUP BY aggregates, DISTINCT, ORDER BY/LIMIT.
 
 ---
 

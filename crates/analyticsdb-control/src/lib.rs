@@ -3285,6 +3285,43 @@ impl ControlPlane {
         store.save_state(state).await
     }
 
+    /// Try to acquire a distributed advisory write lease for `relation_key`.
+    /// Returns `true` when the lease was granted, `false` when another node
+    /// holds an unexpired lease.  Always returns `true` for non-SQLite
+    /// catalogs (single-coordinator assumption).
+    pub async fn try_acquire_relation_lease(
+        &self,
+        relation_key: &str,
+        holder_node_id: &str,
+        ttl_ms: u64,
+    ) -> Result<bool> {
+        let Some(path) = &self.catalog_path else {
+            return Ok(true);
+        };
+        if !catalog_store::is_sqlite_path(path) {
+            return Ok(true);
+        }
+        let store = catalog_store::open_store(path)?;
+        store.try_acquire_lease(relation_key, holder_node_id, ttl_ms).await
+    }
+
+    /// Release the advisory write lease held by `holder_node_id` for
+    /// `relation_key`.  No-op for non-SQLite catalogs.
+    pub async fn release_relation_lease(
+        &self,
+        relation_key: &str,
+        holder_node_id: &str,
+    ) -> Result<()> {
+        let Some(path) = &self.catalog_path else {
+            return Ok(());
+        };
+        if !catalog_store::is_sqlite_path(path) {
+            return Ok(());
+        }
+        let store = catalog_store::open_store(path)?;
+        store.release_lease(relation_key, holder_node_id).await
+    }
+
     /// Export the current catalogue state as pretty-printed JSON to `path`.
     ///
     /// Useful for debugging and disaster-recovery snapshots, regardless of

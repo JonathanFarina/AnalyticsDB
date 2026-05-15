@@ -146,6 +146,7 @@ pub async fn list_files(
 /// Returns the committed file paths and sizes for the table at `prefix`.
 ///
 /// If a manifest exists, uses it. Falls back to a directory scan.
+#[allow(dead_code)]
 pub async fn list_files_with_sizes(
     store: &Arc<dyn ObjectStore>,
     prefix: &OPath,
@@ -162,6 +163,30 @@ pub async fn list_files_with_sizes(
     }
     // Fallback: directory scan.
     storage::list_parquet_files_with_sizes(store, prefix).await
+}
+
+/// Returns the committed file paths, sizes, and row counts for the table at `prefix`.
+///
+/// Like `list_files_with_sizes` but also returns the `row_count` from each manifest entry.
+/// When a manifest does not exist or an entry has no row_count the value is 0.
+/// Falls back to a directory scan when no manifest is present (row_count will be 0 for all).
+pub async fn list_files_with_sizes_and_rows(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+) -> Result<Vec<(String, u64, i64)>> {
+    if let Some(manifest) = read_manifest(store, prefix).await? {
+        return Ok(manifest
+            .files
+            .iter()
+            .map(|e| {
+                let path = format!("/{}/{}", prefix.as_ref(), e.path);
+                (path, e.size, e.row_count)
+            })
+            .collect());
+    }
+    // Fallback: directory scan — row_count is unavailable.
+    let files = storage::list_parquet_files_with_sizes(store, prefix).await?;
+    Ok(files.into_iter().map(|(p, s)| (p, s, 0i64)).collect())
 }
 
 /// Appends a new entry to the manifest at `prefix`, creating it if it doesn't exist.

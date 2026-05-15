@@ -255,7 +255,7 @@ impl PrototypeEngine {
             Err(_) => return Ok(None),
         };
 
-        let relation_lock = self.relation_lock(&relation).await;
+        let relation_lock = self.relation_lock(&relation).await?;
         let _read_guard = relation_lock.read().await;
 
         let Some((index, row_ids)) = self

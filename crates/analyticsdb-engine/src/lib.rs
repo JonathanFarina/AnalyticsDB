@@ -243,8 +243,8 @@ fn session_context_cache_key(session: &SessionContext) -> String {
 use dashmap::DashMap;
 
 pub struct FileListCache {
-    cache: DashMap<String, (u64, Vec<(String, u64)>)>, // table_key -> (epoch, files)
-    epochs: DashMap<String, u64>,                      // table_key -> current_epoch
+    cache: DashMap<String, (u64, Vec<(String, u64, i64)>)>, // table_key -> (epoch, files)
+    epochs: DashMap<String, u64>,                           // table_key -> current_epoch
 }
 
 impl Default for FileListCache {
@@ -266,7 +266,7 @@ impl FileListCache {
         table_key: &str,
         store: &Arc<dyn ObjectStore>,
         prefix: &object_store::path::Path,
-    ) -> Result<Vec<(String, u64)>> {
+    ) -> Result<Vec<(String, u64, i64)>> {
         let current_epoch = self.epochs.get(table_key).map(|r| *r.value()).unwrap_or(0);
         if let Some(entry) = self.cache.get(table_key) {
             let (cached_epoch, files) = entry.value();
@@ -275,7 +275,7 @@ impl FileListCache {
             }
         }
 
-        let files = manifest::list_files_with_sizes(store, prefix).await?;
+        let files = manifest::list_files_with_sizes_and_rows(store, prefix).await?;
         self.cache
             .insert(table_key.to_string(), (current_epoch, files.clone()));
         Ok(files)
@@ -288,6 +288,26 @@ impl FileListCache {
             .map(|r| *r.value() + 1)
             .unwrap_or(1);
         self.epochs.insert(table_key.to_string(), new_epoch);
+    }
+}
+
+/// An in-process write lock for a single relation, optionally backed by a
+/// distributed advisory lease stored in the SQLite catalogue.
+///
+/// When dropped, the lease is released asynchronously via a background task.
+/// The local `RwLock<()>` remains valid for the lifetime of the engine
+/// (preventing concurrent mutations within a single process) regardless of
+/// whether a distributed lease is in use.
+pub struct DistributedRelationLock {
+    inner: Arc<tokio::sync::RwLock<()>>,
+    /// Dropping this sender signals the background task to release the lease.
+    _release_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl std::ops::Deref for DistributedRelationLock {
+    type Target = tokio::sync::RwLock<()>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -650,24 +670,48 @@ impl PrototypeEngine {
         &self,
         req: &distributed::ExecutePartitionRequest,
     ) -> Result<QueryExecutionResult> {
-        let started = std::time::Instant::now();
-        let stream = self.execute_partition_stream(req).await?;
-        let schema = stream.schema();
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .map_err(sanitize_error)?;
-        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let probe = self.query_log.start_probe_distributed(
+            &QueryRequest {
+                sql: req.sql.clone(),
+                session: req.session.clone(),
+                query_id: None,
+            },
+            &req.query_id,
+            &req.initial_query_id,
+            false,
+            &req.coordinator_node_id,
+            Some(self.local_node_id().await),
+            Some(req.partition_files.len() as i32),
+            &req.sql,
+        );
 
-        Ok(QueryExecutionResult {
-            query_id: req.query_id.clone(),
-            coordinator_node_id: String::new(),
-            session: req.session.clone(),
-            schema,
-            batches,
-            message: format!("{row_count} row(s) from partition."),
-            outcome: StatementOutcome::Rows,
-            execution_time_ms: started.elapsed().as_millis(),
-        })
+        let started = std::time::Instant::now();
+        let result: Result<QueryExecutionResult> = async {
+            let stream = self.execute_partition_stream(req).await?;
+            let schema = stream.schema();
+            let batches = datafusion::physical_plan::common::collect(stream)
+                .await
+                .map_err(sanitize_error)?;
+            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            Ok(QueryExecutionResult {
+                query_id: req.query_id.clone(),
+                coordinator_node_id: String::new(),
+                session: req.session.clone(),
+                schema,
+                batches,
+                message: format!("{row_count} row(s) from partition."),
+                outcome: StatementOutcome::Rows,
+                execution_time_ms: started.elapsed().as_millis(),
+            })
+        }
+        .await;
+
+        if let Ok(execution) = &result {
+            let rows: i64 = execution.batches.iter().map(|b| b.num_rows() as i64).sum();
+            probe.observe_read(rows, 0);
+        }
+        probe.finish_result(&result);
+        result
     }
 
     /// Executes an `ExecutePartitionWriteRequest` on behalf of a Coordinator.
@@ -806,24 +850,57 @@ impl PrototypeEngine {
     async fn relation_lock(
         &self,
         relation: &analyticsdb_control::CatalogRelation,
-    ) -> Arc<tokio::sync::RwLock<()>> {
+    ) -> Result<DistributedRelationLock> {
         let key = format!(
             "{}.{}.{}",
             relation.database, relation.schema, relation.name
         );
-        {
+
+        // In-process lock: guarantees single-process serialisation.
+        let inner = {
             let locks = self.relation_locks.read().await;
             if let Some(lock) = locks.get(&key) {
-                return Arc::clone(lock);
+                Arc::clone(lock)
+            } else {
+                drop(locks);
+                let mut locks = self.relation_locks.write().await;
+                Arc::clone(
+                    locks
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
+                )
             }
+        };
+
+        // Distributed advisory lease: guards against concurrent mutations
+        // from other coordinator nodes sharing the same SQLite catalogue.
+        let node_id = self.local_node_id().await;
+        let acquired = self
+            .control_plane
+            .try_acquire_relation_lease(&key, &node_id, 30_000)
+            .await?;
+        if !acquired {
+            anyhow::bail!(
+                "relation {key} is locked by another coordinator; retry momentarily"
+            );
         }
 
-        let mut locks = self.relation_locks.write().await;
-        Arc::clone(
-            locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
-        )
+        // Spawn a background task that releases the lease when the lock is
+        // dropped (the sender half of the oneshot is stored in the lock struct).
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cp = Arc::clone(&self.control_plane);
+        let release_key = key.clone();
+        let release_node = node_id.clone();
+        tokio::spawn(async move {
+            // Wait for the lock to be dropped (sender closes).
+            let _ = rx.await;
+            let _ = cp.release_relation_lease(&release_key, &release_node).await;
+        });
+
+        Ok(DistributedRelationLock {
+            inner,
+            _release_tx: Some(tx),
+        })
     }
 
     pub async fn list_databases(&self, session: &SessionContext) -> Result<Vec<String>> {
@@ -1226,7 +1303,7 @@ impl PrototypeEngine {
             )
         })?;
         let (store, prefix) = storage::store_for_location(storage_location)?;
-        let relation_lock = self.relation_lock(&relation).await;
+        let relation_lock = self.relation_lock(&relation).await?;
         println!("insert waiting for lock for {}", request.sql);
         let _write_guard = relation_lock.write().await;
         println!("insert acquired lock for {}", request.sql);

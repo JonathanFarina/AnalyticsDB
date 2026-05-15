@@ -35,6 +35,28 @@ use crate::{
 pub trait CatalogStore: Send + Sync + std::fmt::Debug {
     async fn load(&self) -> Result<CatalogState>;
     async fn save_state(&self, state: &CatalogState) -> Result<()>;
+
+    /// Try to acquire an advisory write lease for `relation_key` held by
+    /// `holder_node_id` for `ttl_ms` milliseconds.  Returns `true` when the
+    /// lease was granted (either a fresh grant or a renewal by the same
+    /// holder), `false` when another node holds an unexpired lease.
+    ///
+    /// The JSON backend always grants (single-coordinator assumption).
+    async fn try_acquire_lease(
+        &self,
+        _relation_key: &str,
+        _holder_node_id: &str,
+        _ttl_ms: u64,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Release the lease previously acquired by `holder_node_id` for
+    /// `relation_key`.  No-op if the lease doesn't exist or belongs to a
+    /// different node.
+    async fn release_lease(&self, _relation_key: &str, _holder_node_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Choose a backend based on the path extension. Defaults to JSON for
@@ -148,6 +170,11 @@ impl SqliteCatalogStore {
             CREATE TABLE IF NOT EXISTS aggregates  (key  TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS collations  (key  TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversions (key  TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS table_leases (
+                relation_key  TEXT PRIMARY KEY,
+                holder_node_id TEXT NOT NULL,
+                expires_ms    INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -241,6 +268,56 @@ impl CatalogStore for SqliteCatalogStore {
         let serializable = SerializableState::try_from(state)?;
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || Self::save_blocking(path, serializable)).await?
+    }
+
+    async fn try_acquire_lease(
+        &self,
+        relation_key: &str,
+        holder_node_id: &str,
+        ttl_ms: u64,
+    ) -> Result<bool> {
+        let path = self.path.clone();
+        let key = relation_key.to_string();
+        let holder = holder_node_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = Self::new(path);
+            let conn = store.open_conn()?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let expires_ms = now_ms + ttl_ms;
+            // Upsert the lease row only when there is no unexpired lease from
+            // another node. `changes()` tells us whether the row was written.
+            let rows = conn.execute(
+                "INSERT INTO table_leases (relation_key, holder_node_id, expires_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(relation_key) DO UPDATE
+                     SET holder_node_id = excluded.holder_node_id,
+                         expires_ms     = excluded.expires_ms
+                     WHERE table_leases.expires_ms < ?4
+                        OR table_leases.holder_node_id = ?2",
+                params![key, holder, expires_ms as i64, now_ms as i64],
+            )?;
+            Ok(rows > 0)
+        })
+        .await?
+    }
+
+    async fn release_lease(&self, relation_key: &str, holder_node_id: &str) -> Result<()> {
+        let path = self.path.clone();
+        let key = relation_key.to_string();
+        let holder = holder_node_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = Self::new(path);
+            let conn = store.open_conn()?;
+            conn.execute(
+                "DELETE FROM table_leases WHERE relation_key = ?1 AND holder_node_id = ?2",
+                params![key, holder],
+            )?;
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -441,5 +518,71 @@ mod tests {
         assert!(is_sqlite_path(Path::new("foo.sqlite3")));
         assert!(!is_sqlite_path(Path::new("foo.json")));
         assert!(!is_sqlite_path(Path::new("foo")));
+    }
+
+    #[test]
+    fn sqlite_store_lease_acquire_and_release() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_path("lease.db");
+            let store = SqliteCatalogStore::new(path.clone());
+
+            // First acquire should succeed.
+            let ok = store
+                .try_acquire_lease("db.public.orders", "node-1", 30_000)
+                .await
+                .expect("acquire 1");
+            assert!(ok, "first acquire should succeed");
+
+            // Renewal by the same node must also succeed.
+            let ok = store
+                .try_acquire_lease("db.public.orders", "node-1", 30_000)
+                .await
+                .expect("renewal");
+            assert!(ok, "renewal by same node should succeed");
+
+            // A competing node must be blocked while node-1 holds the lease.
+            let blocked = store
+                .try_acquire_lease("db.public.orders", "node-2", 30_000)
+                .await
+                .expect("competing acquire");
+            assert!(!blocked, "competing node should be blocked");
+
+            // After release by node-1 the competing node can acquire.
+            store
+                .release_lease("db.public.orders", "node-1")
+                .await
+                .expect("release");
+
+            let acquired = store
+                .try_acquire_lease("db.public.orders", "node-2", 30_000)
+                .await
+                .expect("post-release acquire");
+            assert!(acquired, "node-2 should acquire after node-1 releases");
+
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("db-wal")).ok();
+            std::fs::remove_file(path.with_extension("db-shm")).ok();
+        });
+    }
+
+    #[test]
+    fn json_store_lease_is_always_granted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = temp_path("lease.json");
+            let store = JsonCatalogStore::new(path);
+            let ok = store
+                .try_acquire_lease("any.relation", "node-1", 1_000)
+                .await
+                .expect("json acquire");
+            assert!(ok);
+        });
     }
 }

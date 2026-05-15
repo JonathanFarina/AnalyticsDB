@@ -44,13 +44,29 @@ impl PrototypeEngine {
             .get_or_list(&table_key, &store, &prefix)
             .await?;
 
-        let aggregate_plan = distributed_aggregate_plan(&request.sql, &table_name);
-        if aggregate_plan.is_none() && select_projection_contains_function(&request.sql) {
+        // Select the distributed plan to use (in priority order).
+        let aggregate_plan: Option<(String, String)> = {
+            if let Some(plan) = distributed_aggregate_plan(&request.sql, &table_name) {
+                Some(plan)
+            } else if let Some(plan) = distributed_distinct_plan(&request.sql, &table_name) {
+                Some(plan)
+            } else if let Some(plan) = distributed_order_limit_plan(&request.sql, &table_name) {
+                Some(plan)
+            } else {
+                None
+            }
+        };
+        // Block distribution for window functions or other unsupported function patterns.
+        if aggregate_plan.is_none()
+            && (has_window_functions(&request.sql)
+                || select_projection_contains_function(&request.sql))
+        {
             return Ok(None);
         }
 
         // Calculate optimal worker count based on data size and file count.
-        let total_size: u64 = files.iter().map(|(_, size)| *size).sum();
+        let total_size: u64 = files.iter().map(|(_, size, _)| *size).sum();
+        let _total_rows: i64 = files.iter().map(|(_, _, rows)| *rows).sum();
         let file_count = files.len();
         let partition_client = Arc::clone(&self.partition_client);
 
@@ -201,7 +217,7 @@ impl PrototypeEngine {
             }
 
             let ctx = DfSessionContext::new_with_config(base_session_config());
-            let all_file_paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+            let all_file_paths: Vec<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
             let base_schema =
                 build_partition_read_schema(&ctx, all_file_paths, &relation.columns).await?;
 
@@ -570,13 +586,13 @@ impl PrototypeEngine {
             }));
         }
 
-        let total_size: u64 = source_files.iter().map(|(_, size)| *size).sum();
+        let total_size: u64 = source_files.iter().map(|(_, size, _)| *size).sum();
         let file_count = source_files.len();
 
         // Acquire the write lock on the target relation once for the duration
         // of all retry attempts; otherwise other writers could slip in between
         // an aborted attempt and a retry.
-        let relation_lock = self.relation_lock(&target_relation).await;
+        let relation_lock = self.relation_lock(&target_relation).await?;
         let _write_guard = relation_lock.write().await;
 
         let make_tasks = |compute_nodes: &[analyticsdb_control::ClusterNode]| -> Vec<(
@@ -887,7 +903,7 @@ impl PrototypeEngine {
                 .collect()
         };
 
-        let relation_lock = self.relation_lock(target_relation).await;
+        let relation_lock = self.relation_lock(target_relation).await?;
         let _write_guard = relation_lock.write().await;
 
         self.run_distributed_insert(
