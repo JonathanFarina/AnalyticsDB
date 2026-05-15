@@ -161,7 +161,7 @@ Tasks:
 
 ---
 
-### Phase B. Durable Object-Storage Storage Layer *(in progress)*
+### Phase B. Durable Object-Storage Storage Layer ✅
 
 This is the most architecturally important phase. The product invariant
 "compute and storage stay decoupled" cannot be honored while managed tables
@@ -270,7 +270,7 @@ Tasks:
 
 ---
 
-### Phase C. Distributed Execution Correctness And Resilience *(in progress)*
+### Phase C. Distributed Execution Correctness And Resilience ✅ *(one exit-gate item outstanding: chaos test)*
 
 The current distributed path is a correctness-first scaffold with known gaps
 ([feature-status.md](docs/agents/feature-status.md) row "Distributed
