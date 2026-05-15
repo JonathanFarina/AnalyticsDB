@@ -143,6 +143,14 @@ impl PrototypeEngine {
                 })
                 .collect();
 
+            // Resolve the cancellation token for this query so worker legs can be
+            // aborted promptly when KILL QUERY is issued.
+            let cancel = self
+                .active_queries
+                .get(&admission.query_id)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
+
             // Dispatch all concurrently.
             let mut dispatch_futures = Vec::new();
             for (node, req) in &worker_tasks {
@@ -150,15 +158,9 @@ impl PrototypeEngine {
                     distributed::PartitionClient::node_channel_endpoint(node).to_string();
                 let pc = Arc::clone(&partition_client);
                 let node_id = node.id.clone();
+                let cancel = cancel.clone();
                 dispatch_futures.push(async move {
-                    match pc
-                        .execute_on_node(
-                            &endpoint,
-                            req,
-                            tokio_util::sync::CancellationToken::new(),
-                        )
-                        .await
-                    {
+                    match pc.execute_on_node(&endpoint, req, cancel).await {
                         Ok(stream) => Ok((node_id, stream)),
                         Err(e) => Err((node_id, e)),
                     }
@@ -198,15 +200,14 @@ impl PrototypeEngine {
                 continue;
             }
 
-            // Merge all worker streams into one concurrent stream.
-            let mut merged_stream = futures::stream::select_all(worker_streams);
             let ctx = DfSessionContext::new_with_config(base_session_config());
             let all_file_paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
             let base_schema =
                 build_partition_read_schema(&ctx, all_file_paths, &relation.columns).await?;
 
             if aggregate_plan.is_some() {
-                // For aggregates, we must materialize the (small) partial results to finalize.
+                // For aggregates, materialize all partial results then finalize on the coordinator.
+                let mut merged_stream = futures::stream::select_all(worker_streams);
                 let mut all_batches = Vec::new();
                 let mut stream_failed_node_id = None;
 
@@ -254,6 +255,26 @@ impl PrototypeEngine {
                     .map(Some);
             } else {
                 // For plain SELECTs (large results), use the TRUE STREAMING path.
+                // Each worker stream is bridged through a bounded mpsc channel so that a
+                // slow consumer creates backpressure all the way to the gRPC transport,
+                // preventing unbounded memory growth on the coordinator.
+                const PARTITION_BUFFER: usize = 16;
+                let mut rx_streams = Vec::new();
+                for stream in worker_streams {
+                    let (tx, rx) = tokio::sync::mpsc::channel(PARTITION_BUFFER);
+                    tokio::spawn(async move {
+                        tokio::pin!(stream);
+                        while let Some(item) = stream.next().await {
+                            if tx.send(item).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    rx_streams
+                        .push(tokio_stream::wrappers::ReceiverStream::new(rx));
+                }
+                let merged_stream = futures::stream::select_all(rx_streams);
+
                 let df_stream = merged_stream.map(|res| match res {
                     Ok(batch) => Ok(batch),
                     Err((node_id, e)) => Err(DataFusionError::Execution(format!(
