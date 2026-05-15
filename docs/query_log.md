@@ -89,7 +89,30 @@ FROM system.query_log
 WHERE event_type = 'ExceptionWhileProcessing';
 ```
 
+## Worker Rows
+
+Distributed read queries write a sibling row per worker into `system.query_log`
+with `is_initial_query = false` and `initial_query_id` set to the coordinator's
+query ID. These rows carry the partition's `read_rows`, `read_bytes`, and
+`duration_ms`.  Filter for coordinator rows with:
+
+```sql
+SELECT * FROM system.query_log WHERE is_initial_query = true;
+```
+
+Or explore all rows for a distributed query:
+
+```sql
+SELECT query_id, worker_node_id, is_initial_query, read_rows, duration_ms
+FROM system.query_log
+WHERE initial_query_id = '<coordinator-query-id>'
+ORDER BY event_time_us;
+```
+
 ## Current Gaps
 
+- Streaming Flight SQL query finish is not yet logged (only non-streaming paths).
+- DataFusion stage-level metrics (operator timings, spill bytes) are not yet enriched into rows.
+- Retention sweeper and partitioned (`YYYY/MM/DD/`) layout are not yet implemented.
 - Benchmark gates for query-log overhead are not wired into CI yet.
 

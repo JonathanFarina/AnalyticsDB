@@ -155,7 +155,7 @@ Rules:
 - no query path is complete without trace identifiers and structured logs
 - logs must be attributable to query id, user, protocol, and node
 - query-log writes must stay off the hot execution path; current implementation pushes records to an in-memory channel and a background writer persists Parquet files under the catalog-managed system directory
-- the current `system.query_log` implementation is `Partial`: it is SQL-queryable and durable for the non-streaming path, but streaming Flight SQL finish accounting, DataFusion metric enrichment, retention sweeping, distributed sibling rows, and benchmark gates remain required before any production-ready claim
+- the current `system.query_log` implementation is `Partial`: it is SQL-queryable and durable for the non-streaming path, and worker sibling rows (`is_initial_query = false`) are now written for the distributed read path; streaming Flight SQL finish accounting, DataFusion stage metric enrichment, retention sweeping, partitioned layout, and benchmark gates remain required before any production-ready claim
 - admin UI requirements depend on this plane
 
 ## PostgreSQL Compatibility Strategy
