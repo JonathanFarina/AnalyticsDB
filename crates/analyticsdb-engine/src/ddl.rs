@@ -1139,6 +1139,60 @@ impl PrototypeEngine {
                     request.session.clone(),
                 )
             }
+            MetadataStatement::VacuumTable {
+                database,
+                schema,
+                name,
+            } => {
+                let relation = self
+                    .control_plane
+                    .table_relation(
+                        &request.session,
+                        database.as_deref(),
+                        schema.as_deref(),
+                        &name,
+                    )
+                    .await?;
+                let storage_location = relation.storage_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Managed table '{}.{}.{}' is missing a storage path",
+                        relation.database,
+                        relation.schema,
+                        relation.name
+                    )
+                })?;
+                let (store, prefix) = storage::store_for_location(storage_location)?;
+                let relation_lock = self.relation_lock(&relation).await;
+                let _write_guard = relation_lock.write().await;
+
+                const TARGET_FILE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+                const MIN_FILES_TO_COMPACT: usize = 2;
+                let files_written = crate::manifest::compact_table(
+                    &store,
+                    &prefix,
+                    TARGET_FILE_BYTES,
+                    MIN_FILES_TO_COMPACT,
+                )
+                .await?;
+
+                tracing::info!(
+                    "VACUUM compacted '{}.{}.{}': {} file(s) written",
+                    relation.database,
+                    relation.schema,
+                    relation.name,
+                    files_written,
+                );
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    format!(
+                        "VACUUM completed for '{}.{}.{}'.",
+                        relation.database, relation.schema, relation.name
+                    ),
+                    command_outcome("VACUUM", 0),
+                    request.session.clone(),
+                )
+            }
             MetadataStatement::AlterTable {
                 database,
                 schema,

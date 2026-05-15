@@ -2,6 +2,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use futures::StreamExt;
 use object_store::path::Path as OPath;
 use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
@@ -316,4 +318,164 @@ pub async fn vacuum_orphans(
     let count = orphans.len();
     storage::delete_objects(store, &orphans).await?;
     Ok(count)
+}
+
+/// Merges small Parquet files under `prefix` into fewer, larger files.
+///
+/// Compaction is skipped when fewer than `min_file_count` files are listed in
+/// the manifest (no work to do) or when the total size of *small* files is
+/// below `target_file_bytes` (a single pass would produce only one tiny file).
+///
+/// Returns the number of new Parquet files written.  The manifest is atomically
+/// replaced and orphaned originals are vacuumed before returning.
+pub async fn compact_table(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+    target_file_bytes: u64,
+    min_file_count: usize,
+) -> Result<usize> {
+    let manifest = match read_manifest(store, prefix).await? {
+        Some(m) => m,
+        None => return Ok(0),
+    };
+
+    if manifest.files.len() < min_file_count {
+        return Ok(0);
+    }
+
+    // Read all committed batches and infer schema from the first file.
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    let mut schema: Option<SchemaRef> = None;
+
+    for entry in &manifest.files {
+        let key = prefix.clone().join(entry.path.as_str());
+        let bytes = match store.get(&key).await {
+            Ok(r) => r.bytes().await?,
+            Err(OsError::NotFound { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        let reader = ParquetRecordBatchReader::try_new(bytes, 8192)
+            .map_err(|e| anyhow::anyhow!("Parquet read error for {}: {}", entry.path, e))?;
+
+        for batch in reader {
+            let batch = batch.map_err(|e| anyhow::anyhow!("Batch read error: {}", e))?;
+            if schema.is_none() {
+                schema = Some(batch.schema());
+            }
+            all_batches.push(batch);
+        }
+    }
+
+    let schema = match schema {
+        Some(s) => s,
+        None => return Ok(0), // All files were empty or missing.
+    };
+
+    // Bin batches into new files sized around `target_file_bytes`.
+    let mut new_entries: Vec<ManifestEntry> = Vec::new();
+    let mut current_bin: Vec<RecordBatch> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    let flush_bin = |bin: &[RecordBatch], schema: SchemaRef| -> Result<(String, u64, i64)> {
+        let filename = format!("{}.parquet", Uuid::now_v7());
+        let bytes = storage::encode_parquet_batches(schema, bin)?;
+        let size = bytes.len() as u64;
+        let row_count: i64 = bin.iter().map(|b| b.num_rows() as i64).sum();
+        Ok((filename, size, row_count))
+    };
+
+    for batch in all_batches {
+        let estimated = storage::encode_parquet_batches(batch.schema(), std::slice::from_ref(&batch))
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+
+        if !current_bin.is_empty() && current_size + estimated > target_file_bytes {
+            let (filename, size, row_count) =
+                flush_bin(&current_bin, Arc::clone(&schema))?;
+            let key = prefix.clone().join(filename.as_str());
+            let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &current_bin)?;
+            store.put(&key, bytes.into()).await?;
+            new_entries.push(ManifestEntry { path: filename, size, row_count });
+            current_bin.clear();
+            current_size = 0;
+        }
+
+        current_size += estimated;
+        current_bin.push(batch);
+    }
+
+    if !current_bin.is_empty() {
+        let (filename, size, row_count) = flush_bin(&current_bin, Arc::clone(&schema))?;
+        let key = prefix.clone().join(filename.as_str());
+        let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &current_bin)?;
+        store.put(&key, bytes.into()).await?;
+        new_entries.push(ManifestEntry { path: filename, size, row_count });
+    }
+
+    let written = new_entries.len();
+    replace_manifest(store, prefix, new_entries).await?;
+    vacuum_orphans(store, prefix).await?;
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+
+    fn make_batch(values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values));
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn compact_table_merges_multiple_small_files_into_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "compact-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+        let prefix = OPath::parse(dir.to_string_lossy().trim_start_matches('/')).unwrap();
+
+        // Write three small Parquet files via append_batch.
+        append_batch(&store, &prefix, make_batch(vec![1, 2])).await.unwrap();
+        append_batch(&store, &prefix, make_batch(vec![3, 4])).await.unwrap();
+        append_batch(&store, &prefix, make_batch(vec![5, 6])).await.unwrap();
+
+        let manifest_before = read_manifest(&store, &prefix).await.unwrap().unwrap();
+        assert_eq!(manifest_before.files.len(), 3, "expected 3 input files");
+
+        // Compact with a large target so all 3 fit into 1 output file.
+        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2).await.unwrap();
+        assert_eq!(written, 1, "all small files should merge into a single output");
+
+        let manifest_after = read_manifest(&store, &prefix).await.unwrap().unwrap();
+        assert_eq!(manifest_after.files.len(), 1, "manifest should list one file after compaction");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn compact_table_skips_when_below_min_file_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "compact-skip-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+        let prefix = OPath::parse(dir.to_string_lossy().trim_start_matches('/')).unwrap();
+
+        append_batch(&store, &prefix, make_batch(vec![1])).await.unwrap();
+
+        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2).await.unwrap();
+        assert_eq!(written, 0, "single file should not be compacted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

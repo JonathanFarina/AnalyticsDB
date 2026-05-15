@@ -647,6 +647,11 @@ pub enum MetadataStatement {
     KillQuery {
         query_id: String,
     },
+    VacuumTable {
+        database: Option<String>,
+        schema: Option<String>,
+        name: String,
+    },
 }
 
 pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
@@ -1092,7 +1097,8 @@ impl ControlPlane {
             | MetadataStatement::DropView { .. }
             | MetadataStatement::DropDatabase { .. }
             | MetadataStatement::DropSchema { .. }
-            | MetadataStatement::KillQuery { .. } => {
+            | MetadataStatement::KillQuery { .. }
+            | MetadataStatement::VacuumTable { .. } => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases => {
@@ -3998,6 +4004,17 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 schema,
                 name: table_name,
             })
+        }
+        sqlparser::ast::Statement::Vacuum(vacuum) => {
+            let table_name = vacuum.table_name.as_ref()?;
+            let idents: Vec<String> = table_name.0.iter().map(|i| i.to_string()).collect();
+            let (database, schema, name) = match idents.as_slice() {
+                [n] => (None, None, n.clone()),
+                [s, n] => (None, Some(s.clone()), n.clone()),
+                [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+                _ => return None,
+            };
+            Some(MetadataStatement::VacuumTable { database, schema, name })
         }
         sqlparser::ast::Statement::Update(update) => {
             let idents: Vec<String> = match &update.table.relation {
