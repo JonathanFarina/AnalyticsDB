@@ -1267,7 +1267,7 @@ impl ControlPlane {
                 }
                 self.grant_privilege(grantee, object_type, object_name, privilege, &session.user)
                     .await?;
-                format!("GRANT")
+                "GRANT".to_string()
             }
             MetadataStatement::RevokePrivilege {
                 grantee,
@@ -1287,7 +1287,7 @@ impl ControlPlane {
                 }
                 self.revoke_privilege(grantee, object_type, object_name, privilege)
                     .await?;
-                format!("REVOKE")
+                "REVOKE".to_string()
             }
             MetadataStatement::CreateView { .. }
             | MetadataStatement::CreateTableAs { .. }
@@ -3904,15 +3904,6 @@ fn bootstrap_state() -> CatalogState {
     );
 
     let mut users = BTreeMap::new();
-
-    // Helper closure: compute SCRAM verifier and return (salt_b64, salted_b64), panicking
-    // only during bootstrap (startup path) which is acceptable.
-    let scram = |pw: &str| -> (Option<String>, Option<String>) {
-        match compute_scram_verifier(pw) {
-            Ok((s, sp)) => (Some(s), Some(sp)),
-            Err(_) => (None, None),
-        }
-    };
 
     // Bootstrap helper: hash password with Argon2id + compute SCRAM verifier.
     // Panicking here is acceptable — bootstrap only runs at first install.

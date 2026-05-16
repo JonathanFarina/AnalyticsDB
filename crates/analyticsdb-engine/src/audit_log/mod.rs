@@ -142,6 +142,7 @@ impl AuditLogRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn error(
         event_type: AuditEventType,
         user: impl Into<String>,

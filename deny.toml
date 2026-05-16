@@ -4,7 +4,14 @@ targets = []
 [advisories]
 version = 2
 # Deny all advisories that have not been explicitly ignored
-ignore = []
+ignore = [
+    # async-std discontinued (transitive dep, cannot easily remove)
+    "RUSTSEC-2025-0052",
+    # bincode unmaintained (transitive dep, cannot easily remove)
+    "RUSTSEC-2025-0141",
+    # paste unmaintained (transitive dep, cannot easily remove)
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -21,11 +28,15 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Internal workspace path deps intentionally omit version constraints
+wildcards = "warn"
 highlight = "all"
 
 [sources]

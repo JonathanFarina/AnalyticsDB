@@ -45,17 +45,10 @@ impl PrototypeEngine {
             .await?;
 
         // Select the distributed plan to use (in priority order).
-        let aggregate_plan: Option<(String, String)> = {
-            if let Some(plan) = distributed_aggregate_plan(&request.sql, &table_name) {
-                Some(plan)
-            } else if let Some(plan) = distributed_distinct_plan(&request.sql, &table_name) {
-                Some(plan)
-            } else if let Some(plan) = distributed_order_limit_plan(&request.sql, &table_name) {
-                Some(plan)
-            } else {
-                None
-            }
-        };
+        let aggregate_plan: Option<(String, String)> =
+            distributed_aggregate_plan(&request.sql, &table_name)
+                .or_else(|| distributed_distinct_plan(&request.sql, &table_name))
+                .or_else(|| distributed_order_limit_plan(&request.sql, &table_name));
         // Block distribution for window functions or other unsupported function patterns.
         if aggregate_plan.is_none()
             && (has_window_functions(&request.sql)

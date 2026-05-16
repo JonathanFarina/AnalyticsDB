@@ -89,7 +89,7 @@ pub fn partition_files_for_workers(
             .enumerate()
             .min_by_key(|(_, w)| *w)
             .map(|(i, _)| i)
-            .unwrap();
+            .unwrap_or(0); // bucket_weights is non-empty (guarded above)
         chunks[min_idx].push(file);
         bucket_weights[min_idx] += weight;
     }
