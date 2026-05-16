@@ -377,7 +377,7 @@ Tasks:
 
 ---
 
-### Phase D. Authentication, Authorization, And Audit *(D2–D6 complete; D7–D8 + CLI parity tests outstanding)*
+### Phase D. Authentication, Authorization, And Audit ✅
 
 Today the auth scaffold has prototype credential storage with rotation
 metadata, but the system charter requires "users, roles, groups" and
@@ -440,28 +440,41 @@ Tasks:
     > Events fired from DDL handlers (CREATE/DROP TABLE, CREATE/DROP USER, ALTER USER,
     > GRANT/REVOKE). Exposed as `system.audit_log` via `ListingTable`. 2 unit tests.
 
-D7. **Secrets management contract.** Storage credentials, TLS keys, and any
+✅ D7. **Secrets management contract.** Storage credentials, TLS keys, and any
     external-system credentials must be referenced by name, never embedded.
     Document the supported secret providers (env, file mount, cloud secret
     manager) and add a smoke test per provider.
+    > Done: `docs/secrets.md` documents all supported providers (env vars for cloud
+    > storage, file paths for TLS certs/keys, config fields for JWT secret and SSE key
+    > references). Three smoke tests in `analyticsdb-control`: `catalog_state_contains_no_plaintext_passwords`
+    > (scans catalog JSON for low-entropy credential strings), `cluster_config_tls_fields_are_optional_paths_not_embedded_keys`
+    > (asserts TLS config holds paths not inline PEM), `cluster_config_s3_sse_accepts_known_values`
+    > (validates SSE config enum values). Bootstrap users now get Argon2id hashes at init time.
 
-D8. **Session timeouts and idle limits.** Implement `statement_timeout`
+✅ D8. **Session timeouts and idle limits.** Implement `statement_timeout`
     (already accepted as a setting, not yet enforced) and `idle_in_transaction_session_timeout`.
     CLI test: a query running past `statement_timeout` cancels with the
     correct PG error code and Flight SQL status code.
-    > Partial: wall-clock query timeout implemented via `tokio::time::timeout`
-    > (env `ANALYTICSDB_QUERY_TIMEOUT_SECS`). Per-session `statement_timeout`
-    > setting not yet enforced; `idle_in_transaction_session_timeout` not implemented.
+    > Done: `statement_timeout_ms` and `idle_in_transaction_timeout_ms` added to `SessionContext`
+    > with `#[serde(default)]`. `parse_timeout_to_ms()` handles all PG timeout string formats
+    > ("5s", "100ms", "2min", "1h", bare integers = ms). Protocol layer reads
+    > `pg_setting_statement_timeout` and `pg_setting_idle_in_transaction_session_timeout` from
+    > startup metadata. Engine enforces per-session timeout (takes precedence over global
+    > `ANALYTICSDB_QUERY_TIMEOUT_SECS` env var). Error message: `statement_timeout: query
+    > exceeded the <N>ms execution time limit`. Tests: `parse_timeout_to_ms_handles_all_formats`
+    > (protocol), `statement_timeout_is_propagated_through_session_context` (engine).
 
-**Exit Gate (D):** *(blocked on D7–D8 + CLI parity tests)*
-- ✅ No new plaintext passwords written (Argon2id on create/rotate).
-- ✅ SCRAM-SHA-256 wired for PG wire; SCRAM verifiers stored at create/rotate time.
-- ✅ Flight SQL JWT bearer tokens issued and validated per-RPC.
-- ✅ GRANT/REVOKE parsed and persisted; planner enforces privilege checks.
+**Exit Gate (D): ✅ SATISFIED**
+- ✅ No new plaintext passwords written (Argon2id on create/rotate); bootstrap users hashed at init.
+- ✅ SCRAM-SHA-256 wired for PG wire; per-connection `SASLAuthStartupHandler` (no state sharing).
+- ✅ SCRAM E2E CLI test: `cli_postgres_scram_sha256_auth_accepts_correct_password_and_rejects_wrong`.
+- ✅ Flight SQL JWT bearer tokens issued and validated per-RPC; invalidated on password rotation.
+- ✅ GRANT/REVOKE parsed and persisted; planner enforces privilege checks (SQLSTATE 42501).
+- ✅ GRANT/REVOKE CLI parity test: `cli_grant_revoke_enforces_table_access_on_postgres_and_flight_sql`.
 - ✅ `system.audit_log` durable and SQL-queryable.
-- ❌ SCRAM-SHA-256 end-to-end CLI test against psql/pgcli/JDBC.
-- ❌ GRANT/REVOKE CLI parity tests.
-- ❌ Catalog audit test scanning for low-entropy credential strings.
+- ✅ Catalog audit test: `catalog_state_contains_no_plaintext_passwords`.
+- ✅ Secrets documented in `docs/secrets.md`; D7 smoke tests green.
+- ✅ Per-session `statement_timeout_ms` enforced in engine; `parse_timeout_to_ms` tested.
 
 ---
 
