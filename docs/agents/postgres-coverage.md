@@ -215,3 +215,34 @@ Commands are grouped by their current coverage status. Status values are unchang
 | SET TRANSACTION | - |  |
 | UNLISTEN | - |  |
 | VACUUM | Partial | `VACUUM <table>` triggers compaction; full PostgreSQL VACUUM semantics (analyze, freeze, full) not implemented |
+
+## SQL Surface Drift Guard (E7)
+
+The supported SQL surface is protected by an automated drift guard that runs in CI.
+
+### Where it lives
+
+`crates/analyticsdb-cli/tests/sql_cli.rs` — test `cli_protocols_cover_supported_sql_surface_with_matrix_parity`.
+
+### What it enforces
+
+Two sets must stay identical:
+
+1. **README bullets** — `documented_sql_capabilities_from_readme()` parses the "Current metadata SQL subset:" section of `README.md` and maps each bullet (`- \`CREATE TABLE ...\``, etc.) to a `SqlCapability` enum variant. Any bullet that has no mapping triggers a `panic!` at test time.
+2. **Parity matrix** — `parity_matrix_sql_capabilities()` returns the hardcoded `BTreeSet<SqlCapability>` of every statement that the test matrix actually exercises.
+
+The test asserts `readme_caps == matrix_caps`. If either side diverges the test fails with a diff, blocking CI.
+
+### CI enforcement
+
+The `test-sql-cli` step in the `rust` job runs `make test-sql-cli`, which includes this test. Any PR that modifies the README SQL subset or the parity matrix without keeping both in sync will fail CI.
+
+### How to add a new statement
+
+1. Add a `SqlCapability` variant to the `SqlCapability` enum in `sql_cli.rs`.
+2. Add a mapping branch for the new README bullet in `documented_sql_capabilities_from_readme()`.
+3. Add the variant to `parity_matrix_sql_capabilities()`.
+4. Add a bullet to the "Current metadata SQL subset:" section of `README.md` that matches the prefix expected by the mapping branch.
+5. Add a `SuccessCase` (or `ErrorCase`) to the parity matrix test body that exercises the new statement.
+
+All five steps must be done together; leaving any one out fails the drift guard.

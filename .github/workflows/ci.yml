@@ -130,6 +130,64 @@ jobs:
           AWS_REGION: us-east-1
         run: cargo test -p analyticsdb-cli --test sql_cli cli_s3_storage_root
 
+  jdbc-smoke:
+    name: JDBC smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: jdbc-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build AnalyticsDB server
+        run: cargo build -p analyticsdb-server
+      - name: Download PostgreSQL JDBC driver
+        run: |
+          curl -L -o postgresql.jar \
+            "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar"
+      - name: Run JDBC smoke test
+        run: |
+          # Pick three free ports: postgres wire, flight SQL, and node communication
+          CATALOG=$(mktemp)/catalog.db
+          mkdir -p "$(dirname "$CATALOG")"
+          PG_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+          FL_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+          ND_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+
+          ./target/debug/analyticsdb-server \
+            --catalog-path "$CATALOG" \
+            --postgres-addr "127.0.0.1:$PG_PORT" \
+            --flight-sql-addr "127.0.0.1:$FL_PORT" \
+            --node-addr "127.0.0.1:$ND_PORT" &
+          SERVER_PID=$!
+
+          # Wait for the postgres wire port to be ready (up to 15 seconds)
+          for i in $(seq 1 30); do
+            if nc -z 127.0.0.1 "$PG_PORT" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          # Compile and run the JDBC smoke test
+          javac -cp postgresql.jar tests/jdbc/JdbcSmokeTest.java -d /tmp/jdbc_out
+          java -cp "/tmp/jdbc_out:postgresql.jar" JdbcSmokeTest 127.0.0.1 "$PG_PORT" postgres postgres postgres
+          RESULT=$?
+
+          kill "$SERVER_PID" 2>/dev/null || true
+          exit $RESULT
+
   web-admin-console:
     runs-on: ubuntu-latest
     steps:
