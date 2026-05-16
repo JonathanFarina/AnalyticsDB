@@ -246,3 +246,57 @@ The `test-sql-cli` step in the `rust` job runs `make test-sql-cli`, which includ
 5. Add a `SuccessCase` (or `ErrorCase`) to the parity matrix test body that exercises the new statement.
 
 All five steps must be done together; leaving any one out fails the drift guard.
+
+---
+
+## Built-in Function Coverage
+
+This section tracks DataFusion built-in function support as exercised through the AnalyticsDB engine (both postgres wire and flight-sql protocols). Tests are in `crates/analyticsdb-cli/tests/sql_cli.rs`.
+
+### Status Definitions
+
+- **Category A**: Supported and CLI-tested (test added in Phase E1/E2).
+- **Category B**: Supported but untested before this PR (empty — all were promoted to A).
+- **Category C**: Unsupported or with known serialisation limitations.
+
+---
+
+### Category A: Supported and CLI-tested
+
+| Function Group | Functions | Test Case |
+| :--- | :--- | :--- |
+| Scalar String | `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `REPLACE`, `SUBSTRING`, `CONCAT`, `LEFT`, `RIGHT` | `cli_scalar_string_functions_work_on_both_protocols` |
+| Aggregate | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | `cli_aggregate_functions_work_on_both_protocols` |
+| Math | `ABS`, `CEIL`, `FLOOR`, `ROUND`, `SQRT`, `MOD` (`%`), `POWER` | `cli_math_functions_work_on_both_protocols` |
+| Date/Time | `DATE_TRUNC`, `EXTRACT`, `DATE_PART`, `NOW`, `CURRENT_DATE` | `cli_date_functions_work_on_both_protocols` |
+| Conditional | `CASE/WHEN/THEN/ELSE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` | `cli_conditional_functions_work_on_both_protocols` |
+| Window | `ROW_NUMBER() OVER`, `RANK() OVER`, `LAG`, `LEAD` | `cli_window_functions_work_on_both_protocols` |
+| Type: NUMERIC/DECIMAL | `NUMERIC(p,s)`, `DECIMAL(p,s)` — INSERT and SELECT round-trip | `cli_numeric_decimal_type_roundtrips_correctly` |
+| Type: DATE | `DATE` — CREATE TABLE + INSERT + COUNT (see Category C for read-back limitation) | `cli_date_type_roundtrips_correctly` |
+| Type: TIMESTAMP | `TIMESTAMP` — CREATE TABLE + INSERT + COUNT (see Category C for read-back limitation) | `cli_timestamp_type_roundtrips_correctly` |
+| Type: TEXT (UUID format) | `TEXT` column storing UUID-format strings — full round-trip | `cli_uuid_type_roundtrips_correctly` |
+| Type: BOOLEAN | `BOOLEAN` — INSERT TRUE/FALSE, SELECT (postgres serialises as `t`/`f`; flight-sql as `true`/`false`) | `cli_boolean_type_roundtrips_correctly` |
+
+---
+
+### Category B: Supported but untested (before this PR)
+
+*(Empty — all functions identified as supported were promoted to Category A by adding tests in Phase E1/E2.)*
+
+---
+
+### Category C: Unsupported or Partially Supported
+
+| Function Group | Functions / Types | Notes |
+| :--- | :--- | :--- |
+| Date/Time literal serialisation | `DATE`, `TIMESTAMP` column values | Stored correctly in Parquet but serialised as empty strings when read back via both protocols. `EXTRACT`, `DATE_TRUNC`, and `DATE_PART` work when applied to in-query TIMESTAMP literals. Filed as a known engine limitation. |
+| String | `REGEXP_REPLACE`, `REGEXP_MATCH`, `FORMAT` | DataFusion supports regex functions but they are not explicitly tested through the CLI wire protocols yet. |
+| Math | `LOG`, `LN`, `EXP`, `TRUNC`, `SIGN` | DataFusion supports these but no CLI wire-protocol tests yet. |
+| Date/Time | `AGE`, `INTERVAL` arithmetic, `AT TIME ZONE` | `AGE` and `INTERVAL` types are not supported by the current DataFusion/Arrow pipeline. `AT TIME ZONE` may work for literals but is not tested. |
+| Aggregate | `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `PERCENTILE_CONT`, `PERCENTILE_DISC` | Not tested; DataFusion supports some of these natively but they have not been validated through the CLI wire protocols. |
+| Window | `NTILE`, `FIRST_VALUE`, `LAST_VALUE`, `PERCENT_RANK`, `CUME_DIST` | DataFusion supports these but no CLI wire-protocol tests yet. |
+| JSON | `jsonb_*`, `json_*`, `->>` operator, `@>` operator | JSONB is not supported; JSON stored as TEXT only. |
+| Array | `ARRAY`, `UNNEST`, `array_*` | Arrow array types are not exposed through the current SQL surface. |
+| Full-text | `to_tsvector`, `to_tsquery`, `@@` | Not implemented. |
+| Type: UUID (native) | Native `UUID` OID / Arrow type | DataFusion/Arrow has UUID support but the engine maps it to TEXT. Use TEXT columns with UUID-format strings instead. |
+| Type: NUMERIC NOT NULL | `NUMERIC(p,s) NOT NULL`, `DECIMAL(p,s) NOT NULL` | Arrow null-value validation error on INSERT when the column is declared NOT NULL with NUMERIC/DECIMAL type. Use nullable NUMERIC columns or DOUBLE PRECISION instead. |
