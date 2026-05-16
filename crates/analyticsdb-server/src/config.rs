@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -84,11 +85,11 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from a file.
-    pub fn from_file(path: &str) -> Result<Self, String> {
+    pub fn from_file(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file: {}", e))?;
+            .with_context(|| format!("Failed to read config file: {}", path))?;
         serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse config file: {}", e))
+            .with_context(|| format!("Failed to parse config file: {}", path))
     }
     
     /// Validate configuration.

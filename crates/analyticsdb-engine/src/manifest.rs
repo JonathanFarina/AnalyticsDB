@@ -218,6 +218,7 @@ pub async fn append_to_manifest(
             path: filename.to_string(),
             size,
             row_count,
+            column_stats: Vec::new(),
         });
         manifest.bump_snapshot();
 
@@ -451,7 +452,7 @@ pub async fn compact_table(
         let row_count: i64 = bin.iter().map(|b| b.num_rows() as i64).sum();
         let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &bin)?;
         let size = bytes.len() as u64;
-        Ok((ManifestEntry { path: data_path, size, row_count }, bytes))
+        Ok((ManifestEntry { path: data_path, size, row_count, column_stats: Vec::new() }, bytes))
     };
 
     for batch in all_batches {

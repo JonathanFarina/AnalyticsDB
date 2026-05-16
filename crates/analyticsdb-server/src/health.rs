@@ -2,8 +2,9 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use anyhow::Result;
+use hyper::body::Body;
+use hyper::server::Server;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
 use tokio::sync::watch;
 use tracing::{debug, error};
 
@@ -19,34 +20,34 @@ pub fn start_health_server(
     tokio::spawn(async move {
         let make_svc = make_service_fn(move |_conn| {
             let ready_rx = ready_rx.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
-                    let ready_rx = ready_rx.clone();
-                    async move {
-                        let path = req.uri().path();
-                        let (status, body) = if path == "/healthz" {
-                            // Liveness: always healthy if the process is running.
+            Ok::<_, Infallible>(service_fn(move |req| {
+                let ready_rx = ready_rx.clone();
+                async move {
+                    let path = req.uri().path();
+                    let (status, body) = if path == "/healthz" {
+                        // Liveness: always healthy if the process is running.
+                        (hyper::StatusCode::OK, "OK\n".to_string())
+                    } else if path == "/readyz" {
+                        // Readiness: check if the engine is ready.
+                        let ready = *ready_rx.borrow();
+                        if ready {
                             (hyper::StatusCode::OK, "OK\n".to_string())
-                        } else if path == "/readyz" {
-                            // Readiness: check if the engine is ready.
-                            let ready = *ready_rx.borrow();
-                            if ready {
-                                (hyper::StatusCode::OK, "OK\n".to_string())
-                            } else {
-                                (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string())
-                            }
                         } else {
-                            (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string())
-                        };
-                        debug!("Health check {} -> {}", path, status);
-                        Ok::<_, Infallible>(Response::builder()
+                            (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string())
+                        }
+                    } else {
+                        (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string())
+                    };
+                    debug!("Health check {} -> {}", path, status);
+                    Ok::<_, Infallible>(
+                        hyper::Response::builder()
                             .status(status)
                             .header("Content-Type", "text/plain")
                             .body(Body::from(body))
-                            .unwrap())
-                    }
-                }))
-            }
+                            .unwrap(),
+                    )
+                }
+            }))
         });
 
         let server = Server::bind(&addr).serve(make_svc);
