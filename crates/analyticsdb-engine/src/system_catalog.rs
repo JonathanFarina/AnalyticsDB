@@ -718,6 +718,10 @@ impl PgCatalogSchemaProvider {
             "pg_constraint".to_string(),
             Arc::new(PgConstraintTable::new(Arc::clone(&control_plane))),
         );
+        tables.insert(
+            "pg_proc".to_string(),
+            Arc::new(PgProcTable::new(Arc::clone(&control_plane))),
+        );
 
         Self {
             _control_plane: control_plane,
@@ -1275,9 +1279,9 @@ impl TableProvider for PgTypeTable {
         _filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Minimal types for JDBC/DBeaver
+        // Standard pg_type entries needed for \d <table> and JDBC introspection
         let types = vec![
-            (16, "bool", 1, true, "b", "B"),
+            (16_i32, "bool", 1_i16, true, "b", "B"),
             (18, "char", 1, true, "b", "S"),
             (20, "int8", 8, true, "b", "N"),
             (21, "int2", 2, true, "b", "N"),
@@ -1285,8 +1289,12 @@ impl TableProvider for PgTypeTable {
             (25, "text", -1, false, "b", "S"),
             (700, "float4", 4, true, "b", "N"),
             (701, "float8", 8, true, "b", "N"),
+            (1043, "varchar", -1, false, "b", "S"),
+            (1082, "date", 4, true, "b", "D"),
             (1114, "timestamp", 8, true, "b", "D"),
             (1184, "timestamptz", 8, true, "b", "D"),
+            (1700, "numeric", -1, false, "b", "N"),
+            (2950, "uuid", 16, false, "b", "U"),
         ];
 
         let mut oid = Vec::new();
@@ -2213,6 +2221,177 @@ impl TableProvider for PgConstraintTable {
                 Arc::new(BooleanArray::from(connoinherit)),
                 Arc::new(StringArray::from(conkey)),
                 Arc::new(StringArray::from(confkey)),
+            ],
+        )?;
+
+        Ok(Arc::new(SystemCatalogExec::new(batch, projection)?))
+    }
+}
+
+#[derive(Debug)]
+struct PgProcTable {
+    _control_plane: Arc<ControlPlane>,
+    schema: SchemaRef,
+}
+
+impl PgProcTable {
+    fn new(control_plane: Arc<ControlPlane>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("proname", DataType::Utf8, false),
+            Field::new("pronamespace", DataType::Int64, false),
+            Field::new("proowner", DataType::Int64, false),
+            Field::new("prolang", DataType::Int64, false),
+            Field::new("procost", DataType::Float32, false),
+            Field::new("prorows", DataType::Float32, false),
+            Field::new("provariadic", DataType::Int64, false),
+            Field::new("prosecdef", DataType::Boolean, false),
+            Field::new("proleakproof", DataType::Boolean, false),
+            Field::new("proisstrict", DataType::Boolean, false),
+            Field::new("proretset", DataType::Boolean, false),
+            Field::new("provolatile", DataType::Utf8, false),
+            Field::new("pronargs", DataType::Int32, false),
+            Field::new("prorettype", DataType::Int64, false),
+            Field::new("proargtypes", DataType::Utf8, false),
+            Field::new("prosrc", DataType::Utf8, false),
+        ]));
+        Self {
+            _control_plane: control_plane,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgProcTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // (oid, name, nargs, rettype_oid, argtypes, volatility)
+        // rettype: 25=text, 23=int4, 20=int8, 701=float8, 700=float4, 16=bool
+        let functions: &[(&str, i32, i64, &str, &str)] = &[
+            // String functions
+            ("length", 1, 23, "25", "i"),
+            ("upper", 1, 25, "25", "i"),
+            ("lower", 1, 25, "25", "i"),
+            ("trim", 1, 25, "25", "i"),
+            ("ltrim", 1, 25, "25", "i"),
+            ("rtrim", 1, 25, "25", "i"),
+            ("concat", 2, 25, "25 25", "i"),
+            ("substring", 3, 25, "25 23 23", "i"),
+            ("replace", 3, 25, "25 25 25", "i"),
+            ("strpos", 2, 23, "25 25", "i"),
+            ("starts_with", 2, 16, "25 25", "i"),
+            ("regexp_like", 2, 16, "25 25", "i"),
+            ("regexp_match", 2, 25, "25 25", "i"),
+            // Math
+            ("abs", 1, 701, "701", "i"),
+            ("ceil", 1, 701, "701", "i"),
+            ("floor", 1, 701, "701", "i"),
+            ("round", 1, 701, "701", "i"),
+            ("sqrt", 1, 701, "701", "i"),
+            ("power", 2, 701, "701 701", "i"),
+            ("exp", 1, 701, "701", "i"),
+            ("ln", 1, 701, "701", "i"),
+            ("log", 1, 701, "701", "i"),
+            ("log2", 1, 701, "701", "i"),
+            ("log10", 1, 701, "701", "i"),
+            ("sin", 1, 701, "701", "i"),
+            ("cos", 1, 701, "701", "i"),
+            ("tan", 1, 701, "701", "i"),
+            ("pi", 0, 701, "", "i"),
+            // Date/time
+            ("now", 0, 1184, "", "s"),
+            ("current_date", 0, 1082, "", "s"),
+            ("current_timestamp", 0, 1184, "", "s"),
+            ("date_trunc", 2, 1114, "25 1114", "s"),
+            ("date_part", 2, 701, "25 1114", "s"),
+            ("extract", 2, 701, "25 1114", "s"),
+            ("to_timestamp", 1, 1184, "701", "i"),
+            // Aggregates
+            ("count", 1, 20, "25", "i"),
+            ("sum", 1, 701, "701", "i"),
+            ("avg", 1, 701, "701", "i"),
+            ("min", 1, 25, "25", "i"),
+            ("max", 1, 25, "25", "i"),
+            ("array_agg", 1, 25, "25", "i"),
+            ("string_agg", 2, 25, "25 25", "i"),
+        ];
+
+        let mut oid_col: Vec<i64> = Vec::new();
+        let mut proname: Vec<String> = Vec::new();
+        let mut pronamespace: Vec<i64> = Vec::new();
+        let mut proowner: Vec<i64> = Vec::new();
+        let mut prolang: Vec<i64> = Vec::new();
+        let mut procost: Vec<f32> = Vec::new();
+        let mut prorows: Vec<f32> = Vec::new();
+        let mut provariadic: Vec<i64> = Vec::new();
+        let mut prosecdef: Vec<bool> = Vec::new();
+        let mut proleakproof: Vec<bool> = Vec::new();
+        let mut proisstrict: Vec<bool> = Vec::new();
+        let mut proretset: Vec<bool> = Vec::new();
+        let mut provolatile: Vec<String> = Vec::new();
+        let mut pronargs: Vec<i32> = Vec::new();
+        let mut prorettype: Vec<i64> = Vec::new();
+        let mut proargtypes: Vec<String> = Vec::new();
+        let mut prosrc: Vec<String> = Vec::new();
+
+        for (i, (name, nargs, rettype, argtypes, volatility)) in functions.iter().enumerate() {
+            oid_col.push(10000 + i as i64);
+            proname.push(name.to_string());
+            pronamespace.push(11); // pg_catalog
+            proowner.push(10);
+            prolang.push(12); // SQL
+            procost.push(1.0);
+            prorows.push(0.0);
+            provariadic.push(0);
+            prosecdef.push(false);
+            proleakproof.push(false);
+            proisstrict.push(false);
+            proretset.push(false);
+            provolatile.push(volatility.to_string());
+            pronargs.push(*nargs);
+            prorettype.push(*rettype);
+            proargtypes.push(argtypes.to_string());
+            prosrc.push(String::new());
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(oid_col)),
+                Arc::new(StringArray::from(proname)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(pronamespace)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(proowner)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(prolang)),
+                Arc::new(datafusion::arrow::array::Float32Array::from(procost)),
+                Arc::new(datafusion::arrow::array::Float32Array::from(prorows)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(provariadic)),
+                Arc::new(BooleanArray::from(prosecdef)),
+                Arc::new(BooleanArray::from(proleakproof)),
+                Arc::new(BooleanArray::from(proisstrict)),
+                Arc::new(BooleanArray::from(proretset)),
+                Arc::new(StringArray::from(provolatile)),
+                Arc::new(Int32Array::from(pronargs)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(prorettype)),
+                Arc::new(StringArray::from(proargtypes)),
+                Arc::new(StringArray::from(prosrc)),
             ],
         )?;
 

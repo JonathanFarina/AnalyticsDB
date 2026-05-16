@@ -30,6 +30,9 @@ impl PrototypeEngine {
             | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
             | MetadataStatement::InformationSchemaReferentialConstraints { .. }
+            | MetadataStatement::InformationSchemaRoutines { .. }
+            | MetadataStatement::InformationSchemaParameters { .. }
+            | MetadataStatement::InformationSchemaTriggers { .. }
             | MetadataStatement::CreateUser { .. }
             | MetadataStatement::DropUser { .. }
             | MetadataStatement::AlterUserPassword { .. }
@@ -310,6 +313,97 @@ impl PrototypeEngine {
                         vec![batch],
                         format!(
                             "{row_count} information_schema.referential_constraints row(s) listed successfully."
+                        ),
+                        rows_outcome(),
+                        request.session.clone(),
+                    )
+                }
+                MetadataStatement::InformationSchemaRoutines { sql } => {
+                    let columns = [
+                        "specific_catalog",
+                        "specific_schema",
+                        "specific_name",
+                        "routine_catalog",
+                        "routine_schema",
+                        "routine_name",
+                        "routine_type",
+                        "data_type",
+                        "routine_body",
+                        "routine_definition",
+                        "is_deterministic",
+                        "security_type",
+                    ];
+                    let rows = self.information_schema_routines_rows();
+                    let (batch, row_count) = execute_pg_catalog_select(
+                        &sql,
+                        "information_schema.routines",
+                        &columns,
+                        &rows,
+                    )?;
+                    (
+                        batch.schema(),
+                        vec![batch],
+                        format!(
+                            "{row_count} information_schema.routines row(s) listed successfully."
+                        ),
+                        rows_outcome(),
+                        request.session.clone(),
+                    )
+                }
+                MetadataStatement::InformationSchemaParameters { sql } => {
+                    let columns = [
+                        "specific_catalog",
+                        "specific_schema",
+                        "specific_name",
+                        "ordinal_position",
+                        "parameter_mode",
+                        "is_result",
+                        "as_locator",
+                        "parameter_name",
+                        "data_type",
+                    ];
+                    let rows = self.information_schema_parameters_rows();
+                    let (batch, row_count) = execute_pg_catalog_select(
+                        &sql,
+                        "information_schema.parameters",
+                        &columns,
+                        &rows,
+                    )?;
+                    (
+                        batch.schema(),
+                        vec![batch],
+                        format!(
+                            "{row_count} information_schema.parameters row(s) listed successfully."
+                        ),
+                        rows_outcome(),
+                        request.session.clone(),
+                    )
+                }
+                MetadataStatement::InformationSchemaTriggers { sql } => {
+                    let columns = [
+                        "trigger_catalog",
+                        "trigger_schema",
+                        "trigger_name",
+                        "event_manipulation",
+                        "event_object_catalog",
+                        "event_object_schema",
+                        "event_object_table",
+                        "action_statement",
+                        "action_orientation",
+                        "action_timing",
+                    ];
+                    let rows = self.information_schema_triggers_rows();
+                    let (batch, row_count) = execute_pg_catalog_select(
+                        &sql,
+                        "information_schema.triggers",
+                        &columns,
+                        &rows,
+                    )?;
+                    (
+                        batch.schema(),
+                        vec![batch],
+                        format!(
+                            "{row_count} information_schema.triggers row(s) listed successfully."
                         ),
                         rows_outcome(),
                         request.session.clone(),

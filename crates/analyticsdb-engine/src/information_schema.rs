@@ -273,6 +273,21 @@ impl PrototypeEngine {
         Ok(rows)
     }
 
+    pub(super) fn information_schema_routines_rows(&self) -> Vec<Vec<String>> {
+        // Always empty - schema stub for client compatibility
+        vec![]
+    }
+
+    pub(super) fn information_schema_parameters_rows(&self) -> Vec<Vec<String>> {
+        // Always empty - schema stub for client compatibility
+        vec![]
+    }
+
+    pub(super) fn information_schema_triggers_rows(&self) -> Vec<Vec<String>> {
+        // Always empty - schema stub for client compatibility
+        vec![]
+    }
+
     pub(super) async fn information_schema_referential_constraints_rows(
         &self,
         session: &SessionContext,

@@ -691,6 +691,15 @@ pub enum MetadataStatement {
     InformationSchemaReferentialConstraints {
         sql: String,
     },
+    InformationSchemaRoutines {
+        sql: String,
+    },
+    InformationSchemaParameters {
+        sql: String,
+    },
+    InformationSchemaTriggers {
+        sql: String,
+    },
     DropTable {
         database: Option<String>,
         schema: Option<String>,
@@ -1267,7 +1276,10 @@ impl ControlPlane {
             | MetadataStatement::InformationSchemaKeyColumnUsage { .. }
             | MetadataStatement::InformationSchemaConstraintColumnUsage { .. }
             | MetadataStatement::InformationSchemaConstraintTableUsage { .. }
-            | MetadataStatement::InformationSchemaReferentialConstraints { .. } => {
+            | MetadataStatement::InformationSchemaReferentialConstraints { .. }
+            | MetadataStatement::InformationSchemaRoutines { .. }
+            | MetadataStatement::InformationSchemaParameters { .. }
+            | MetadataStatement::InformationSchemaTriggers { .. } => {
                 self.validate_session(session).await?;
                 "Command completed.".to_string()
             }
@@ -5018,6 +5030,21 @@ fn parse_metadata_statement_fallback(sql: &str) -> Option<MetadataStatement> {
         && upper.contains(" FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS")
     {
         return Some(MetadataStatement::InformationSchemaReferentialConstraints {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.ROUTINES") {
+        return Some(MetadataStatement::InformationSchemaRoutines {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.PARAMETERS") {
+        return Some(MetadataStatement::InformationSchemaParameters {
+            sql: trimmed.to_string(),
+        });
+    }
+    if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.TRIGGERS") {
+        return Some(MetadataStatement::InformationSchemaTriggers {
             sql: trimmed.to_string(),
         });
     }

@@ -118,6 +118,43 @@ pub(crate) fn metadata_statement_schema(statement: &MetadataStatement) -> Option
             "update_rule",
             "delete_rule",
         ])),
+        MetadataStatement::InformationSchemaRoutines { .. } => Some(utf8_schema(&[
+            "specific_catalog",
+            "specific_schema",
+            "specific_name",
+            "routine_catalog",
+            "routine_schema",
+            "routine_name",
+            "routine_type",
+            "data_type",
+            "routine_body",
+            "routine_definition",
+            "is_deterministic",
+            "security_type",
+        ])),
+        MetadataStatement::InformationSchemaParameters { .. } => Some(utf8_schema(&[
+            "specific_catalog",
+            "specific_schema",
+            "specific_name",
+            "ordinal_position",
+            "parameter_mode",
+            "is_result",
+            "as_locator",
+            "parameter_name",
+            "data_type",
+        ])),
+        MetadataStatement::InformationSchemaTriggers { .. } => Some(utf8_schema(&[
+            "trigger_catalog",
+            "trigger_schema",
+            "trigger_name",
+            "event_manipulation",
+            "event_object_catalog",
+            "event_object_schema",
+            "event_object_table",
+            "action_statement",
+            "action_orientation",
+            "action_timing",
+        ])),
         _ => None,
     }
 }
@@ -132,7 +169,10 @@ pub(crate) fn metadata_statement_sql(statement: &MetadataStatement) -> Option<&s
         | MetadataStatement::InformationSchemaKeyColumnUsage { sql }
         | MetadataStatement::InformationSchemaConstraintColumnUsage { sql }
         | MetadataStatement::InformationSchemaConstraintTableUsage { sql }
-        | MetadataStatement::InformationSchemaReferentialConstraints { sql } => Some(sql),
+        | MetadataStatement::InformationSchemaReferentialConstraints { sql }
+        | MetadataStatement::InformationSchemaRoutines { sql }
+        | MetadataStatement::InformationSchemaParameters { sql }
+        | MetadataStatement::InformationSchemaTriggers { sql } => Some(sql),
         _ => None,
     }
 }

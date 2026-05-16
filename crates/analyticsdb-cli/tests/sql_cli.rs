@@ -6562,3 +6562,192 @@ async fn cli_grant_revoke_enforces_table_access_on_postgres_and_flight_sql() {
 
     cleanup_catalog_artifacts(&catalog_path);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_pg_catalog_pg_proc_lists_builtin_functions() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // Query pg_proc for the full list - should have rows
+    let all_procs = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT proname, pronargs, prorettype FROM pg_catalog.pg_proc ORDER BY proname",
+    );
+    assert!(
+        !all_procs.rows.is_empty(),
+        "pg_catalog.pg_proc should return built-in function rows"
+    );
+    assert_eq!(
+        all_procs.columns,
+        vec!["proname", "pronargs", "prorettype"],
+        "pg_proc should surface proname, pronargs, prorettype columns"
+    );
+
+    // Verify some known functions are present
+    let pronames: Vec<&str> = all_procs
+        .rows
+        .iter()
+        .map(|row| row[0].as_str())
+        .collect();
+    assert!(
+        pronames.contains(&"length"),
+        "pg_proc should list 'length' function"
+    );
+    assert!(
+        pronames.contains(&"upper"),
+        "pg_proc should list 'upper' function"
+    );
+    assert!(
+        pronames.contains(&"now"),
+        "pg_proc should list 'now' function"
+    );
+    assert!(
+        pronames.contains(&"count"),
+        "pg_proc should list 'count' aggregate"
+    );
+
+    // Verify we can filter by proname
+    let length_fn = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT proname, pronargs FROM pg_catalog.pg_proc WHERE proname = 'length'",
+    );
+    assert_eq!(length_fn.rows.len(), 1, "should find exactly one 'length' function");
+    assert_eq!(length_fn.rows[0][0], "length");
+    assert_eq!(length_fn.rows[0][1], "1", "length takes 1 argument");
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_information_schema_routines_parameters_triggers_return_schema() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // information_schema.routines - should return 0 rows but no error
+    let routines = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT routine_name, routine_type, data_type FROM information_schema.routines",
+    );
+    assert_eq!(
+        routines.rows.len(),
+        0,
+        "information_schema.routines should return 0 rows"
+    );
+    assert_eq!(
+        routines.columns,
+        vec!["routine_name", "routine_type", "data_type"],
+        "information_schema.routines should have expected columns"
+    );
+
+    // information_schema.parameters - should return 0 rows but no error
+    let parameters = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT specific_name, parameter_name, data_type FROM information_schema.parameters",
+    );
+    assert_eq!(
+        parameters.rows.len(),
+        0,
+        "information_schema.parameters should return 0 rows"
+    );
+    assert_eq!(
+        parameters.columns,
+        vec!["specific_name", "parameter_name", "data_type"],
+        "information_schema.parameters should have expected columns"
+    );
+
+    // information_schema.triggers - should return 0 rows but no error
+    let triggers = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT trigger_name, event_manipulation, event_object_table FROM information_schema.triggers",
+    );
+    assert_eq!(
+        triggers.rows.len(),
+        0,
+        "information_schema.triggers should return 0 rows"
+    );
+    assert_eq!(
+        triggers.columns,
+        vec!["trigger_name", "event_manipulation", "event_object_table"],
+        "information_schema.triggers should have expected columns"
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_psql_backslash_d_commands_work() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // Create a 'customers' table similar to what psql \d would inspect
+    Command::cargo_bin("analyticsdb")
+        .expect("binary should build")
+        .args([
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &endpoint,
+            "--password",
+            "postgres",
+            "--sql",
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT, email TEXT)",
+        ])
+        .assert()
+        .success();
+
+    // Simulate psql \d customers - joining pg_class, pg_attribute, pg_type
+    let describe_result = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT c.relname, a.attname, t.typname \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid \
+         JOIN pg_catalog.pg_type t ON a.atttypid = t.oid \
+         WHERE c.relname = 'customers' AND a.attnum > 0 \
+         ORDER BY a.attnum",
+    );
+
+    assert!(
+        !describe_result.rows.is_empty(),
+        "\\d customers should return attribute rows"
+    );
+    assert_eq!(
+        describe_result.columns,
+        vec!["relname", "attname", "typname"],
+        "join result should have expected columns"
+    );
+
+    // All rows should refer to the customers table
+    for row in &describe_result.rows {
+        assert_eq!(row[0], "customers", "relname should be 'customers'");
+    }
+
+    // Find the column names we expect
+    let attnames: Vec<&str> = describe_result.rows.iter().map(|r| r[1].as_str()).collect();
+    assert!(attnames.contains(&"id"), "should see 'id' column");
+    assert!(attnames.contains(&"name"), "should see 'name' column");
+    assert!(attnames.contains(&"email"), "should see 'email' column");
+
+    // Verify type names are populated
+    for row in &describe_result.rows {
+        assert!(
+            !row[2].is_empty(),
+            "typname should not be empty for column '{}'",
+            row[1]
+        );
+    }
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
