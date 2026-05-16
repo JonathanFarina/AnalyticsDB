@@ -64,14 +64,14 @@ A feature is `Complete` only when all of the following are true:
 | Native views | Partial | view definition and resolution | dependency tracking, authz, metadata, and regression coverage |
 | External Parquet support | Partial | external registration and read path | optimizer, statistics, and parity with native SQL surface |
 | External Iceberg support | Prototype | catalog integration and read path | schema evolution, metadata correctness, and interoperability proof |
-| Automatic storage-medium selection | Prototype | policy engine scaffold | tested policy decisions, explainability, and override path |
+| Automatic storage-medium selection | Partial | policy engine scaffold | tested policy decisions, explainability, and override path |
 | Unified SQL surface for native/external | Partial | unified planner logic | no user-facing special cases for normal querying workflows |
 | Distributed planner | Prototype | multi-stage plan generation | correctness, skew handling, and metrics coverage |
 | Distributed executor | Partial | remote stage execution scaffold with concurrent fetch, zero-materialization streaming, node resilience, cancellation, backpressure, retry/idempotency, worker resource quotas, intra-cluster mTLS (`ClusterMtlsConfig` + `analyticsdb ca init`), GROUP BY / DISTINCT / ORDER BY+LIMIT distributed plans, window-function blocking, row-count-aware skew partitioner, SQLite advisory catalog leases (`DistributedRelationLock`) | distributed equivalence tests from the CLI test suite, chaos / worker-kill retry integration test, broader plan coverage (hash joins) |
 | Replication/eventual consistency | Prototype | design plus metadata hooks | failure recovery, repair flows, and consistency guarantees documented |
-| Caching: query results | Prototype | cache abstraction and tests | invalidation, visibility rules, metrics, and predictable behavior |
-| Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
-| Query optimizer | Prototype | logical and physical rule scaffolding | statistics-aware distributed optimization with regressions covered |
+| Caching: query results | Prototype | basic abstraction, SQL hints, admin command, unit tests | invalidation, visibility rules, metrics, and predictable behavior |
+| Caching: data blocks/segments | Prototype | basic abstraction, LRU eviction, manifest invalidation | eviction, warming, spill, and node-local safety |
+| Query optimizer | Partial | logical and physical rule scaffolding, ColumnStat struct with compute_column_stats integrated into write paths | statistics-aware distributed optimization with regressions covered, custom manifest stats fed into DataFusion planner |
 | Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
 | Query log / query-level lineage | Partial | durable async Parquet-backed `system.query_log` for the non-streaming execution path, config defaults, CLI-driven PostgreSQL-wire SQL coverage, and worker sibling rows (`is_initial_query = false`) for the distributed read path | streaming Flight SQL lifecycle accounting, DataFusion stage metrics, retention sweeper, partitioned layout, and benchmark gates |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
@@ -85,8 +85,10 @@ A feature is `Complete` only when all of the following are true:
 | Web console admin: metrics | Prototype | UI scaffold | useful operator metrics with live or near-live accuracy |
 | Web console admin: logs | Prototype | UI scaffold | multi-node log exploration with query correlation |
 | Test coverage discipline | Partial | baseline CI and tests | no uncovered feature claims remain |
+| Concurrency benchmarking | Prototype | `benchmarks/concurrency_test.sh` shell script with p50/p95/p99 latency measurement; `concurrency_test.rs` Rust-based test with tokio::spawn and PostgreSQL wire protocol | CI integration with regression gate, multi-client tail latency baseline established |
 | Kubernetes deployment | Partial | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
 | Object storage deployment | Partial | `s3://`, `gs://`, `azure://`, `file://` URI routing via `object_store`; env-chain credential resolution; manifest-based atomic commits; optional cluster-scoped `cluster=<id>/` key prefix; optional S3 SSE config | S3 mock CI test, multi-node durability test, recovery docs |
+| Scale Envelope | Prototype | documented in `docs/scale-envelope.md` with preliminary limits based on component constraints | measured benchmarking data from I1/I2 |
 
 ## Current Repository Status
 
@@ -182,5 +184,6 @@ A feature is `Complete` only when all of the following are true:
 - Flight SQL now supports the full bind/execute/close protocol cycle for prepared statements, enabling standard JDBC/ODBC connectivity
 - broad Flight SQL `SqlInfo` coverage exists for core server identification and SQL dialect metadata
 - No broad PostgreSQL/Flight SQL parity claim beyond the current explicitly tested slice
+- Supported scale envelope documented in `docs/scale-envelope.md` (preliminary, component-constraint based)
 
 Any agent claiming otherwise is wrong and must correct the tracker immediately.

@@ -264,6 +264,7 @@ impl SqliteCatalogStore {
             functions,
             config,
             catalogue_version,
+            storage_policies: BTreeMap::new(),
         })
     }
 

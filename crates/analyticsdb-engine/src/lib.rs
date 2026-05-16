@@ -1485,8 +1485,8 @@ impl PrototypeEngine {
                 let size = bytes.len() as u64;
                 let row_count = current_rows as i64;
                 store.put(&key, bytes.into()).await?;
-                crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count).await?;
-                current_batch.clear();
+                crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count, Vec::new()).await?;
+                 current_batch.clear();
                 current_rows = 0;
             }
         }
@@ -1500,7 +1500,7 @@ impl PrototypeEngine {
             let size = bytes.len() as u64;
             let row_count = current_rows as i64;
             store.put(&key, bytes.into()).await?;
-            crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count).await?;
+            crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count, Vec::new()).await?;
         }
 
         let table_key = format!(

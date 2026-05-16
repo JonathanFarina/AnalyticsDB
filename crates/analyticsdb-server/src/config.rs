@@ -93,32 +93,32 @@ impl Config {
     }
     
     /// Validate configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
         // Validate TLS config
         match (&self.tls_cert, &self.tls_key) {
-            (Some(_), Some(_)) => Ok(()),
-            (None, None) => Ok(()),
-            _ => Err("Both --tls-cert and --tls-key must be provided to enable TLS".to_string()),
+            (Some(_), Some(_)) => anyhow::Ok(()),
+            (None, None) => anyhow::Ok(()),
+            _ => anyhow::bail!("Both --tls-cert and --tls-key must be provided to enable TLS"),
         }?;
-        
+
         // Validate addresses
         if let Some(addr) = &self.postgres_addr {
             addr.parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid postgres address '{}': {}", addr, e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid postgres address '{}': {}", addr, e))?;
         }
         if let Some(addr) = &self.flight_sql_addr {
             addr.parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid flight sql address '{}': {}", addr, e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid flight sql address '{}': {}", addr, e))?;
         }
         if let Some(addr) = &self.node_addr {
             addr.parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid node address '{}': {}", addr, e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid node address '{}': {}", addr, e))?;
         }
         if let Some(addr) = &self.admin_addr {
             addr.parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid admin address '{}': {}", addr, e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid admin address '{}': {}", addr, e))?;
         }
-        
+
         Ok(())
     }
 }

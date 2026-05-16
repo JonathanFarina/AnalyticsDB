@@ -179,6 +179,26 @@ pub enum ExternalStorageFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StoragePolicyType {
+    #[serde(rename = "managed")]
+    Managed,
+    #[serde(rename = "external")]
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePolicy {
+    pub database: String,
+    pub schema: String,
+    pub table_name: String,
+    pub policy_type: StoragePolicyType,
+    #[serde(default)]
+    pub auto_select: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogColumn {
     pub name: String,
     pub data_type: String,
@@ -408,6 +428,8 @@ pub(crate) struct CatalogState {
     /// their cached snapshot is stale.
     #[serde(default)]
     pub(crate) catalogue_version: u64,
+    #[serde(default)]
+    pub(crate) storage_policies: BTreeMap<String, StoragePolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +808,10 @@ struct NodeLiveness {
     last_heartbeat_at_epoch_ms: u128,
 }
 
+fn relation_key(database: &str, schema: &str, table: &str) -> String {
+    format!("{}.{}.{}", database, schema, table)
+}
+
 #[derive(Debug)]
 pub struct ControlPlane {
     coordinator_node_id: String,
@@ -994,6 +1020,26 @@ impl ControlPlane {
             relations: state.relations.values().cloned().collect(),
             functions: state.functions.values().cloned().collect(),
         }
+    }
+
+    pub async fn get_storage_policy(
+        &self,
+        database: &str,
+        schema: &str,
+        table_name: &str,
+    ) -> Option<StoragePolicy> {
+        let key = relation_key(database, schema, table_name);
+        let state = self.state.read().await;
+        state.storage_policies.get(&key).cloned()
+    }
+
+    pub async fn set_storage_policy(&self, policy: StoragePolicy) -> Result<()> {
+        let key = relation_key(&policy.database, &policy.schema, &policy.table_name);
+        let mut state = self.state.write().await;
+        state.storage_policies.insert(key, policy);
+        drop(state);
+        self.persist().await?;
+        Ok(())
     }
 
     pub async fn execute_metadata_statement(
@@ -3915,6 +3961,7 @@ fn bootstrap_state() -> CatalogState {
         functions: BTreeMap::new(),
         config,
         catalogue_version: 0,
+        storage_policies: BTreeMap::new(),
     }
 }
 
@@ -3957,10 +4004,6 @@ fn parse_qualified_name(
         )),
         _ => bail!("Unsupported qualified name '{}'", raw),
     }
-}
-
-fn relation_key(database: &str, schema: &str, name: &str) -> String {
-    format!("{database}.{schema}.{name}")
 }
 
 fn default_password_version() -> u64 {
