@@ -85,7 +85,7 @@ A feature is `Complete` only when all of the following are true:
 | Web console admin: metrics | Prototype | UI scaffold | useful operator metrics with live or near-live accuracy |
 | Web console admin: logs | Prototype | UI scaffold | multi-node log exploration with query correlation |
 | Test coverage discipline | Partial | baseline CI and tests | no uncovered feature claims remain |
-| Kubernetes deployment | Prototype | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
+| Kubernetes deployment | Partial | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
 | Object storage deployment | Partial | `s3://`, `gs://`, `azure://`, `file://` URI routing via `object_store`; env-chain credential resolution; manifest-based atomic commits; optional cluster-scoped `cluster=<id>/` key prefix; optional S3 SSE config | S3 mock CI test, multi-node durability test, recovery docs |
 
 ## Current Repository Status

@@ -1,32 +1,30 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "analyticsdb.fullname" . }}-control
+  name: {{ include "analyticsdb.fullname" . }}-compute
   labels:
     {{- include "analyticsdb.labels" . | nindent 4 }}
-    component: control
+    component: compute
 spec:
-  replicas: {{ .Values.controlPlane.replicaCount }}
+  replicas: {{ .Values.computePool.replicaCount }}
   selector:
     matchLabels:
       {{- include "analyticsdb.selectorLabels" . | nindent 6 }}
-      component: control
+      component: compute
   template:
     metadata:
       labels:
         {{- include "analyticsdb.selectorLabels" . | nindent 8 }}
-        component: control
+        component: compute
     spec:
       containers:
-        - name: control
+        - name: compute
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["--role", "control", "--admin-addr", "0.0.0.0:9090"]
+          args: ["--role", "compute", "--join", "{{ include "analyticsdb.fullname" . }}-control:8816", "--admin-addr", "0.0.0.0:9090"]
           ports:
-            - containerPort: 5432
-              name: pg
-            - containerPort: 8815
-              name: flight
+            - containerPort: 8816
+              name: nodechannel
             - containerPort: 9090
               name: admin
           livenessProbe:
@@ -35,14 +33,12 @@ spec:
               port: admin
             initialDelaySeconds: 10
             periodSeconds: 30
-            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /readyz
               port: admin
             initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 5
           env:
             - name: ANALYTICSDB_STORAGE_ROOT
               value: {{ .Values.storageRoot | quote }}
@@ -53,22 +49,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "analyticsdb.fullname" . }}-control
+  name: {{ include "analyticsdb.fullname" . }}-compute
   labels:
     {{- include "analyticsdb.labels" . | nindent 4 }}
-    component: control
+    component: compute
 spec:
-  type: {{ .Values.controlPlane.service.type }}
+  type: ClusterIP
   ports:
-    - port: 5432
-      targetPort: pg
-      name: pg
-    - port: 8815
-      targetPort: flight
-      name: flight
-    - port: 9090
-      targetPort: admin
-      name: admin
+    - port: 8816
+      targetPort: nodechannel
+      name: nodechannel
   selector:
     {{- include "analyticsdb.selectorLabels" . | nindent 4 }}
-    component: control
+    component: compute

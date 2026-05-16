@@ -679,9 +679,13 @@ Tasks:
      > values.yaml, templates for control-plane deployment and service.
      > Prototype.
 
-H3. **Liveness, readiness, startup probes.** Distinct HTTP endpoints on a
+✅ H3. **Liveness, readiness, startup probes.** Distinct HTTP endpoints on a
      dedicated admin port; readiness fails until the node finishes catalog
      bootstrap and confirms object-store reachability.
+     > Done: Health endpoints implemented in `health.rs`.
+     > `/healthz` (liveness) and `/readyz` (readiness) added.
+     > Dockerfile includes HEALTHCHECK. Helm chart includes
+     > livenessProbe and readinessProbe.
 
 H4. **Rolling upgrade.** Document and CI-verify that a rolling upgrade of
      coordinator + workers does not abort in-flight queries (in combination

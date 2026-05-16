@@ -39,6 +39,9 @@ RUN groupadd -r analyticsdb && useradd -r -g analyticsdb analyticsdb || true
 
 USER analyticsdb:analyticsdb
 
-EXPOSE 5432 8815 8816
+EXPOSE 5432 8815 8816 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/analyticsdb-server", "healthz"] || true
 
 ENTRYPOINT ["/usr/local/bin/analyticsdb-server"]

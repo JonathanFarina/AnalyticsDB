@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::net::SocketAddr;
 
 use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
 use analyticsdb_engine::PrototypeEngine;
@@ -10,8 +11,11 @@ use clap::Parser;
 use futures::Future;
 use hyper_util::rt::tokio::TokioIo;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
+
+mod health;
 
 const BANNER: &str = "
 \x1b[1;36m     _                _       _   _          ____  ____  \x1b[0m
@@ -407,6 +411,18 @@ async fn run() -> Result<()> {
     info!("Flight SQL protocol listening on: {}", flight_addr);
     info!("Node communication channel listening on: {}", node_addr);
 
+    // Start health server.
+    let admin_addr: SocketAddr = cli.admin_addr.parse().unwrap_or_else(|e| {
+        panic!("Invalid admin address '{}': {}", cli.admin_addr, e);
+    });
+    let (ready_tx, ready_rx) = watch::channel(false);
+    let _health_handle = health::start_health_server(admin_addr, ready_rx);
+    info!("Admin HTTP server (health checks) listening on {}", admin_addr);
+
+    // Mark ready after engine is set up.
+    // (In a real scenario, we might wait for catalog load, etc.)
+    let _ = ready_tx.send(true);
+
     let tls_config = match (&final_tls_cert, &final_tls_key) {
         (Some(cert_path), Some(key_path)) => {
             let cert = std::fs::read(cert_path)?;
@@ -544,6 +560,10 @@ struct Cli {
     /// coordinator; you only need to set it explicitly for the primary node.
     #[arg(long)]
     node_addr: Option<String>,
+    /// Address to bind the admin HTTP server for health checks.
+    /// Defaults to 127.0.0.1:9090.
+    #[arg(long, default_value = "127.0.0.1:9090")]
+    admin_addr: String,
     /// Hostname or IP that peer nodes use to reach this node.
     /// Defaults to 127.0.0.1 (suitable for single-machine clusters).
     /// Set to your network IP or DNS name for multi-host deployments.
