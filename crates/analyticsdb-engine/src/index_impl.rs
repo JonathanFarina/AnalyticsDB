@@ -140,7 +140,8 @@ impl PrototypeEngine {
             let mut count_val: i64 = 0;
             for b in &results {
                 if b.num_rows() > 0 {
-                    let arr = b.column(0)
+                    let arr = b
+                        .column(0)
                         .as_any()
                         .downcast_ref::<datafusion::arrow::array::Int64Array>()
                         .ok_or_else(|| anyhow::anyhow!("COUNT(*) column is not Int64"))?;
@@ -187,7 +188,8 @@ impl PrototypeEngine {
         let mut row_count: usize = 0;
         for b in &row_count_results {
             if b.num_rows() > 0 {
-                let arr = b.column(0)
+                let arr = b
+                    .column(0)
                     .as_any()
                     .downcast_ref::<datafusion::arrow::array::Int64Array>()
                     .ok_or_else(|| anyhow::anyhow!("row count column is not Int64"))?;
@@ -300,7 +302,9 @@ impl PrototypeEngine {
         let full_schema = build_arrow_schema_from_catalog_columns(&relation.columns)?;
 
         let (store, prefix) = crate::storage::store_for_location(storage_path)?;
-        let committed_files = crate::manifest::list_files(&store, &prefix).await.unwrap_or_default();
+        let committed_files = crate::manifest::list_files(&store, &prefix)
+            .await
+            .unwrap_or_default();
 
         let listing_opts = datafusion::datasource::listing::ListingOptions::new(Arc::new(
             datafusion::datasource::file_format::parquet::ParquetFormat::default(),

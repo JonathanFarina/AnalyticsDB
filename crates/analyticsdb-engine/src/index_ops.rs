@@ -142,7 +142,9 @@ pub(crate) fn select_projection_columns(projection: &[SelectItem]) -> Result<Opt
                 columns.push(identifier.to_string());
             }
             SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
-                let last = parts.last().ok_or_else(|| anyhow::anyhow!("empty compound identifier"))?;
+                let last = parts
+                    .last()
+                    .ok_or_else(|| anyhow::anyhow!("empty compound identifier"))?;
                 columns.push(last.to_string());
             }
             SelectItem::ExprWithAlias {
@@ -325,7 +327,11 @@ pub(crate) fn index_manifest_key(table_prefix: &OPath, index_name: &str) -> OPat
         .join("manifest.json")
 }
 
-pub(crate) fn index_version_metadata_key(table_prefix: &OPath, index_name: &str, version: &str) -> OPath {
+pub(crate) fn index_version_metadata_key(
+    table_prefix: &OPath,
+    index_name: &str,
+    version: &str,
+) -> OPath {
     table_prefix
         .clone()
         .join(".analyticsdb_indexes")
@@ -335,7 +341,11 @@ pub(crate) fn index_version_metadata_key(table_prefix: &OPath, index_name: &str,
         .join("metadata.json")
 }
 
-pub(crate) fn index_data_key(table_prefix: &OPath, index_name: &str, entries_object: &str) -> OPath {
+pub(crate) fn index_data_key(
+    table_prefix: &OPath,
+    index_name: &str,
+    entries_object: &str,
+) -> OPath {
     table_prefix
         .clone()
         .join(".analyticsdb_indexes")

@@ -423,8 +423,9 @@ async fn run() -> Result<()> {
             loop {
                 interval.tick().await;
                 const DEAD_THRESHOLD_MS: u128 = 45_000;
-                if let Err(e) =
-                    control_plane_prune.prune_unhealthy_nodes(DEAD_THRESHOLD_MS).await
+                if let Err(e) = control_plane_prune
+                    .prune_unhealthy_nodes(DEAD_THRESHOLD_MS)
+                    .await
                 {
                     warn!("Node health pruning failed: {}", e);
                 }
@@ -567,10 +568,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("Failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
 
         tokio::select! {
             _ = ctrl_c => {},

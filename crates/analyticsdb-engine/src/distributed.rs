@@ -595,7 +595,10 @@ mod tests {
 
         let large_in_chunk0 = chunks[0].contains(&"large.parquet".to_string());
         let large_in_chunk1 = chunks[1].contains(&"large.parquet".to_string());
-        assert!(large_in_chunk0 ^ large_in_chunk1, "large.parquet must be in exactly one chunk");
+        assert!(
+            large_in_chunk0 ^ large_in_chunk1,
+            "large.parquet must be in exactly one chunk"
+        );
 
         // The chunk that has large.parquet should contain only it (greedy: 1000 > 300).
         if large_in_chunk0 {
@@ -609,8 +612,8 @@ mod tests {
 
     #[tokio::test]
     async fn mtls_config_from_cluster_config_requires_all_three_paths() {
-        use analyticsdb_control::{ClusterConfig, QueryLogConfig};
         use crate::load_mtls_config_from_cluster_config;
+        use analyticsdb_control::{ClusterConfig, QueryLogConfig};
         let mut config = ClusterConfig {
             base_postgres_port: 5432,
             base_flight_sql_port: 50051,
@@ -637,8 +640,7 @@ mod tests {
     #[test]
     fn cluster_mtls_config_can_be_built_from_rcgen_certs() {
         use rcgen::{
-            BasicConstraints, CertificateParams, IsCa, KeyPair, SanType,
-            PKCS_ECDSA_P256_SHA256,
+            BasicConstraints, CertificateParams, IsCa, KeyPair, SanType, PKCS_ECDSA_P256_SHA256,
         };
         // Generate CA
         let mut ca_params = CertificateParams::default();
@@ -647,12 +649,9 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         // Generate leaf
         let mut leaf_params = CertificateParams::default();
-        leaf_params.subject_alt_names =
-            vec![SanType::DnsName("localhost".try_into().unwrap())];
+        leaf_params.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
         let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
         // Build config
         let cfg = ClusterMtlsConfig {
             ca_cert_pem: ca_cert.pem().into_bytes(),

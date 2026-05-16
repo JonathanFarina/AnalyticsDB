@@ -420,10 +420,8 @@ mod tests {
                 enabled: false,
                 ..AuditLogConfig::default()
             };
-            let tmp = std::env::temp_dir().join(format!(
-                "adb-audit-disabled-{}",
-                uuid::Uuid::now_v7()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("adb-audit-disabled-{}", uuid::Uuid::now_v7()));
             let audit_log = AuditLog::new(config, tmp);
             // sender should be None — log_event is a no-op
             assert!(

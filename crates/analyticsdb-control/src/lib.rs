@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use analyticsdb_core::SessionContext;
 use anyhow::{bail, Result};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -36,7 +38,9 @@ pub fn hash_password(password: &str) -> Result<String> {
 /// (see `authenticate_user`).
 pub fn verify_password(provided: &str, stored: &str) -> bool {
     if stored.starts_with(ARGON2ID_PREFIX) {
-        let Ok(hash) = PasswordHash::new(stored) else { return false };
+        let Ok(hash) = PasswordHash::new(stored) else {
+            return false;
+        };
         Argon2::default()
             .verify_password(provided.as_bytes(), &hash)
             .is_ok()
@@ -58,8 +62,8 @@ fn compute_scram_verifier(password: &str) -> Result<(String, String)> {
     use sha2::Sha256;
 
     // SASLprep per RFC 4013 — fall back to raw password on error (same as pgwire)
-    let normalized: std::borrow::Cow<str> = stringprep::saslprep(password)
-        .unwrap_or(std::borrow::Cow::Borrowed(password));
+    let normalized: std::borrow::Cow<str> =
+        stringprep::saslprep(password).unwrap_or(std::borrow::Cow::Borrowed(password));
     let pass_bytes = normalized.as_bytes();
 
     let mut salt = [0u8; 16];
@@ -3485,7 +3489,9 @@ impl ControlPlane {
             return Ok(true);
         }
         let store = catalog_store::open_store(path)?;
-        store.try_acquire_lease(relation_key, holder_node_id, ttl_ms).await
+        store
+            .try_acquire_lease(relation_key, holder_node_id, ttl_ms)
+            .await
     }
 
     /// Release the advisory write lease held by `holder_node_id` for
@@ -3691,10 +3697,7 @@ impl ControlPlane {
 
         // Hash the password before entering the write-lock to avoid blocking
         // other writers for the duration of the Argon2 KDF computation.
-        let hashed_password = password
-            .as_deref()
-            .map(hash_password)
-            .transpose()?;
+        let hashed_password = password.as_deref().map(hash_password).transpose()?;
         let scram_verifier = password
             .as_deref()
             .map(compute_scram_verifier)
@@ -4421,7 +4424,11 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
                 _ => return None,
             };
-            Some(MetadataStatement::VacuumTable { database, schema, name })
+            Some(MetadataStatement::VacuumTable {
+                database,
+                schema,
+                name,
+            })
         }
         sqlparser::ast::Statement::Update(update) => {
             let idents: Vec<String> = match &update.table.relation {
@@ -4810,9 +4817,10 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 _ => return None,
             };
 
-            let grantee = grant.grantees.first().and_then(|g| {
-                g.name.as_ref().map(|n| n.to_string())
-            })?;
+            let grantee = grant
+                .grantees
+                .first()
+                .and_then(|g| g.name.as_ref().map(|n| n.to_string()))?;
 
             Some(MetadataStatement::GrantPrivilege {
                 grantee,
@@ -4847,9 +4855,10 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 _ => return None,
             };
 
-            let grantee = revoke.grantees.first().and_then(|g| {
-                g.name.as_ref().map(|n| n.to_string())
-            })?;
+            let grantee = revoke
+                .grantees
+                .first()
+                .and_then(|g| g.name.as_ref().map(|n| n.to_string()))?;
 
             Some(MetadataStatement::RevokePrivilege {
                 grantee,
@@ -6543,11 +6552,10 @@ mod tests {
         let stored = BASE64_STANDARD.decode(&salted_b64).expect("decode salted");
 
         // SASLprep then PBKDF2 — must match what compute_scram_verifier computed.
-        let normalized = stringprep::saslprep(password)
-            .unwrap_or(std::borrow::Cow::Borrowed(password));
+        let normalized =
+            stringprep::saslprep(password).unwrap_or(std::borrow::Cow::Borrowed(password));
         let mut expected = [0u8; 32];
-        pbkdf2::<Hmac<Sha256>>(normalized.as_bytes(), &salt, 4096, &mut expected)
-            .expect("pbkdf2");
+        pbkdf2::<Hmac<Sha256>>(normalized.as_bytes(), &salt, 4096, &mut expected).expect("pbkdf2");
 
         assert_eq!(stored, expected.as_ref());
         // Salt should be 16 bytes.
@@ -6574,9 +6582,9 @@ mod tests {
                     "user '{}' has empty SCRAM salt",
                     user.name
                 );
-                BASE64_STANDARD
-                    .decode(salt_b64)
-                    .unwrap_or_else(|_| panic!("user '{}' scram_salt_b64 is not valid base64", user.name));
+                BASE64_STANDARD.decode(salt_b64).unwrap_or_else(|_| {
+                    panic!("user '{}' scram_salt_b64 is not valid base64", user.name)
+                });
             }
         }
     }
@@ -6597,10 +6605,15 @@ mod tests {
         let state = bootstrap_state();
         let mut config = state.config.expect("bootstrap has config");
         config.s3_sse = Some("aws:kms".to_string());
-        config.s3_sse_kms_key_id = Some("arn:aws:kms:us-east-1:123456789012:key/mrk-abc".to_string());
+        config.s3_sse_kms_key_id =
+            Some("arn:aws:kms:us-east-1:123456789012:key/mrk-abc".to_string());
         assert_eq!(config.s3_sse.as_deref(), Some("aws:kms"));
         assert!(
-            config.s3_sse_kms_key_id.as_ref().map(|k| k.starts_with("arn:")).unwrap_or(false),
+            config
+                .s3_sse_kms_key_id
+                .as_ref()
+                .map(|k| k.starts_with("arn:"))
+                .unwrap_or(false),
             "KMS key ID should look like an ARN"
         );
     }

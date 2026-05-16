@@ -286,8 +286,7 @@ impl PrototypeEngine {
                             }
                         }
                     });
-                    rx_streams
-                        .push(tokio_stream::wrappers::ReceiverStream::new(rx));
+                    rx_streams.push(tokio_stream::wrappers::ReceiverStream::new(rx));
                 }
                 let merged_stream = futures::stream::select_all(rx_streams);
 

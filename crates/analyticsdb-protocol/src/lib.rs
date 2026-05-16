@@ -63,8 +63,8 @@ use futures::Sink;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::sasl::scram::ScramAuth;
+use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::AuthSource;
 use pgwire::api::auth::LoginInfo;
 use pgwire::api::auth::Password;
@@ -189,10 +189,16 @@ impl AuthSource for ControlPlaneScramAuthSource {
 
         let salt = base64::engine::general_purpose::STANDARD
             .decode(salt_b64)
-            .map_err(|e| anyhow_error_to_pgwire(anyhow::anyhow!("invalid scram salt encoding: {e}")))?;
+            .map_err(|e| {
+                anyhow_error_to_pgwire(anyhow::anyhow!("invalid scram salt encoding: {e}"))
+            })?;
         let salted_password = base64::engine::general_purpose::STANDARD
             .decode(salted_password_b64)
-            .map_err(|e| anyhow_error_to_pgwire(anyhow::anyhow!("invalid scram salted password encoding: {e}")))?;
+            .map_err(|e| {
+                anyhow_error_to_pgwire(anyhow::anyhow!(
+                    "invalid scram salted password encoding: {e}"
+                ))
+            })?;
 
         Ok(Password::new(Some(salt), salted_password))
     }
@@ -292,8 +298,8 @@ pub async fn serve_flight_sql(
 pub async fn serve_flight_sql_with_label(
     listener: TcpListener,
     engine: Arc<PrototypeEngine>,
-    tls_config: Option<(Vec<u8>, Vec<u8>)>,  // (cert_pem, key_pem) for server identity
-    ca_cert: Option<Vec<u8>>,                 // PEM CA cert; when set, enables mTLS (requires client certs)
+    tls_config: Option<(Vec<u8>, Vec<u8>)>, // (cert_pem, key_pem) for server identity
+    ca_cert: Option<Vec<u8>>, // PEM CA cert; when set, enables mTLS (requires client certs)
     label: &'static str,
 ) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
@@ -305,13 +311,14 @@ pub async fn serve_flight_sql_with_label(
             Some(secret) => secret,
             None => {
                 let random_bytes: [u8; 32] = rand::random();
-                let hex_secret = random_bytes
-                    .iter()
-                    .fold(String::with_capacity(64), |mut acc, b| {
-                        use std::fmt::Write as _;
-                        let _ = write!(acc, "{b:02x}");
-                        acc
-                    });
+                let hex_secret =
+                    random_bytes
+                        .iter()
+                        .fold(String::with_capacity(64), |mut acc, b| {
+                            use std::fmt::Write as _;
+                            let _ = write!(acc, "{b:02x}");
+                            acc
+                        });
                 warn!(
                     "{}: jwt_secret not configured — using ephemeral key. \
                      Flight SQL sessions will not survive a server restart.",
@@ -335,17 +342,18 @@ pub async fn serve_flight_sql_with_label(
         if let Some(ca_pem) = ca_cert {
             let ca = tonic::transport::Certificate::from_pem(ca_pem);
             server_tls = server_tls.client_ca_root(ca);
-            info!("{}: Starting with mTLS enabled (client certificate required)", label);
+            info!(
+                "{}: Starting with mTLS enabled (client certificate required)",
+                label
+            );
         } else {
             info!("{}: Starting with TLS enabled", label);
         }
-        builder
-            .tls_config(server_tls)?
-            .add_service(
-                FlightServiceServer::new(service)
-                    .max_decoding_message_size(usize::MAX)
-                    .max_encoding_message_size(usize::MAX),
-            )
+        builder.tls_config(server_tls)?.add_service(
+            FlightServiceServer::new(service)
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
+        )
     } else {
         if ca_cert.is_some() {
             warn!("{}: CA cert provided but no server identity configured — mTLS requires a server cert/key; ignoring CA cert", label);
@@ -484,9 +492,9 @@ impl PgWireServerHandlers for AnalyticsPostgresFactory {
         // per-connection Mutex<SASLState> so it must NOT be shared across connections.
         let auth_source: Arc<dyn AuthSource> = self.scram_auth_source.clone();
         Arc::new(PerConnectionStartupHandler {
-            sasl: SASLAuthStartupHandler::new(Arc::new(
-                AnalyticsServerParameterProvider::default(),
-            ))
+            sasl: SASLAuthStartupHandler::new(
+                Arc::new(AnalyticsServerParameterProvider::default()),
+            )
             .with_scram(ScramAuth::new(auth_source)),
             auth_hook: Arc::clone(&self.handler.auth_hook),
         })
@@ -594,7 +602,6 @@ struct AnalyticsPreparedStatement {
 struct AnalyticsQueryParser {
     engine: Arc<PrototypeEngine>,
 }
-
 
 #[async_trait]
 impl SimpleQueryHandler for AnalyticsPostgresHandler {
@@ -808,7 +815,11 @@ fn parse_timeout_to_ms(s: &str) -> u64 {
         return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(60_000);
     }
     if let Some(n) = s.strip_suffix("h") {
-        return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(3_600_000);
+        return n
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+            .saturating_mul(3_600_000);
     }
     if let Some(n) = s.strip_suffix('s') {
         return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(1_000);
@@ -1867,7 +1878,11 @@ async fn plan_rows_schema(
     session: SessionContext,
 ) -> Result<SchemaRef, Status> {
     let schema = engine
-        .plan_query_schema(&QueryRequest { sql, session, query_id: None })
+        .plan_query_schema(&QueryRequest {
+            sql,
+            session,
+            query_id: None,
+        })
         .await
         .map_err(status_from_error)?;
 
@@ -2022,8 +2037,9 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
         }
 
         if action.r#type == "Heartbeat" {
-            let node_id =
-                std::str::from_utf8(&action.body).map_err(status_from_error)?.to_string();
+            let node_id = std::str::from_utf8(&action.body)
+                .map_err(status_from_error)?
+                .to_string();
             self.engine
                 .control_plane()
                 .heartbeat(&node_id)
@@ -2127,8 +2143,7 @@ impl ArrowFlightSqlService for AnalyticsFlightSqlService {
             as Pin<Box<dyn Stream<Item = Result<arrow_flight::HandshakeResponse, Status>> + Send>>);
         response.metadata_mut().insert(
             "authorization",
-            MetadataValue::try_from(format!("Bearer {token}"))
-            .map_err(|error| {
+            MetadataValue::try_from(format!("Bearer {token}")).map_err(|error| {
                 Status::internal(format!("invalid authorization metadata: {error}"))
             })?,
         );
@@ -2606,16 +2621,11 @@ impl AnalyticsFlightSqlService {
         &self,
         request: &tonic::Request<T>,
     ) -> Result<SessionContext, Status> {
-        let auth_header = metadata_value(request.metadata(), "authorization").ok_or_else(|| {
-            
-            Status::unauthenticated("missing authorization header")
+        let auth_header = metadata_value(request.metadata(), "authorization")
+            .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+            Status::unauthenticated("authorization header must be Bearer <token>")
         })?;
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| {
-                
-                Status::unauthenticated("authorization header must be Bearer <token>")
-            })?;
 
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
@@ -4325,7 +4335,11 @@ mod tests {
         let jwt_str = std::str::from_utf8(&payload).expect("payload should be valid UTF-8");
         // JWTs have three base64url segments separated by dots.
         let parts: Vec<&str> = jwt_str.split('.').collect();
-        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts: {jwt_str}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "JWT must have 3 dot-separated parts: {jwt_str}"
+        );
         // Decode the claims segment to verify user/role fields.
         let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[1])
@@ -4520,10 +4534,18 @@ mod tests {
     fn parse_timeout_to_ms_handles_all_formats() {
         assert_eq!(super::parse_timeout_to_ms("0"), 0, "zero = unlimited");
         assert_eq!(super::parse_timeout_to_ms(""), 0, "empty = unlimited");
-        assert_eq!(super::parse_timeout_to_ms("5000"), 5000, "bare integer = ms");
+        assert_eq!(
+            super::parse_timeout_to_ms("5000"),
+            5000,
+            "bare integer = ms"
+        );
         assert_eq!(super::parse_timeout_to_ms("5s"), 5000, "seconds suffix");
         assert_eq!(super::parse_timeout_to_ms("100ms"), 100, "ms suffix");
-        assert_eq!(super::parse_timeout_to_ms("2min"), 120_000, "minutes suffix");
+        assert_eq!(
+            super::parse_timeout_to_ms("2min"),
+            120_000,
+            "minutes suffix"
+        );
         assert_eq!(super::parse_timeout_to_ms("1h"), 3_600_000, "hours suffix");
         assert_eq!(super::parse_timeout_to_ms("garbage"), 0, "invalid = 0");
     }

@@ -67,7 +67,9 @@ pub(crate) fn parse_insert_select_statement(sql: &str) -> Result<Option<InsertSe
 /// The result is used by `try_execute_distributed_select` to decide whether the
 /// query can be fanned out to Compute nodes.  Conservative: returns `None` for
 /// anything that doesn't look like `SELECT … FROM [db.][ schema.]table [WHERE …]`.
-pub(crate) fn parse_plain_select_table(sql: &str) -> Option<(Option<String>, Option<String>, String)> {
+pub(crate) fn parse_plain_select_table(
+    sql: &str,
+) -> Option<(Option<String>, Option<String>, String)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
@@ -234,8 +236,7 @@ pub(crate) fn distributed_aggregate_plan(
                         aggregate.argument,
                         quote_sql_identifier(&output)
                     ));
-                    final_items
-                        .push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+                    final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
                 }
                 "sum" => {
                     worker_items.push(format!(
@@ -243,8 +244,7 @@ pub(crate) fn distributed_aggregate_plan(
                         aggregate.argument,
                         quote_sql_identifier(&output)
                     ));
-                    final_items
-                        .push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
+                    final_items.push(format!("SUM({}) AS {alias}", quote_sql_identifier(&output)));
                 }
                 "min" => {
                     worker_items.push(format!(
@@ -252,8 +252,7 @@ pub(crate) fn distributed_aggregate_plan(
                         aggregate.argument,
                         quote_sql_identifier(&output)
                     ));
-                    final_items
-                        .push(format!("MIN({}) AS {alias}", quote_sql_identifier(&output)));
+                    final_items.push(format!("MIN({}) AS {alias}", quote_sql_identifier(&output)));
                 }
                 "max" => {
                     worker_items.push(format!(
@@ -261,8 +260,7 @@ pub(crate) fn distributed_aggregate_plan(
                         aggregate.argument,
                         quote_sql_identifier(&output)
                     ));
-                    final_items
-                        .push(format!("MAX({}) AS {alias}", quote_sql_identifier(&output)));
+                    final_items.push(format!("MAX({}) AS {alias}", quote_sql_identifier(&output)));
                 }
                 "avg" => {
                     let sum_output = format!("{output}_sum");
@@ -298,9 +296,9 @@ pub(crate) fn distributed_aggregate_plan(
         (true, true) => format!("SELECT {worker_select} FROM __partition__"),
         (true, false) => format!("SELECT {worker_select} FROM __partition__ {group_by_clause}"),
         (false, true) => format!("SELECT {worker_select} FROM __partition__ {where_clause}"),
-        (false, false) => format!(
-            "SELECT {worker_select} FROM __partition__ {where_clause} {group_by_clause}"
-        ),
+        (false, false) => {
+            format!("SELECT {worker_select} FROM __partition__ {where_clause} {group_by_clause}")
+        }
     };
 
     let final_sql = if group_by_clause.is_empty() {
@@ -347,10 +345,7 @@ pub(crate) fn has_window_functions(sql: &str) -> bool {
 }
 
 /// 2-phase DISTINCT: both worker and coordinator run `SELECT DISTINCT … FROM __partition__`.
-pub(crate) fn distributed_distinct_plan(
-    sql: &str,
-    source_table: &str,
-) -> Option<(String, String)> {
+pub(crate) fn distributed_distinct_plan(sql: &str, source_table: &str) -> Option<(String, String)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, trimmed).ok()?;
@@ -661,7 +656,10 @@ pub(crate) fn rewrite_generate_series_range(
     Some(statement.to_string())
 }
 
-pub(crate) async fn delete_written_files(store: &Arc<dyn ObjectStore>, files: &[String]) -> Result<()> {
+pub(crate) async fn delete_written_files(
+    store: &Arc<dyn ObjectStore>,
+    files: &[String],
+) -> Result<()> {
     let keys: Vec<object_store::path::Path> = files
         .iter()
         .filter_map(|p| object_store::path::Path::parse(p.trim_start_matches('/')).ok())
@@ -742,8 +740,14 @@ mod tests {
         let sql = "SELECT DISTINCT status FROM orders";
         let (worker_sql, final_sql) =
             distributed_distinct_plan(sql, "orders").expect("should produce a plan");
-        assert!(worker_sql.contains("__partition__"), "worker_sql: {worker_sql}");
-        assert!(final_sql.contains("__partition__"), "final_sql: {final_sql}");
+        assert!(
+            worker_sql.contains("__partition__"),
+            "worker_sql: {worker_sql}"
+        );
+        assert!(
+            final_sql.contains("__partition__"),
+            "final_sql: {final_sql}"
+        );
         assert_eq!(worker_sql, final_sql);
         assert!(
             worker_sql.to_uppercase().contains("DISTINCT"),
@@ -758,7 +762,9 @@ mod tests {
 
     #[test]
     fn distributed_distinct_plan_rejects_aggregate() {
-        assert!(distributed_distinct_plan("SELECT DISTINCT COUNT(*) FROM orders", "orders").is_none());
+        assert!(
+            distributed_distinct_plan("SELECT DISTINCT COUNT(*) FROM orders", "orders").is_none()
+        );
     }
 
     #[test]
@@ -775,10 +781,19 @@ mod tests {
         let sql = "SELECT id FROM orders ORDER BY id LIMIT 10";
         let (worker_sql, final_sql) =
             distributed_order_limit_plan(sql, "orders").expect("should produce a plan");
-        assert!(worker_sql.contains("__partition__"), "worker_sql: {worker_sql}");
-        assert!(final_sql.contains("__partition__"), "final_sql: {final_sql}");
+        assert!(
+            worker_sql.contains("__partition__"),
+            "worker_sql: {worker_sql}"
+        );
+        assert!(
+            final_sql.contains("__partition__"),
+            "final_sql: {final_sql}"
+        );
         assert_eq!(worker_sql, final_sql);
-        assert!(worker_sql.to_uppercase().contains("ORDER BY"), "worker_sql: {worker_sql}");
+        assert!(
+            worker_sql.to_uppercase().contains("ORDER BY"),
+            "worker_sql: {worker_sql}"
+        );
         assert!(worker_sql.contains("LIMIT"), "worker_sql: {worker_sql}");
     }
 

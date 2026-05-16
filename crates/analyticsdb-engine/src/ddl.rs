@@ -415,8 +415,8 @@ impl PrototypeEngine {
                         .control_plane
                         .execute_metadata_statement(&request.session, &statement)
                         .await?;
-                    self.audit_log.log_event(
-                        crate::audit_log::AuditLogRecord::success(
+                    self.audit_log
+                        .log_event(crate::audit_log::AuditLogRecord::success(
                             crate::audit_log::AuditEventType::CreateUser,
                             &request.session.user,
                             &request.session.role,
@@ -424,8 +424,7 @@ impl PrototypeEngine {
                             "user",
                             &user_name,
                             "embedded",
-                        ),
-                    );
+                        ));
                     (
                         Arc::new(Schema::empty()),
                         Vec::new(),
@@ -440,8 +439,8 @@ impl PrototypeEngine {
                         .control_plane
                         .execute_metadata_statement(&request.session, &statement)
                         .await?;
-                    self.audit_log.log_event(
-                        crate::audit_log::AuditLogRecord::success(
+                    self.audit_log
+                        .log_event(crate::audit_log::AuditLogRecord::success(
                             crate::audit_log::AuditEventType::DropUser,
                             &request.session.user,
                             &request.session.role,
@@ -449,8 +448,7 @@ impl PrototypeEngine {
                             "user",
                             &user_name,
                             "embedded",
-                        ),
-                    );
+                        ));
                     (
                         Arc::new(Schema::empty()),
                         Vec::new(),
@@ -465,8 +463,8 @@ impl PrototypeEngine {
                         .control_plane
                         .execute_metadata_statement(&request.session, &statement)
                         .await?;
-                    self.audit_log.log_event(
-                        crate::audit_log::AuditLogRecord::success(
+                    self.audit_log
+                        .log_event(crate::audit_log::AuditLogRecord::success(
                             crate::audit_log::AuditEventType::AlterUser,
                             &request.session.user,
                             &request.session.role,
@@ -474,8 +472,7 @@ impl PrototypeEngine {
                             "user",
                             &user_name,
                             "embedded",
-                        ),
-                    );
+                        ));
                     (
                         Arc::new(Schema::empty()),
                         Vec::new(),
@@ -1010,8 +1007,8 @@ impl PrototypeEngine {
                 self.rebuild_all_index_snapshots(&request.session, &relation)
                     .await?;
 
-                self.audit_log.log_event(
-                    crate::audit_log::AuditLogRecord::success(
+                self.audit_log
+                    .log_event(crate::audit_log::AuditLogRecord::success(
                         crate::audit_log::AuditEventType::CreateTable,
                         &request.session.user,
                         &request.session.role,
@@ -1019,8 +1016,7 @@ impl PrototypeEngine {
                         "table",
                         &name,
                         "embedded",
-                    ),
-                );
+                    ));
 
                 (
                     Arc::new(Schema::empty()),
@@ -1886,10 +1882,8 @@ impl PrototypeEngine {
                                 if storage_path_str.contains(&hier_old) {
                                     storage_path_str.replace(&hier_old, &hier_new)
                                 } else {
-                                    let flat_old =
-                                        format!("{}__{}__", name, relation.schema);
-                                    let flat_new =
-                                        format!("{}__{}__", new_name, relation.schema);
+                                    let flat_old = format!("{}__{}__", name, relation.schema);
+                                    let flat_new = format!("{}__{}__", new_name, relation.schema);
                                     storage_path_str.replace(&flat_old, &flat_new)
                                 }
                             };
@@ -1898,12 +1892,8 @@ impl PrototypeEngine {
                                     storage::store_for_location(storage_path_str)?;
                                 let (_, new_obj_prefix) =
                                     storage::store_for_location(&new_location_str)?;
-                                storage::rename_prefix(
-                                    &store,
-                                    &old_obj_prefix,
-                                    &new_obj_prefix,
-                                )
-                                .await?;
+                                storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix)
+                                    .await?;
                                 self.control_plane
                                     .update_relation_storage_path(
                                         &request.session,
@@ -2227,8 +2217,8 @@ impl PrototypeEngine {
                     )
                     .await?;
 
-                self.audit_log.log_event(
-                    crate::audit_log::AuditLogRecord::success(
+                self.audit_log
+                    .log_event(crate::audit_log::AuditLogRecord::success(
                         crate::audit_log::AuditEventType::DropTable,
                         &request.session.user,
                         &request.session.role,
@@ -2236,8 +2226,7 @@ impl PrototypeEngine {
                         "table",
                         &name,
                         "embedded",
-                    ),
-                );
+                    ));
 
                 (
                     Arc::new(Schema::empty()),
@@ -2337,17 +2326,18 @@ impl PrototypeEngine {
                     .control_plane
                     .execute_metadata_statement(&request.session, &qualified_statement)
                     .await?;
-                self.audit_log.log_event(
-                    crate::audit_log::AuditLogRecord::success(
+                self.audit_log
+                    .log_event(crate::audit_log::AuditLogRecord::success(
                         crate::audit_log::AuditEventType::GrantPrivilege,
                         &request.session.user,
                         &request.session.role,
-                        &format!("GRANT {privilege} ON {object_type} {qualified_name} TO {grantee}"),
+                        &format!(
+                            "GRANT {privilege} ON {object_type} {qualified_name} TO {grantee}"
+                        ),
                         object_type,
                         &qualified_name,
                         "embedded",
-                    ),
-                );
+                    ));
                 (
                     Arc::new(Schema::empty()),
                     Vec::new(),
@@ -2377,17 +2367,18 @@ impl PrototypeEngine {
                     .control_plane
                     .execute_metadata_statement(&request.session, &qualified_statement)
                     .await?;
-                self.audit_log.log_event(
-                    crate::audit_log::AuditLogRecord::success(
+                self.audit_log
+                    .log_event(crate::audit_log::AuditLogRecord::success(
                         crate::audit_log::AuditEventType::RevokePrivilege,
                         &request.session.user,
                         &request.session.role,
-                        &format!("REVOKE {privilege} ON {object_type} {qualified_name} FROM {grantee}"),
+                        &format!(
+                            "REVOKE {privilege} ON {object_type} {qualified_name} FROM {grantee}"
+                        ),
                         object_type,
                         &qualified_name,
                         "embedded",
-                    ),
-                );
+                    ));
                 (
                     Arc::new(Schema::empty()),
                     Vec::new(),
@@ -2407,10 +2398,7 @@ impl PrototypeEngine {
                         request.session.clone(),
                     )
                 } else {
-                    return Err(anyhow::anyhow!(
-                        "No active query with id '{}'",
-                        query_id
-                    ));
+                    return Err(anyhow::anyhow!("No active query with id '{}'", query_id));
                 }
             }
         };

@@ -26,7 +26,9 @@ pub(crate) fn build_arrow_schema_from_definitions(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-pub(crate) fn build_arrow_schema_from_catalog_columns(columns: &[CatalogColumn]) -> Result<SchemaRef> {
+pub(crate) fn build_arrow_schema_from_catalog_columns(
+    columns: &[CatalogColumn],
+) -> Result<SchemaRef> {
     let definitions = columns
         .iter()
         .map(|c| TableColumnDefinition {

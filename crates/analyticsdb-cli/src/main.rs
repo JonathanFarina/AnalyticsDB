@@ -3,13 +3,13 @@ use analyticsdb_engine::PrototypeEngine;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use clap::{Parser, Subcommand, ValueEnum};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::util::display::array_value_to_string;
+use futures::StreamExt;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType,
     PKCS_ECDSA_P256_SHA256,
 };
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::display::array_value_to_string;
-use futures::StreamExt;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde::Deserialize;
@@ -58,8 +58,8 @@ fn run_ca_init(opts: &CaInitOptions) -> Result<()> {
     ca_params.not_before = time::OffsetDateTime::now_utc();
     ca_params.not_after =
         time::OffsetDateTime::now_utc() + time::Duration::days(opts.validity_days as i64);
-    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-        .context("failed to generate CA key pair")?;
+    let ca_key =
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("failed to generate CA key pair")?;
     let ca_cert = ca_params
         .self_signed(&ca_key)
         .context("failed to self-sign CA certificate")?;
@@ -77,7 +77,9 @@ fn run_ca_init(opts: &CaInitOptions) -> Result<()> {
     ];
     for h in &opts.hostname {
         sans.push(SanType::DnsName(
-            h.as_str().try_into().with_context(|| format!("invalid hostname SAN: {h}"))?,
+            h.as_str()
+                .try_into()
+                .with_context(|| format!("invalid hostname SAN: {h}"))?,
         ));
     }
     leaf_params.subject_alt_names = sans;
@@ -112,18 +114,9 @@ fn run_ca_init(opts: &CaInitOptions) -> Result<()> {
     println!("  server.key — Leaf private key");
     println!();
     println!("Add to your cluster-config.json:");
-    println!(
-        "  \"tls_ca_cert_path\": \"{}\",",
-        ca_crt_path.display()
-    );
-    println!(
-        "  \"tls_cert_path\":    \"{}\",",
-        server_crt_path.display()
-    );
-    println!(
-        "  \"tls_key_path\":     \"{}\"",
-        server_key_path.display()
-    );
+    println!("  \"tls_ca_cert_path\": \"{}\",", ca_crt_path.display());
+    println!("  \"tls_cert_path\":    \"{}\",", server_crt_path.display());
+    println!("  \"tls_key_path\":     \"{}\"", server_key_path.display());
 
     Ok(())
 }
@@ -356,7 +349,11 @@ async fn run_embedded_query(
     session: SessionContext,
     catalog_path: String,
 ) -> Result<QueryResponse> {
-    let request = QueryRequest { sql, session, query_id: None };
+    let request = QueryRequest {
+        sql,
+        session,
+        query_id: None,
+    };
     let engine = PrototypeEngine::from_catalog_path(&catalog_path).await?;
 
     let result = engine.execute_query(&request).await?;

@@ -781,7 +781,9 @@ fn extract_keyword_table(sql: &str, session: &SessionContext, out: &mut Vec<Stri
         r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_\.]*)",
     ];
     for pattern in patterns {
-        let Ok(re) = Regex::new(pattern) else { continue };
+        let Ok(re) = Regex::new(pattern) else {
+            continue;
+        };
         if let Some(captures) = re.captures(sql) {
             if let Some(name) = captures.get(1) {
                 out.push(qualify_object_name(name.as_str(), session));

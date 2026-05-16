@@ -9,7 +9,9 @@ use datafusion_common::{ColumnStatistics, Statistics};
 use datafusion_common::stats::Precision;
 use futures::StreamExt;
 use object_store::path::Path as OPath;
-use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
+use object_store::{
+    Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -111,11 +113,20 @@ async fn put_manifest(
     mode: PutMode,
 ) -> Result<String, OsError> {
     let key = manifest_key(prefix);
-    let json = serde_json::to_string_pretty(manifest)
-        .map_err(|e| OsError::Generic { store: "manifest", source: Box::new(e) })?;
+    let json = serde_json::to_string_pretty(manifest).map_err(|e| OsError::Generic {
+        store: "manifest",
+        source: Box::new(e),
+    })?;
     let payload: object_store::PutPayload = Bytes::from(json.into_bytes()).into();
     let result = store
-        .put_opts(&key, payload, PutOptions { mode, ..Default::default() })
+        .put_opts(
+            &key,
+            payload,
+            PutOptions {
+                mode,
+                ..Default::default()
+            },
+        )
         .await?;
     Ok(result.e_tag.unwrap_or_default())
 }
@@ -147,10 +158,7 @@ pub fn manifest_file_paths(prefix: &OPath, manifest: &Manifest) -> Vec<String> {
 ///
 /// If a manifest exists, uses it. Falls back to a directory scan via
 /// `storage::list_parquet_files` for tables that predate manifests.
-pub async fn list_files(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &OPath,
-) -> Result<Vec<String>> {
+pub async fn list_files(store: &Arc<dyn ObjectStore>, prefix: &OPath) -> Result<Vec<String>> {
     if let Some(manifest) = read_manifest(store, prefix).await? {
         return Ok(manifest_file_paths(prefix, &manifest));
     }
@@ -228,7 +236,10 @@ pub async fn append_to_manifest(
         manifest.bump_snapshot();
 
         let mode = match e_tag {
-            Some(tag) => PutMode::Update(UpdateVersion { e_tag: Some(tag), version: None }),
+            Some(tag) => PutMode::Update(UpdateVersion {
+                e_tag: Some(tag),
+                version: None,
+            }),
             None => PutMode::Create,
         };
         match put_manifest(store, prefix, &manifest, mode).await {
@@ -276,7 +287,10 @@ pub async fn replace_manifest(
         let manifest = Manifest::new(entries.clone());
 
         let mode = match e_tag {
-            Some(tag) => PutMode::Update(UpdateVersion { e_tag: Some(tag), version: None }),
+            Some(tag) => PutMode::Update(UpdateVersion {
+                e_tag: Some(tag),
+                version: None,
+            }),
             None => PutMode::Create,
         };
         match put_manifest(store, prefix, &manifest, mode).await {
@@ -346,10 +360,7 @@ pub async fn append_batch(
 /// created it, so it will not be mistaken for an orphan by a concurrent vacuum).
 ///
 /// Returns the number of files deleted.
-pub async fn vacuum_orphans(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &OPath,
-) -> Result<usize> {
+pub async fn vacuum_orphans(store: &Arc<dyn ObjectStore>, prefix: &OPath) -> Result<usize> {
     let manifest = read_manifest(store, prefix).await?;
     let committed: HashSet<String> = match &manifest {
         Some(m) => m.files.iter().map(|e| e.path.clone()).collect(),
@@ -467,7 +478,15 @@ pub async fn compact_table(
         let row_count: i64 = bin.iter().map(|b| b.num_rows() as i64).sum();
         let bytes = storage::encode_parquet_batches(Arc::clone(&schema), &bin)?;
         let size = bytes.len() as u64;
-        Ok((ManifestEntry { path: data_path, size, row_count, column_stats: Vec::new() }, bytes))
+        Ok((
+            ManifestEntry {
+                path: data_path,
+                size,
+                row_count,
+                column_stats: Vec::new(),
+            },
+            bytes,
+        ))
     };
 
     for batch in all_batches {
@@ -626,45 +645,58 @@ mod tests {
 
     #[tokio::test]
     async fn compact_table_merges_multiple_small_files_into_one() {
-        let dir = std::env::temp_dir().join(format!(
-            "compact-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let dir = std::env::temp_dir().join(format!("compact-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
         let prefix = OPath::parse(dir.to_string_lossy().trim_start_matches('/')).unwrap();
 
         // Write three small Parquet files via append_batch.
-        append_batch(&store, &prefix, make_batch(vec![1, 2])).await.unwrap();
-        append_batch(&store, &prefix, make_batch(vec![3, 4])).await.unwrap();
-        append_batch(&store, &prefix, make_batch(vec![5, 6])).await.unwrap();
+        append_batch(&store, &prefix, make_batch(vec![1, 2]))
+            .await
+            .unwrap();
+        append_batch(&store, &prefix, make_batch(vec![3, 4]))
+            .await
+            .unwrap();
+        append_batch(&store, &prefix, make_batch(vec![5, 6]))
+            .await
+            .unwrap();
 
         let manifest_before = read_manifest(&store, &prefix).await.unwrap().unwrap();
         assert_eq!(manifest_before.files.len(), 3, "expected 3 input files");
 
         // Compact with a large target so all 3 fit into 1 output file.
-        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2).await.unwrap();
-        assert_eq!(written, 1, "all small files should merge into a single output");
+        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 1,
+            "all small files should merge into a single output"
+        );
 
         let manifest_after = read_manifest(&store, &prefix).await.unwrap().unwrap();
-        assert_eq!(manifest_after.files.len(), 1, "manifest should list one file after compaction");
+        assert_eq!(
+            manifest_after.files.len(),
+            1,
+            "manifest should list one file after compaction"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn compact_table_skips_when_below_min_file_count() {
-        let dir = std::env::temp_dir().join(format!(
-            "compact-skip-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let dir = std::env::temp_dir().join(format!("compact-skip-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
         let prefix = OPath::parse(dir.to_string_lossy().trim_start_matches('/')).unwrap();
 
-        append_batch(&store, &prefix, make_batch(vec![1])).await.unwrap();
+        append_batch(&store, &prefix, make_batch(vec![1]))
+            .await
+            .unwrap();
 
-        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2).await.unwrap();
+        let written = compact_table(&store, &prefix, 128 * 1024 * 1024, 2)
+            .await
+            .unwrap();
         assert_eq!(written, 0, "single file should not be compacted");
 
         std::fs::remove_dir_all(&dir).ok();

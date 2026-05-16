@@ -128,9 +128,9 @@ use datafusion::physical_plan::RecordBatchStream;
 use datafusion::prelude::{
     col, lit, ParquetReadOptions, SessionConfig, SessionContext as DfSessionContext,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::scalar::ScalarValue;
 use datafusion_functions_aggregate::expr_fn::count;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::SendableRecordBatchStream;
@@ -143,11 +143,11 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tracing::{info, warn};
 
+pub mod audit_log;
 pub mod distributed;
 pub mod functions;
 pub(crate) mod manifest;
 pub mod postgres_compatibility;
-pub mod audit_log;
 pub mod query_log;
 pub mod sql_rewriter;
 pub mod storage;
@@ -586,7 +586,10 @@ impl PrototypeEngine {
             partition_client,
             file_list_cache: Arc::new(FileListCache::new()),
             query_log: Arc::new(QueryLog::new(query_log_config, query_log_root)),
-            audit_log: Arc::new(AuditLog::new(audit_log::AuditLogConfig::default(), audit_log_root)),
+            audit_log: Arc::new(AuditLog::new(
+                audit_log::AuditLogConfig::default(),
+                audit_log_root,
+            )),
             active_queries: Arc::new(dashmap::DashMap::new()),
             query_semaphore: Self::build_query_semaphore(),
             memory_pool: Self::build_memory_pool(),
@@ -930,9 +933,7 @@ impl PrototypeEngine {
             .try_acquire_relation_lease(&key, &node_id, 30_000)
             .await?;
         if !acquired {
-            anyhow::bail!(
-                "relation {key} is locked by another coordinator; retry momentarily"
-            );
+            anyhow::bail!("relation {key} is locked by another coordinator; retry momentarily");
         }
 
         // Spawn a background task that releases the lease when the lock is
@@ -1110,7 +1111,9 @@ impl PrototypeEngine {
         }
 
         // D5: Object-level authorization check before executing DML.
-        if let Some((table_name, privilege)) = extract_dml_table_and_privilege(&request.sql, &request.session) {
+        if let Some((table_name, privilege)) =
+            extract_dml_table_and_privilege(&request.sql, &request.session)
+        {
             self.check_table_access(&request.session, &table_name, &privilege)
                 .await?;
         }
@@ -1261,7 +1264,9 @@ impl PrototypeEngine {
         }
 
         // D5: Object-level authorization check before executing DML (stream path).
-        if let Some((table_name, privilege)) = extract_dml_table_and_privilege(&request.sql, &request.session) {
+        if let Some((table_name, privilege)) =
+            extract_dml_table_and_privilege(&request.sql, &request.session)
+        {
             self.check_table_access(&request.session, &table_name, &privilege)
                 .await?;
         }
@@ -1485,8 +1490,16 @@ impl PrototypeEngine {
                 let size = bytes.len() as u64;
                 let row_count = current_rows as i64;
                 store.put(&key, bytes.into()).await?;
-                crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count, Vec::new()).await?;
-                 current_batch.clear();
+                crate::manifest::append_to_manifest(
+                    &store,
+                    &prefix,
+                    &data_path,
+                    size,
+                    row_count,
+                    Vec::new(),
+                )
+                .await?;
+                current_batch.clear();
                 current_rows = 0;
             }
         }
@@ -1500,7 +1513,15 @@ impl PrototypeEngine {
             let size = bytes.len() as u64;
             let row_count = current_rows as i64;
             store.put(&key, bytes.into()).await?;
-            crate::manifest::append_to_manifest(&store, &prefix, &data_path, size, row_count, Vec::new()).await?;
+            crate::manifest::append_to_manifest(
+                &store,
+                &prefix,
+                &data_path,
+                size,
+                row_count,
+                Vec::new(),
+            )
+            .await?;
         }
 
         let table_key = format!(
@@ -1651,9 +1672,7 @@ fn extract_dml_table_and_privilege(
     session: &SessionContext,
 ) -> Option<(String, String)> {
     let dialect = PostgreSqlDialect {};
-    let Ok(statements) =
-        Parser::parse_sql(&dialect, sql.trim().trim_end_matches(';'))
-    else {
+    let Ok(statements) = Parser::parse_sql(&dialect, sql.trim().trim_end_matches(';')) else {
         return None;
     };
 
@@ -1683,7 +1702,9 @@ fn extract_dml_table_and_privilege(
                 sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
                 sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
             };
-            let name = tables.first().map(|f| qualify_table_name(&f.relation.to_string(), session))?;
+            let name = tables
+                .first()
+                .map(|f| qualify_table_name(&f.relation.to_string(), session))?;
             Some((name, "DELETE".to_string()))
         }
         _ => None,
@@ -1792,7 +1813,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "SELECT 1 AS logged_value".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("logged query should execute");
 
@@ -1843,7 +1864,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "SELECT * FROM generate_series(1, 100)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("query should execute");
 
@@ -1853,7 +1874,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "SELECT * FROM generate_series(1, 50) AS t2".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("stream query should execute");
 
@@ -1973,7 +1994,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("table should be created");
 
@@ -1985,12 +2006,12 @@ FROM generate_series(1, 1000000) AS s(n)
             sql: "INSERT INTO customers VALUES (1, 'one')".to_string(),
             session: session_a,
             query_id: None,
-};
+        };
         let request_b = QueryRequest {
             sql: "INSERT INTO customers VALUES (1, 'duplicate')".to_string(),
             session: session_b,
             query_id: None,
-};
+        };
 
         let (insert_a, insert_b) = tokio::join!(
             engine_a.execute_query(&request_a),
@@ -2041,7 +2062,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2050,7 +2071,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "INSERT INTO customers VALUES (1, 'one'), (2, 'two')".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2061,7 +2082,7 @@ FROM generate_series(1, 1000000) AS s(n)
                     .to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("CREATE UNIQUE INDEX CONCURRENTLY should succeed");
 
@@ -2075,7 +2096,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "SELECT id, name FROM customers WHERE name = 'one'".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("Query should succeed");
         let response = result.to_query_response();
@@ -2103,7 +2124,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "CREATE TABLE test_idx (id INT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2112,7 +2133,7 @@ FROM generate_series(1, 1000000) AS s(n)
                 sql: "CREATE INDEX test_idx_idx ON test_idx (id)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2166,7 +2187,7 @@ FROM generate_series(1, 1000) AS s(n)";
                 sql: sql.to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await;
 
         cleanup_catalog_artifacts(&catalog_path);
@@ -2277,9 +2298,7 @@ FROM generate_series(1, 10) AS s(n)";
             .clone()
             .expect("orders should have managed storage");
         let (store, prefix) = crate::storage::store_for_location(&storage_path).unwrap();
-        let partition_files = crate::manifest::list_files(&store, &prefix)
-            .await
-            .unwrap();
+        let partition_files = crate::manifest::list_files(&store, &prefix).await.unwrap();
         assert!(
             !partition_files.is_empty(),
             "orders table must have parquet files"
@@ -2375,9 +2394,7 @@ FROM generate_series(1, 10) AS s(n)";
         crate::manifest::append_batch(&store, &prefix, batch)
             .await
             .unwrap();
-        let partition_files = crate::manifest::list_files(&store, &prefix)
-            .await
-            .unwrap();
+        let partition_files = crate::manifest::list_files(&store, &prefix).await.unwrap();
 
         let req = crate::distributed::ExecutePartitionRequest {
             query_id: "test-partition-string-backed-orders-agg".to_string(),
@@ -2462,7 +2479,7 @@ FROM generate_series(1, 10) AS s(n)";
             sql: "SELECT COUNT(*) FROM customers".to_string(),
             session: session.clone(),
             query_id: None,
-};
+        };
         let admission = QueryAdmission {
             query_id: "test-distributed-count-finalize".to_string(),
             coordinator_node_id: "coord-test".to_string(),
@@ -2527,7 +2544,7 @@ FROM generate_series(1, 10) AS s(n)";
             sql: "SELECT COUNT(*) FROM customers".to_string(),
             session: session.clone(),
             query_id: None,
-};
+        };
         let admission = QueryAdmission {
             query_id: "test-distributed-partial-count-finalize".to_string(),
             coordinator_node_id: "coord-test".to_string(),
@@ -2814,7 +2831,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "CREATE TABLE dist_test (id INT, val TEXT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2823,7 +2840,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "INSERT INTO dist_test SELECT 1, 'hello'".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2833,7 +2850,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "SELECT * FROM dist_test".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("local fallback should succeed");
 
@@ -2861,7 +2878,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "CREATE TABLE write_src (n INT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
         engine
@@ -2870,7 +2887,7 @@ FROM generate_series(1, 10) AS s(n)";
                     .to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2935,7 +2952,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "CREATE TABLE ins_src (x INT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
         engine
@@ -2943,7 +2960,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "INSERT INTO ins_src SELECT * FROM generate_series(1, 3) AS s(x)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
         engine
@@ -2951,7 +2968,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "CREATE TABLE ins_dst (x INT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -2961,7 +2978,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "INSERT INTO ins_dst SELECT * FROM ins_src".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("local insert fallback should succeed");
 
@@ -2991,7 +3008,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "CREATE TABLE fail_test (id INT)".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
         engine
@@ -3000,7 +3017,7 @@ FROM generate_series(1, 10) AS s(n)";
                     .to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .unwrap();
 
@@ -3024,7 +3041,7 @@ FROM generate_series(1, 10) AS s(n)";
                 sql: "SELECT * FROM fail_test".to_string(),
                 session: session.clone(),
                 query_id: None,
-})
+            })
             .await
             .expect("Query should succeed via fallback despite bogus node");
 
@@ -3160,10 +3177,7 @@ FROM generate_series(1, 10) AS s(n)";
             })
             .await;
 
-        assert!(
-            result.is_err(),
-            "unprivileged user should be denied SELECT"
-        );
+        assert!(result.is_err(), "unprivileged user should be denied SELECT");
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
             msg.contains("permission denied for table"),

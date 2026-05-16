@@ -6275,9 +6275,18 @@ async fn cli_file_url_storage_root_supports_full_dml_ddl_lifecycle() {
         .stdout
         .clone();
     let select_stdout = String::from_utf8(select_out).expect("stdout should be utf-8");
-    assert!(select_stdout.contains("alpha"), "SELECT should return alpha row");
-    assert!(select_stdout.contains("beta"), "SELECT should return beta row");
-    assert!(select_stdout.contains("gamma"), "SELECT should return gamma row");
+    assert!(
+        select_stdout.contains("alpha"),
+        "SELECT should return alpha row"
+    );
+    assert!(
+        select_stdout.contains("beta"),
+        "SELECT should return beta row"
+    );
+    assert!(
+        select_stdout.contains("gamma"),
+        "SELECT should return gamma row"
+    );
 
     // UPDATE
     run_sql_via_protocol(
@@ -6313,11 +6322,7 @@ async fn cli_file_url_storage_root_supports_full_dml_ddl_lifecycle() {
     );
 
     // DELETE
-    run_sql_via_protocol(
-        "postgres",
-        &addr,
-        "DELETE FROM file_url_test WHERE id = 3",
-    );
+    run_sql_via_protocol("postgres", &addr, "DELETE FROM file_url_test WHERE id = 3");
 
     let after_delete_out = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
@@ -6339,8 +6344,7 @@ async fn cli_file_url_storage_root_supports_full_dml_ddl_lifecycle() {
         .get_output()
         .stdout
         .clone();
-    let after_delete_stdout =
-        String::from_utf8(after_delete_out).expect("stdout should be utf-8");
+    let after_delete_stdout = String::from_utf8(after_delete_out).expect("stdout should be utf-8");
     assert!(
         !after_delete_stdout.contains("| 3 "),
         "DELETE should remove id=3, got: {after_delete_stdout}"
@@ -6436,9 +6440,17 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
     let select_out = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args([
-            "query", "--protocol", "postgres", "--endpoint", &addr,
-            "--user", "postgres", "--password", "postgres",
-            "--sql", "SELECT id, label FROM s3_parity_test ORDER BY id",
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT id, label FROM s3_parity_test ORDER BY id",
         ])
         .assert()
         .success()
@@ -6446,19 +6458,40 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
         .stdout
         .clone();
     let select_stdout = String::from_utf8(select_out).expect("stdout should be utf-8");
-    assert!(select_stdout.contains("alpha"), "S3 SELECT should return alpha row");
-    assert!(select_stdout.contains("beta"), "S3 SELECT should return beta row");
-    assert!(select_stdout.contains("gamma"), "S3 SELECT should return gamma row");
+    assert!(
+        select_stdout.contains("alpha"),
+        "S3 SELECT should return alpha row"
+    );
+    assert!(
+        select_stdout.contains("beta"),
+        "S3 SELECT should return beta row"
+    );
+    assert!(
+        select_stdout.contains("gamma"),
+        "S3 SELECT should return gamma row"
+    );
 
     // UPDATE
-    run_sql_via_protocol("postgres", &addr, "UPDATE s3_parity_test SET label = 'updated' WHERE id = 2");
+    run_sql_via_protocol(
+        "postgres",
+        &addr,
+        "UPDATE s3_parity_test SET label = 'updated' WHERE id = 2",
+    );
 
     let after_update = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args([
-            "query", "--protocol", "postgres", "--endpoint", &addr,
-            "--user", "postgres", "--password", "postgres",
-            "--sql", "SELECT label FROM s3_parity_test WHERE id = 2",
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT label FROM s3_parity_test WHERE id = 2",
         ])
         .assert()
         .success()
@@ -6466,7 +6499,9 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
         .stdout
         .clone();
     assert!(
-        String::from_utf8(after_update).expect("utf-8").contains("updated"),
+        String::from_utf8(after_update)
+            .expect("utf-8")
+            .contains("updated"),
         "S3 UPDATE should change label"
     );
 
@@ -6476,9 +6511,17 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
     let after_delete = Command::cargo_bin("analyticsdb")
         .expect("binary should build")
         .args([
-            "query", "--protocol", "postgres", "--endpoint", &addr,
-            "--user", "postgres", "--password", "postgres",
-            "--sql", "SELECT id FROM s3_parity_test ORDER BY id",
+            "query",
+            "--protocol",
+            "postgres",
+            "--endpoint",
+            &addr,
+            "--user",
+            "postgres",
+            "--password",
+            "postgres",
+            "--sql",
+            "SELECT id FROM s3_parity_test ORDER BY id",
         ])
         .assert()
         .success()
@@ -6486,7 +6529,9 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
         .stdout
         .clone();
     assert!(
-        !String::from_utf8(after_delete).expect("utf-8").contains("| 3 "),
+        !String::from_utf8(after_delete)
+            .expect("utf-8")
+            .contains("| 3 "),
         "S3 DELETE should remove id=3"
     );
 
@@ -6582,7 +6627,10 @@ async fn cli_grant_revoke_enforces_table_access_on_postgres_and_flight_sql() {
     let fl_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fl listener");
-    let fl_addr = format!("http://127.0.0.1:{}", fl_listener.local_addr().unwrap().port());
+    let fl_addr = format!(
+        "http://127.0.0.1:{}",
+        fl_listener.local_addr().unwrap().port()
+    );
     let _pg_task = {
         let eng = Arc::clone(&engine);
         tokio::spawn(serve_postgres_wire(pg_listener, eng))
@@ -6595,87 +6643,169 @@ async fn cli_grant_revoke_enforces_table_access_on_postgres_and_flight_sql() {
 
     // Admin: create table and insert a row.
     protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
         "CREATE TABLE access_test (id INT, val TEXT)",
     );
     protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
         "INSERT INTO access_test VALUES (1, 'hello')",
     );
 
     // Admin: create a non-admin user.
     protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
         "CREATE USER alice PASSWORD 'alicepass'",
     );
 
     // PG: alice is denied before any grant.
     let err_pg = protocol_stderr_failure_with_auth_context(
-        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
     let err_pg_lower = err_pg.to_ascii_lowercase();
     assert!(
-        err_pg_lower.contains("permission") || err_pg_lower.contains("denied") || err_pg_lower.contains("error"),
+        err_pg_lower.contains("permission")
+            || err_pg_lower.contains("denied")
+            || err_pg_lower.contains("error"),
         "PG should deny alice before grant, got: {err_pg}"
     );
 
     // Flight SQL: alice is also denied before grant.
     let err_fl = protocol_stderr_failure_with_auth_context(
-        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "flight-sql",
+        &fl_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
     let err_fl_lower = err_fl.to_ascii_lowercase();
     assert!(
-        err_fl_lower.contains("permission") || err_fl_lower.contains("denied") || err_fl_lower.contains("error"),
+        err_fl_lower.contains("permission")
+            || err_fl_lower.contains("denied")
+            || err_fl_lower.contains("error"),
         "Flight SQL should deny alice before grant, got: {err_fl}"
     );
 
     // Admin: grant SELECT on the table to alice.
     protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
         "GRANT SELECT ON TABLE access_test TO alice",
     );
 
     // PG: alice can now SELECT.
     let resp_pg = protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
-    assert_eq!(resp_pg.rows.len(), 1, "PG: alice should see 1 row after grant");
+    assert_eq!(
+        resp_pg.rows.len(),
+        1,
+        "PG: alice should see 1 row after grant"
+    );
 
     // Flight SQL: alice can also SELECT.
     let resp_fl = protocol_json_response_with_auth_context(
-        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "flight-sql",
+        &fl_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
-    assert_eq!(resp_fl.rows.len(), 1, "Flight SQL: alice should see 1 row after grant");
+    assert_eq!(
+        resp_fl.rows.len(),
+        1,
+        "Flight SQL: alice should see 1 row after grant"
+    );
 
     // Admin: revoke SELECT from alice.
     protocol_json_response_with_auth_context(
-        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
         "REVOKE SELECT ON TABLE access_test FROM alice",
     );
 
     // PG: alice is denied again after revoke.
     let err_after_pg = protocol_stderr_failure_with_auth_context(
-        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "postgres",
+        &pg_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
     let err_after_pg_lower = err_after_pg.to_ascii_lowercase();
     assert!(
-        err_after_pg_lower.contains("permission") || err_after_pg_lower.contains("denied") || err_after_pg_lower.contains("error"),
+        err_after_pg_lower.contains("permission")
+            || err_after_pg_lower.contains("denied")
+            || err_after_pg_lower.contains("error"),
         "PG should deny alice after revoke, got: {err_after_pg}"
     );
 
     // Flight SQL: alice is denied again after revoke.
     let err_after_fl = protocol_stderr_failure_with_auth_context(
-        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "flight-sql",
+        &fl_addr,
+        None,
+        None,
+        "alice",
+        Some("alice"),
+        Some("alicepass"),
         "SELECT * FROM access_test",
     );
     let err_after_fl_lower = err_after_fl.to_ascii_lowercase();
     assert!(
-        err_after_fl_lower.contains("permission") || err_after_fl_lower.contains("denied") || err_after_fl_lower.contains("error"),
+        err_after_fl_lower.contains("permission")
+            || err_after_fl_lower.contains("denied")
+            || err_after_fl_lower.contains("error"),
         "Flight SQL should deny alice after revoke, got: {err_after_fl}"
     );
 

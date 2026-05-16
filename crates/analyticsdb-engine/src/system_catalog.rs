@@ -396,30 +396,26 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                 // Resolve committed file paths from the manifest once and reuse
                 // them for both schema inference and the final ListingTable,
                 // so neither step scans the directory (avoiding stale staged files).
-                let committed_files: Vec<String> = if let Ok((store, prefix)) =
-                    crate::storage::store_for_location(storage_path)
-                {
-                    crate::manifest::list_files(&store, &prefix)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let committed_files: Vec<String> =
+                    if let Ok((store, prefix)) = crate::storage::store_for_location(storage_path) {
+                        crate::manifest::list_files(&store, &prefix)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
 
                 let infer_context = DfSessionContext::new();
                 if !committed_files.is_empty() {
-                    if let Ok(inferred_config) =
-                        ListingTableConfig::new_with_multi_paths(
-                            committed_files
-                                .iter()
-                                .filter_map(|f| ListingTableUrl::parse(f).ok())
-                                .collect(),
-                        )
-                        .with_listing_options(ListingOptions::new(Arc::new(
-                            ParquetFormat::default(),
-                        )))
-                        .infer_schema(&infer_context.state())
-                        .await
+                    if let Ok(inferred_config) = ListingTableConfig::new_with_multi_paths(
+                        committed_files
+                            .iter()
+                            .filter_map(|f| ListingTableUrl::parse(f).ok())
+                            .collect(),
+                    )
+                    .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+                    .infer_schema(&infer_context.state())
+                    .await
                     {
                         if let Some(inferred_schema) = inferred_config.file_schema {
                             schema =
@@ -435,7 +431,10 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                 {
                     if let Ok(sample_df) = infer_context
                         .read_parquet(
-                            committed_files.iter().map(String::as_str).collect::<Vec<_>>(),
+                            committed_files
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
                             Default::default(),
                         )
                         .await

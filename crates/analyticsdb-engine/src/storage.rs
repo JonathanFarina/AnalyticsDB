@@ -79,8 +79,7 @@ pub fn store_for_location(location: &str) -> Result<(Arc<dyn ObjectStore>, OPath
 fn build_s3_store(rest: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
     let (bucket, key_prefix) = split_bucket_and_prefix(rest);
 
-    let mut builder = object_store::aws::AmazonS3Builder::from_env()
-        .with_bucket_name(bucket);
+    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
 
     // SSE: ANALYTICSDB_S3_SSE takes precedence over ClusterConfig; the engine
     // propagates ClusterConfig values into these env vars at startup if needed.
@@ -122,7 +121,10 @@ fn build_azure_store(rest: &str, original_location: &str) -> Result<(Arc<dyn Obj
     // and treat remainder as container/prefix like the other schemes.
     let normalised = if original_location.starts_with("abfss://") {
         if let Some((container_at_host, path)) = rest.split_once('/') {
-            let container = container_at_host.split('@').next().unwrap_or(container_at_host);
+            let container = container_at_host
+                .split('@')
+                .next()
+                .unwrap_or(container_at_host);
             format!("{}/{}", container, path)
         } else {
             rest.to_string()
@@ -464,11 +466,16 @@ mod tests {
     fn s3_sse_config_key_parses_correctly() {
         let sse_key: Result<object_store::aws::AmazonS3ConfigKey, _> =
             "aws_server_side_encryption".parse();
-        assert!(sse_key.is_ok(), "aws_server_side_encryption must be a valid AmazonS3ConfigKey");
+        assert!(
+            sse_key.is_ok(),
+            "aws_server_side_encryption must be a valid AmazonS3ConfigKey"
+        );
 
-        let kms_key: Result<object_store::aws::AmazonS3ConfigKey, _> =
-            "aws_sse_kms_key_id".parse();
-        assert!(kms_key.is_ok(), "aws_sse_kms_key_id must be a valid AmazonS3ConfigKey");
+        let kms_key: Result<object_store::aws::AmazonS3ConfigKey, _> = "aws_sse_kms_key_id".parse();
+        assert!(
+            kms_key.is_ok(),
+            "aws_sse_kms_key_id must be a valid AmazonS3ConfigKey"
+        );
     }
 
     /// B8: verify that build_s3_store picks up ANALYTICSDB_S3_SSE from the environment.
@@ -506,7 +513,10 @@ mod tests {
     #[test]
     fn build_s3_store_accepts_kms_key_id_env_var() {
         unsafe {
-            std::env::set_var("ANALYTICSDB_S3_SSE_KMS_KEY_ID", "arn:aws:kms:us-east-1:123:key/abc");
+            std::env::set_var(
+                "ANALYTICSDB_S3_SSE_KMS_KEY_ID",
+                "arn:aws:kms:us-east-1:123:key/abc",
+            );
         }
         let result = build_s3_store("test-bucket/prefix");
         unsafe {

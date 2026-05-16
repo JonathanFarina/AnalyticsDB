@@ -395,7 +395,14 @@ impl CatalogStore for SqliteCatalogStore {
                 "INSERT OR REPLACE INTO object_permissions
                  (grantee, object_type, object_name, privilege, granted_by, granted_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![grantee, object_type, object_name, privilege, granted_by, now_ms],
+                params![
+                    grantee,
+                    object_type,
+                    object_name,
+                    privilege,
+                    granted_by,
+                    now_ms
+                ],
             )?;
             Ok(())
         })
@@ -733,7 +740,13 @@ mod tests {
 
             // Grant SELECT on a table to alice.
             store
-                .grant_privilege("alice", "table", "postgres.public.orders", "SELECT", "admin")
+                .grant_privilege(
+                    "alice",
+                    "table",
+                    "postgres.public.orders",
+                    "SELECT",
+                    "admin",
+                )
                 .await
                 .expect("grant");
 
@@ -768,7 +781,13 @@ mod tests {
             let store = SqliteCatalogStore::new(path.clone());
 
             store
-                .grant_privilege("alice", "table", "postgres.public.orders", "SELECT", "admin")
+                .grant_privilege(
+                    "alice",
+                    "table",
+                    "postgres.public.orders",
+                    "SELECT",
+                    "admin",
+                )
                 .await
                 .expect("grant");
 
@@ -809,7 +828,10 @@ mod tests {
                 .check_privilege("anyone", "table", "any.table", "SELECT")
                 .await
                 .expect("json check");
-            assert!(ok, "JsonCatalogStore should always return true for check_privilege");
+            assert!(
+                ok,
+                "JsonCatalogStore should always return true for check_privilege"
+            );
         });
     }
 }
