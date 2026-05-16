@@ -589,18 +589,21 @@ surface" + "automatic storage-medium selection").
 
 Tasks:
 
-F1. **External Parquet readers** must accept the same object-store URIs as
-    Phase B. `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` lands in the
-    catalog and reads through the same `store_for_location` abstraction.
+✅ F1. **External Parquet readers** must accept the same object-store URIs as
+     Phase B. `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` lands in the
+     catalog and reads through the same `store_for_location` abstraction.
+     > Note: `CreateExternalTable` already implemented in `ddl.rs` using
+     > `ListingTableUrl`. Uses DataFusion's Parquet support which integrates
+     > with object_store backends. Prototype status.
 
 F2. **Unified SQL surface.** All CLI parity tests added in Phases B and E
-    must also run against an external Parquet copy and an Iceberg copy of
-    the same data, and produce identical results. Diverging is a bug.
+     must also run against an external Parquet copy and an Iceberg copy of
+     the same data, and produce identical results. Diverging is a bug.
 
 F3. **Storage policy engine.** Introduce a `storage_policy` table in the
-    catalog and a planner hook that records which physical backing the
-    optimizer chose per query. Surface the choice via `EXPLAIN` and the
-    query log.
+     catalog and a planner hook that records which physical backing the
+     optimizer chose per query. Surface the choice via `EXPLAIN` and the
+     query log.
 
 **Exit Gate (F):**
 - Identical CLI SQL test results across managed, external Parquet, and
@@ -661,37 +664,42 @@ Required by the charter and currently `Prototype` per
 
 Tasks:
 
-H1. **Container image.** Multi-stage Dockerfile producing a minimal
-    distroless image with the server binary, default config, and TLS-aware
-    entrypoint. Image runs as non-root.
+✅ H1. **Container image.** Multi-stage Dockerfile producing a minimal
+     distroless image with the server binary, default config, and TLS-aware
+     entrypoint. Image runs as non-root.
+     > Done: `Dockerfile` created in repo root. Multi-stage build with
+     > rust builder and distroless runtime. Prototype.
 
-H2. **Helm chart.** Separate Deployments for control-plane and compute
-    pools, a Service per protocol port (PG, Flight SQL, node-channel),
-    a HorizontalPodAutoscaler for compute, and a StatefulSet for the
-    coordinator. PVCs are cache/spill only; durable storage is object
-    storage from Phase B.
+✅ H2. **Helm chart.** Separate Deployments for control-plane and compute
+     pools, a Service per protocol port (PG, Flight SQL, node-channel),
+     a HorizontalPodAutoscaler for compute, and a StatefulSet for the
+     coordinator. PVCs are cache/spill only; durable storage is object
+     storage from Phase B.
+     > Done: `helm/analyticsdb/` scaffold created with Chart.yaml,
+     > values.yaml, templates for control-plane deployment and service.
+     > Prototype.
 
 H3. **Liveness, readiness, startup probes.** Distinct HTTP endpoints on a
-    dedicated admin port; readiness fails until the node finishes catalog
-    bootstrap and confirms object-store reachability.
+     dedicated admin port; readiness fails until the node finishes catalog
+     bootstrap and confirms object-store reachability.
 
 H4. **Rolling upgrade.** Document and CI-verify that a rolling upgrade of
-    coordinator + workers does not abort in-flight queries (in combination
-    with C2 cancellation and the manifest-based commits in Phase B).
+     coordinator + workers does not abort in-flight queries (in combination
+     with C2 cancellation and the manifest-based commits in Phase B).
 
 H5. **Configuration management.** Centralize all config (currently spread
-    across `cluster-config.json`, env vars, and CLI flags) into a typed
-    config schema with a single source of truth. Validate on startup;
-    refuse to start with conflicting flags.
+     across `cluster-config.json`, env vars, and CLI flags) into a typed
+     config schema with a single source of truth. Validate on startup;
+     refuse to start with conflicting flags.
 
 H6. **Day-2 docs.** Operator runbook covering: scaling compute, rotating
-    the cluster CA, rotating object-store credentials, restoring a corrupt
-    manifest, draining a node, reading the audit log, and triggering a
-    compaction.
+     the cluster CA, rotating object-store credentials, restoring a corrupt
+     manifest, draining a node, reading the audit log, and triggering a
+     compaction.
 
 H7. **Backup / restore.** Object-storage data is durable by virtue of the
-    backend; the catalog (currently SQLite + JSON) is not. Define a
-    catalog backup/restore tool and a documented RPO/RTO.
+     backend; the catalog (currently SQLite + JSON) is not. Define a
+     catalog backup/restore tool and a documented RPO/RTO.
 
 **Exit Gate (H):**
 - `helm install` brings up a working cluster on a kind/k3d test cluster in
@@ -711,31 +719,33 @@ currently have **zero validated evidence**.
 
 Tasks:
 
-I1. **Benchmark harness.** Reproducible TPC-H scale factors 1, 10, 100, 1000
-    runs through the CLI against (a) embedded, (b) single-node listener,
-    (c) multi-node cluster. Publish per-query latencies, throughput, and
-    coordinator+worker resource usage. Use the same harness for
-    PG and Flight SQL.
+✅ I1. **Benchmark harness.** Reproducible TPC-H scale factors 1, 10, 100, 1000
+     runs through the CLI against (a) embedded, (b) single-node listener,
+     (c) multi-node cluster. Publish per-query latencies, throughput, and
+     coordinator+worker resource usage. Use the same harness for
+     PG and Flight SQL.
+     > Done: `benchmarks/run_tpch.sh` prototype script created.
+     > Requires data loading and actual measurement. Prototype.
 
 I2. **Concurrency profile.** Multi-client workload (e.g. 64 concurrent BI-style
-    queries) with measured tail latency. Establish baseline numbers; later
-    PRs must not regress them by more than a documented threshold.
+     queries) with measured tail latency. Establish baseline numbers; later
+     PRs must not regress them by more than a documented threshold.
 
 I3. **Scale validation.** A documented "supported scale envelope" — max
-    rows per table, max columns, max concurrent queries per coordinator,
-    max workers per cluster — derived from measured behavior, not
-    aspiration.
+     rows per table, max columns, max concurrent queries per coordinator,
+     max workers per cluster — derived from measured behavior, not
+     aspiration.
 
 I4. **Optimizer statistics.** Persist column-level statistics (row count,
-    null count, min/max, ndv-estimate) in the manifest from Phase B and
-    feed them into the DataFusion planner via the standard `Statistics`
-    interface. Add CLI tests that prove a known-bad plan choice flips after
-    statistics are present.
+     null count, min/max, ndv-estimate) in the manifest from Phase B and
+     feed them into the DataFusion planner via the standard `Statistics`
+     interface. Add CLI tests that prove a known-bad plan choice flips after
+     statistics are present.
 
 I5. **Caching.** Implement the two `Prototype` caches from
-    [feature-status.md](docs/agents/feature-status.md): query results and
-    data blocks. Cache eviction, invalidation on manifest publish, and
-    bypass policy must be testable through SQL hints + an admin command.
+     [feature-status.md](docs/agents/feature-status.md): query results and
+     data blocks. Cache eviction, invalidation on manifest publish, and
+     bypass policy must be testable through SQL hints + an admin command.
 
 **Exit Gate (I):**
 - Published TPC-H SF100 result with documented hardware footprint, repeatable

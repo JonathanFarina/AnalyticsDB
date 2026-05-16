@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "analyticsdb.fullname" . }}-control
+  labels:
+    {{- include "analyticsdb.labels" . | nindent 4 }}
+    component: control
+spec:
+  replicas: {{ .Values.controlPlane.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "analyticsdb.selectorLabels" . | nindent 6 }}
+      component: control
+  template:
+    metadata:
+      labels:
+        {{- include "analyticsdb.selectorLabels" . | nindent 8 }}
+        component: control
+    spec:
+      containers:
+        - name: control
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--role", "control"]
+          ports:
+            - containerPort: 5432
+              name: pg
+            - containerPort: 8815
+              name: flight
+            - containerPort: 9090
+              name: admin
+          env:
+            - name: ANALYTICSDB_STORAGE_ROOT
+              value: {{ .Values.storageRoot | quote }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "analyticsdb.fullname" . }}-control
+  labels:
+    {{- include "analyticsdb.labels" . | nindent 4 }}
+    component: control
+spec:
+  type: {{ .Values.controlPlane.service.type }}
+  ports:
+    - port: 5432
+      targetPort: pg
+      name: pg
+    - port: 8815
+      targetPort: flight
+      name: flight
+    - port: 9090
+      targetPort: admin
+      name: admin
+  selector:
+    {{- include "analyticsdb.selectorLabels" . | nindent 4 }}
+    component: control
