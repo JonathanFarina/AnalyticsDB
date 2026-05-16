@@ -17,11 +17,22 @@ use crate::storage;
 const MAX_CAS_RETRIES: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnStat {
+    pub name: String,
+    pub null_count: i64,
+    pub min_value: Option<String>,
+    pub max_value: Option<String>,
+    pub ndv_estimate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Filename relative to the table prefix (e.g. "7f3a...v7.parquet").
     pub path: String,
     pub size: u64,
     pub row_count: i64,
+    #[serde(default)]
+    pub column_stats: Vec<ColumnStat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

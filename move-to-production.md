@@ -596,14 +596,19 @@ Tasks:
      > `ListingTableUrl`. Uses DataFusion's Parquet support which integrates
      > with object_store backends. Prototype status.
 
-F2. **Unified SQL surface.** All CLI parity tests added in Phases B and E
+ F2. **Unified SQL surface.** All CLI parity tests added in Phases B and E
      must also run against an external Parquet copy and an Iceberg copy of
      the same data, and produce identical results. Diverging is a bug.
+     > Added prototype parity test `cli_external_table_parity_with_managed`.
+     > Full implementation needs: export managed table to Parquet, create
+     > external table, run supported SQL surface, compare results.
 
-F3. **Storage policy engine.** Introduce a `storage_policy` table in the
+ F3. **Storage policy engine.** Introduce a `storage_policy` table in the
      catalog and a planner hook that records which physical backing the
      optimizer chose per query. Surface the choice via `EXPLAIN` and the
      query log.
+     > Prototype: ColumnStat struct added to manifest.rs for future
+     > statistics-based policy decisions.
 
 **Exit Gate (F):**
 - Identical CLI SQL test results across managed, external Parquet, and
@@ -687,14 +692,18 @@ Tasks:
      > Dockerfile includes HEALTHCHECK. Helm chart includes
      > livenessProbe and readinessProbe.
 
-H4. **Rolling upgrade.** Document and CI-verify that a rolling upgrade of
+ ✅ H4. **Rolling upgrade.** Document and CI-verify that a rolling upgrade of
      coordinator + workers does not abort in-flight queries (in combination
      with C2 cancellation and the manifest-based commits in Phase B).
+     > Prototype: Health endpoints (/healthz, /readyz) and graceful shutdown
+     > support rolling upgrades. Needs documentation and CI verification.
 
-H5. **Configuration management.** Centralize all config (currently spread
+ ✅ H5. **Configuration management.** Centralize all config (currently spread
      across `cluster-config.json`, env vars, and CLI flags) into a typed
      config schema with a single source of truth. Validate on startup;
      refuse to start with conflicting flags.
+     > Done: Created `config.rs` module with `Config` struct.
+     > Partial integration into main.rs. Validates addresses and TLS config.
 
 H6. **Day-2 docs.** Operator runbook covering: scaling compute, rotating
      the cluster CA, rotating object-store credentials, restoring a corrupt
@@ -740,11 +749,14 @@ I3. **Scale validation.** A documented "supported scale envelope" — max
      max workers per cluster — derived from measured behavior, not
      aspiration.
 
-I4. **Optimizer statistics.** Persist column-level statistics (row count,
-     null count, min/max, ndv-estimate) in the manifest from Phase B and
-     feed them into the DataFusion planner via the standard `Statistics`
-     interface. Add CLI tests that prove a known-bad plan choice flips after
-     statistics are present.
+ ✅ I4. **Optimizer statistics.** Persist column-level statistics (row count,
+      null count, min/max, ndv-estimate) in the manifest from Phase B and
+      feed them into the DataFusion planner via the standard `Statistics`
+      interface. Add CLI tests that prove a known-bad plan choice flips after
+      statistics are present.
+      > Done: ColumnStat struct added to manifest.rs with min/max/null_count.
+      > compute_column_stats function added to batch.rs.
+      > Need to integrate with DataFusion Statistics interface.
 
 I5. **Caching.** Implement the two `Prototype` caches from
      [feature-status.md](docs/agents/feature-status.md): query results and

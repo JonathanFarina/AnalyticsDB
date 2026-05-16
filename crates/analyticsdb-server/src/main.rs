@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
+mod config;
 mod health;
 
 const BANNER: &str = "
@@ -133,31 +134,39 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-
-    println!("{}", BANNER);
-
-    if let Some(config_path) = &cli.cluster_config {
+    
+    // Load configuration
+    let mut config = if let Some(config_path) = &cli.cluster_config {
         if !std::path::Path::new(config_path).exists() {
             anyhow::bail!("Cluster configuration file not found: {}", config_path);
         }
-    } else if cli.role == NodeRole::Control && cli.join.is_none() && !cli.init_cluster {
-        warn!("\x1b[1;31mNo cluster configuration provided for control node. Using bootstrap defaults.\x1b[0m");
+        let config: config::Config = config::Config::from_file(config_path)?;
+        config
+    } else {
+        config::Config::default()
+    };
+    
+    // CLI arguments take precedence over config file
+    if cli.postgres_addr.is_some() {
+        config.postgres_addr = cli.postgres_addr;
     }
-
-    // Addresses: explicit CLI values take precedence; joining nodes get ports
-    // assigned by the coordinator, so these are optional for non-primary nodes.
-    let mut pg_addr = cli
-        .postgres_addr
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:5432".to_string());
-    let mut flight_addr = cli
-        .flight_sql_addr
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    let mut node_addr = cli
-        .node_addr
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:60051".to_string());
+    if cli.flight_sql_addr.is_some() {
+        config.flight_sql_addr = cli.flight_sql_addr;
+    }
+    if cli.node_addr.is_some() {
+        config.node_addr = cli.node_addr;
+    }
+    config.admin_addr = cli.admin_addr.clone();
+    
+    // Validate config
+    config.validate()?;
+    
+    println!("{}", BANNER);
+    
+    // Use config values
+    let mut pg_addr = config.postgres_addr.unwrap_or_else(|| "127.0.0.1:5432".to_string());
+    let mut flight_addr = config.flight_sql_addr.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let mut node_addr = config.node_addr.unwrap_or_else(|| "127.0.0.1:60051".to_string());
     let mut catalog_path = cli.catalog_path.clone();
     let mut node_id = cli.node_id.clone();
     let mut final_tls_cert = cli.tls_cert.clone();

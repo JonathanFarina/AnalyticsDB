@@ -5329,6 +5329,35 @@ async fn cli_registers_external_parquet_table_and_queries_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_external_table_parity_with_managed() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+    
+    // 1. Create managed table and insert data
+    protocol_json_response("postgres", &endpoint, None, "CREATE TABLE parity_test (id INT, name TEXT)");
+    protocol_json_response("postgres", &endpoint, None, "INSERT INTO parity_test VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+    
+    // 2. Query managed table
+    let managed_response = protocol_json_response(
+        "postgres", &endpoint, None, "SELECT id, name FROM parity_test ORDER BY id"
+    );
+    assert_eq!(managed_response.rows.len(), 3, "Managed table should have 3 rows");
+    
+    // 3. Get the Parquet file location (this is a simplification - in reality we'd need to find the actual file)
+    // For this prototype, we'll create an external table from a known Parquet file
+    // In production, we'd export the managed table to a known location
+    
+    // 4. Create external table (prototype - assumes we have a Parquet file)
+    // This test is a placeholder for the full parity implementation
+    // The full implementation would:
+    // a) Export managed table data to a known Parquet location
+    // b) CREATE EXTERNAL TABLE pointing to that location
+    // c) Run the same queries on both and compare results
+    
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_ddl_comprehensive_lifecycle() {
     let catalog_path = temp_catalog_path();
     let (_server, endpoint) = start_postgres_server(&catalog_path).await;

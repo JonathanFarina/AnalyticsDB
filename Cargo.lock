@@ -204,6 +204,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "hyper",
  "hyper-util",
  "rustls",
  "rustls-pki-types",
