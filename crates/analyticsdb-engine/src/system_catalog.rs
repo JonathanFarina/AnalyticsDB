@@ -2225,15 +2225,7 @@ fn postgres_session_from_state(state: &dyn Session) -> analyticsdb_core::Session
         .config()
         .get_extension::<analyticsdb_core::SessionContext>()
         .map(|v| v.as_ref().clone())
-        .unwrap_or_else(|| analyticsdb_core::SessionContext {
-            user: "postgres".to_string(),
-            role: "postgres".to_string(),
-            database: "postgres".to_string(),
-            schema: "public".to_string(),
-            auth_method: "postgres-wire-startup".to_string(),
-            protocol: analyticsdb_core::Protocol::PostgreSql,
-            transaction_status: analyticsdb_core::TransactionStatus::Idle,
-        })
+        .unwrap_or_default()
 }
 
 fn synthetic_namespace_oid(database: &str, schema: &str) -> u32 {

@@ -24,6 +24,12 @@ pub struct SessionContext {
     pub protocol: Protocol,
     #[serde(default = "default_transaction_status")]
     pub transaction_status: TransactionStatus,
+    /// Per-session statement timeout in milliseconds; 0 = unlimited.
+    #[serde(default)]
+    pub statement_timeout_ms: u64,
+    /// Idle-in-transaction session timeout in milliseconds; 0 = disabled.
+    #[serde(default)]
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 fn default_transaction_status() -> TransactionStatus {
@@ -40,6 +46,8 @@ impl Default for SessionContext {
             auth_method: "embedded-prototype".to_string(),
             protocol: Protocol::Embedded,
             transaction_status: TransactionStatus::Idle,
+            statement_timeout_ms: 0,
+            idle_in_transaction_timeout_ms: 0,
         }
     }
 }

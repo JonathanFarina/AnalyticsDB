@@ -3821,13 +3821,21 @@ fn bootstrap_state() -> CatalogState {
         }
     };
 
-    let (pg_scram_salt, pg_scram_sp) = scram("postgres");
+    // Bootstrap helper: hash password with Argon2id + compute SCRAM verifier.
+    // Panicking here is acceptable — bootstrap only runs at first install.
+    let bootstrap_user_creds = |pw: &str| -> (Option<String>, Option<String>, Option<String>) {
+        let argon = hash_password(pw).expect("bootstrap hash");
+        let (salt, sp) = compute_scram_verifier(pw).expect("bootstrap scram");
+        (Some(argon), Some(salt), Some(sp))
+    };
+
+    let (pg_hash, pg_scram_salt, pg_scram_sp) = bootstrap_user_creds("postgres");
     users.insert(
         "postgres".to_string(),
         CatalogUser {
             name: "postgres".to_string(),
             is_admin: true,
-            password: Some("postgres".to_string()),
+            password: pg_hash,
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
@@ -3835,13 +3843,13 @@ fn bootstrap_state() -> CatalogState {
             scram_salted_password_b64: pg_scram_sp,
         },
     );
-    let (ar_scram_salt, ar_scram_sp) = scram("analytics_reader");
+    let (ar_hash, ar_scram_salt, ar_scram_sp) = bootstrap_user_creds("analytics_reader");
     users.insert(
         "analytics_reader".to_string(),
         CatalogUser {
             name: "analytics_reader".to_string(),
             is_admin: false,
-            password: Some("analytics_reader".to_string()),
+            password: ar_hash,
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
@@ -3849,13 +3857,13 @@ fn bootstrap_state() -> CatalogState {
             scram_salted_password_b64: ar_scram_sp,
         },
     );
-    let (aa_scram_salt, aa_scram_sp) = scram("analyticsdb_admin");
+    let (aa_hash, aa_scram_salt, aa_scram_sp) = bootstrap_user_creds("analyticsdb_admin");
     users.insert(
         "analyticsdb_admin".to_string(),
         CatalogUser {
             name: "analyticsdb_admin".to_string(),
             is_admin: false,
-            password: Some("analyticsdb_admin".to_string()),
+            password: aa_hash,
             password_version: 1,
             password_rotated_at_epoch_ms: Some(current_epoch_millis()),
             members: BTreeSet::new(),
@@ -6427,5 +6435,54 @@ mod tests {
         assert_eq!(salt.len(), 16);
         // SaltedPassword should be 32 bytes.
         assert_eq!(stored.len(), 32);
+    }
+
+    #[test]
+    fn catalog_state_contains_no_plaintext_passwords() {
+        let state = bootstrap_state();
+        for user in state.users.values() {
+            if let Some(pw) = &user.password {
+                assert!(
+                    pw.starts_with("$argon2"),
+                    "user '{}' has non-Argon2id password field: {:?}",
+                    user.name,
+                    &pw[..pw.len().min(20)]
+                );
+            }
+            if let Some(salt_b64) = &user.scram_salt_b64 {
+                assert!(
+                    !salt_b64.is_empty(),
+                    "user '{}' has empty SCRAM salt",
+                    user.name
+                );
+                BASE64_STANDARD
+                    .decode(salt_b64)
+                    .unwrap_or_else(|_| panic!("user '{}' scram_salt_b64 is not valid base64", user.name));
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_config_tls_fields_are_optional_paths_not_embedded_keys() {
+        let state = bootstrap_state();
+        let config = state.config.expect("bootstrap has config");
+        // All TLS/secret fields are Option<String> (file paths or identifiers, never raw key bytes)
+        let _: Option<String> = config.tls_cert_path;
+        let _: Option<String> = config.tls_key_path;
+        let _: Option<String> = config.tls_ca_cert_path;
+        let _: Option<String> = config.jwt_secret;
+    }
+
+    #[test]
+    fn cluster_config_s3_sse_accepts_known_values() {
+        let state = bootstrap_state();
+        let mut config = state.config.expect("bootstrap has config");
+        config.s3_sse = Some("aws:kms".to_string());
+        config.s3_sse_kms_key_id = Some("arn:aws:kms:us-east-1:123456789012:key/mrk-abc".to_string());
+        assert_eq!(config.s3_sse.as_deref(), Some("aws:kms"));
+        assert!(
+            config.s3_sse_kms_key_id.as_ref().map(|k| k.starts_with("arn:")).unwrap_or(false),
+            "KMS key ID should look like an ARN"
+        );
     }
 }

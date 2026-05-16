@@ -254,10 +254,9 @@ pub async fn serve_postgres_wire(
     let auth_hook: Arc<dyn AuthHook> = Arc::new(PrototypeAllowAllAuthHook {
         control_plane: Arc::clone(&control_plane),
     });
-    let startup_auth = SASLAuthStartupHandler::new(Arc::new(AnalyticsServerParameterProvider::default()))
-        .with_scram(ScramAuth::new(Arc::new(ControlPlaneScramAuthSource {
-            control_plane: Arc::clone(&control_plane),
-        })));
+    let scram_auth_source: Arc<dyn AuthSource> = Arc::new(ControlPlaneScramAuthSource {
+        control_plane: Arc::clone(&control_plane),
+    });
     let query_parser = Arc::new(AnalyticsQueryParser {
         engine: Arc::clone(&engine),
     });
@@ -265,10 +264,10 @@ pub async fn serve_postgres_wire(
         engine,
         query_parser,
         auth_hook,
-        startup_auth,
     });
     let factory = Arc::new(AnalyticsPostgresFactory {
         handler: Arc::clone(&handler),
+        scram_auth_source,
     });
 
     loop {
@@ -372,6 +371,96 @@ pub async fn serve_flight_sql_with_label(
 
 struct AnalyticsPostgresFactory {
     handler: Arc<AnalyticsPostgresHandler>,
+    scram_auth_source: Arc<dyn AuthSource>,
+}
+
+/// Per-connection startup handler that creates a fresh SASL state machine for
+/// each connection and runs apply_post_startup_auth once the exchange finishes.
+struct PerConnectionStartupHandler {
+    sasl: SASLAuthStartupHandler<AnalyticsServerParameterProvider>,
+    auth_hook: Arc<dyn AuthHook>,
+}
+
+#[async_trait]
+impl StartupHandler for PerConnectionStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.sasl.on_startup(client, message).await?;
+
+        if matches!(client.state(), PgWireConnectionState::ReadyForQuery)
+            && !client
+                .metadata()
+                .contains_key(POSTGRES_AUTH_METHOD_METADATA)
+        {
+            self.apply_post_startup_auth(client).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl PerConnectionStartupHandler {
+    async fn apply_post_startup_auth<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo,
+    {
+        let user = client
+            .metadata()
+            .get(METADATA_USER)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let database = client
+            .metadata()
+            .get(METADATA_DATABASE)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let schema = client
+            .metadata()
+            .get(POSTGRES_SCHEMA_METADATA)
+            .cloned()
+            .unwrap_or_else(|| "public".to_string());
+
+        let decision = self
+            .auth_hook
+            .authenticate(&AuthRequest {
+                protocol: Protocol::PostgreSql,
+                user,
+                database,
+                schema,
+                role: client.metadata().get(POSTGRES_ROLE_METADATA).cloned(),
+                password: None,
+                auth_header: None,
+            })
+            .await
+            .map_err(status_to_pgwire)?;
+
+        client
+            .metadata_mut()
+            .insert(METADATA_USER.to_string(), decision.user);
+        client
+            .metadata_mut()
+            .insert(METADATA_DATABASE.to_string(), decision.database);
+        client
+            .metadata_mut()
+            .insert(POSTGRES_SCHEMA_METADATA.to_string(), decision.schema);
+        client
+            .metadata_mut()
+            .insert(POSTGRES_ROLE_METADATA.to_string(), decision.role);
+        client.metadata_mut().insert(
+            POSTGRES_AUTH_METHOD_METADATA.to_string(),
+            decision.auth_method,
+        );
+
+        Ok(())
+    }
 }
 
 impl PgWireServerHandlers for AnalyticsPostgresFactory {
@@ -384,7 +473,16 @@ impl PgWireServerHandlers for AnalyticsPostgresFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::clone(&self.handler)
+        // Fresh per-connection SASL state machine — SASLAuthStartupHandler holds
+        // per-connection Mutex<SASLState> so it must NOT be shared across connections.
+        let auth_source: Arc<dyn AuthSource> = self.scram_auth_source.clone();
+        Arc::new(PerConnectionStartupHandler {
+            sasl: SASLAuthStartupHandler::new(Arc::new(
+                AnalyticsServerParameterProvider::default(),
+            ))
+            .with_scram(ScramAuth::new(auth_source)),
+            auth_hook: Arc::clone(&self.handler.auth_hook),
+        })
     }
 }
 
@@ -392,7 +490,6 @@ struct AnalyticsPostgresHandler {
     engine: Arc<PrototypeEngine>,
     query_parser: Arc<AnalyticsQueryParser>,
     auth_hook: Arc<dyn AuthHook>,
-    startup_auth: SASLAuthStartupHandler<AnalyticsServerParameterProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -491,87 +588,6 @@ struct AnalyticsQueryParser {
     engine: Arc<PrototypeEngine>,
 }
 
-#[async_trait]
-impl StartupHandler for AnalyticsPostgresHandler {
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        self.startup_auth.on_startup(client, message).await?;
-
-        if matches!(client.state(), PgWireConnectionState::ReadyForQuery)
-            && !client
-                .metadata()
-                .contains_key(POSTGRES_AUTH_METHOD_METADATA)
-        {
-            self.apply_post_startup_auth(client).await?;
-        }
-
-        Ok(())
-    }
-}
-
-impl AnalyticsPostgresHandler {
-    async fn apply_post_startup_auth<C>(&self, client: &mut C) -> PgWireResult<()>
-    where
-        C: ClientInfo,
-    {
-        let user = client
-            .metadata()
-            .get(METADATA_USER)
-            .cloned()
-            .unwrap_or_else(|| "postgres".to_string());
-        let database = client
-            .metadata()
-            .get(METADATA_DATABASE)
-            .cloned()
-            .unwrap_or_else(|| "postgres".to_string());
-        let schema = client
-            .metadata()
-            .get(POSTGRES_SCHEMA_METADATA)
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
-
-        let decision = self
-            .auth_hook
-            .authenticate(&AuthRequest {
-                protocol: Protocol::PostgreSql,
-                user,
-                database,
-                schema,
-                role: client.metadata().get(POSTGRES_ROLE_METADATA).cloned(),
-                password: None,
-                auth_header: None,
-            })
-            .await
-            .map_err(status_to_pgwire)?;
-
-        client
-            .metadata_mut()
-            .insert(METADATA_USER.to_string(), decision.user);
-        client
-            .metadata_mut()
-            .insert(METADATA_DATABASE.to_string(), decision.database);
-        client
-            .metadata_mut()
-            .insert(POSTGRES_SCHEMA_METADATA.to_string(), decision.schema);
-        client
-            .metadata_mut()
-            .insert(POSTGRES_ROLE_METADATA.to_string(), decision.role);
-        client.metadata_mut().insert(
-            POSTGRES_AUTH_METHOD_METADATA.to_string(),
-            decision.auth_method,
-        );
-
-        Ok(())
-    }
-}
 
 #[async_trait]
 impl SimpleQueryHandler for AnalyticsPostgresHandler {
@@ -770,6 +786,30 @@ impl ExtendedQueryHandler for AnalyticsPostgresHandler {
     }
 }
 
+/// Parses a PostgreSQL-style timeout string into milliseconds.
+/// Bare integers are treated as milliseconds (PostgreSQL GUC convention).
+/// Recognises `ms`, `s`, `min`, `h` suffixes. Returns 0 on any parse error.
+fn parse_timeout_to_ms(s: &str) -> u64 {
+    let s = s.trim();
+    if s == "0" || s.is_empty() {
+        return 0;
+    }
+    if let Some(n) = s.strip_suffix("ms") {
+        return n.trim().parse::<u64>().unwrap_or(0);
+    }
+    if let Some(n) = s.strip_suffix("min") {
+        return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(60_000);
+    }
+    if let Some(n) = s.strip_suffix("h") {
+        return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(3_600_000);
+    }
+    if let Some(n) = s.strip_suffix('s') {
+        return n.trim().parse::<u64>().unwrap_or(0).saturating_mul(1_000);
+    }
+    // bare integer = milliseconds
+    s.parse::<u64>().unwrap_or(0)
+}
+
 fn postgres_session_from_client<C: ClientInfo>(client: &C) -> SessionContext {
     SessionContext {
         user: client
@@ -805,6 +845,22 @@ fn postgres_session_from_client<C: ClientInfo>(client: &C) -> SessionContext {
             .unwrap_or_else(|| "postgres-wire-startup".to_string()),
         protocol: Protocol::PostgreSql,
         transaction_status: analyticsdb_core::TransactionStatus::Idle,
+        statement_timeout_ms: parse_timeout_to_ms(
+            client
+                .metadata()
+                .get(&postgres_setting_metadata_key("statement_timeout"))
+                .map(|s| s.as_str())
+                .unwrap_or("0"),
+        ),
+        idle_in_transaction_timeout_ms: parse_timeout_to_ms(
+            client
+                .metadata()
+                .get(&postgres_setting_metadata_key(
+                    "idle_in_transaction_session_timeout",
+                ))
+                .map(|s| s.as_str())
+                .unwrap_or("0"),
+        ),
     }
 }
 
@@ -2582,6 +2638,8 @@ impl AnalyticsFlightSqlService {
             auth_method: "flight-sql-jwt".to_string(),
             protocol: analyticsdb_core::Protocol::ArrowFlightSql,
             transaction_status: analyticsdb_core::TransactionStatus::Idle,
+            statement_timeout_ms: 0,
+            idle_in_transaction_timeout_ms: 0,
         })
     }
 }
@@ -2600,6 +2658,8 @@ fn flight_session_from_metadata(metadata: &MetadataMap) -> SessionContext {
             .unwrap_or_else(|| "flight-sql-metadata".to_string()),
         protocol: Protocol::ArrowFlightSql,
         transaction_status: analyticsdb_core::TransactionStatus::Idle,
+        statement_timeout_ms: 0,
+        idle_in_transaction_timeout_ms: 0,
     }
 }
 
@@ -2612,6 +2672,8 @@ fn flight_session_for_database(session: &SessionContext, database: &str) -> Sess
         auth_method: session.auth_method.clone(),
         protocol: Protocol::ArrowFlightSql,
         transaction_status: analyticsdb_core::TransactionStatus::Idle,
+        statement_timeout_ms: session.statement_timeout_ms,
+        idle_in_transaction_timeout_ms: session.idle_in_transaction_timeout_ms,
     }
 }
 
@@ -4434,5 +4496,17 @@ mod tests {
         );
 
         assert!(result.is_err(), "decoding with wrong secret must fail");
+    }
+
+    #[test]
+    fn parse_timeout_to_ms_handles_all_formats() {
+        assert_eq!(super::parse_timeout_to_ms("0"), 0, "zero = unlimited");
+        assert_eq!(super::parse_timeout_to_ms(""), 0, "empty = unlimited");
+        assert_eq!(super::parse_timeout_to_ms("5000"), 5000, "bare integer = ms");
+        assert_eq!(super::parse_timeout_to_ms("5s"), 5000, "seconds suffix");
+        assert_eq!(super::parse_timeout_to_ms("100ms"), 100, "ms suffix");
+        assert_eq!(super::parse_timeout_to_ms("2min"), 120_000, "minutes suffix");
+        assert_eq!(super::parse_timeout_to_ms("1h"), 3_600_000, "hours suffix");
+        assert_eq!(super::parse_timeout_to_ms("garbage"), 0, "invalid = 0");
     }
 }

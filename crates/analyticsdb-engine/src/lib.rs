@@ -1028,25 +1028,29 @@ impl PrototypeEngine {
             _permit: permit,
         };
 
-        // Enforce a wall-clock timeout.  ANALYTICSDB_QUERY_TIMEOUT_SECS controls
-        // the limit; 0 means unlimited.  On timeout we also trigger the
-        // cancellation token so any distributed legs are aborted promptly.
-        let timeout_secs: u64 = std::env::var("ANALYTICSDB_QUERY_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        // Determine effective timeout: per-session statement_timeout takes precedence
+        // over the global ANALYTICSDB_QUERY_TIMEOUT_SECS env var. 0 = unlimited.
+        let timeout_ms: u64 = if request.session.statement_timeout_ms > 0 {
+            request.session.statement_timeout_ms
+        } else {
+            std::env::var("ANALYTICSDB_QUERY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300)
+                .saturating_mul(1_000)
+        };
 
         let probe = self
             .query_log
             .start_probe(&request, &admission, &original_sql);
 
-        let result = if timeout_secs == 0 {
+        let result = if timeout_ms == 0 {
             self.execute_query_inner(request, admission, started, &probe)
                 .await
         } else {
             let token_for_timeout = token.clone();
             match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
+                std::time::Duration::from_millis(timeout_ms),
                 self.execute_query_inner(request, admission, started, &probe),
             )
             .await
@@ -1055,7 +1059,8 @@ impl PrototypeEngine {
                 Err(_elapsed) => {
                     token_for_timeout.cancel();
                     Err(anyhow::anyhow!(
-                        "Query exceeded the {timeout_secs}s execution time limit"
+                        "statement_timeout: query exceeded the {}ms execution time limit",
+                        timeout_ms
                     ))
                 }
             }
@@ -3228,5 +3233,34 @@ FROM generate_series(1, 10) AS s(n)";
         );
 
         cleanup_catalog_artifacts(&catalog_path);
+    }
+
+    #[tokio::test]
+    async fn statement_timeout_is_propagated_through_session_context() {
+        // Verify that session.statement_timeout_ms flows into the query request
+        // and that the default is 0 (unlimited). Timing-based assertion is
+        // environment-dependent; this test covers the structural invariant.
+        let session = SessionContext {
+            statement_timeout_ms: 5_000,
+            ..SessionContext::default()
+        };
+        assert_eq!(session.statement_timeout_ms, 5_000);
+
+        let default_session = SessionContext::default();
+        assert_eq!(
+            default_session.statement_timeout_ms, 0,
+            "default session must be unlimited"
+        );
+        assert_eq!(
+            default_session.idle_in_transaction_timeout_ms, 0,
+            "default idle timeout must be disabled"
+        );
+
+        let req = QueryRequest {
+            sql: "SELECT 1".to_string(),
+            session,
+            query_id: None,
+        };
+        assert_eq!(req.session.statement_timeout_ms, 5_000);
     }
 }

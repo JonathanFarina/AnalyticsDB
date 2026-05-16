@@ -258,6 +258,8 @@ async fn execute_sql(
         },
         protocol,
         transaction_status: analyticsdb_core::TransactionStatus::Idle,
+        statement_timeout_ms: 0,
+        idle_in_transaction_timeout_ms: 0,
     };
 
     match options.protocol {

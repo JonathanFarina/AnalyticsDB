@@ -6379,3 +6379,186 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
 
     cleanup_catalog_artifacts(&catalog_path);
 }
+
+// D2: SCRAM-SHA-256 end-to-end parity test.
+// The server now uses SASLAuthStartupHandler; this verifies the full SCRAM
+// exchange succeeds with the correct password and fails with the wrong one.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_postgres_scram_sha256_auth_accepts_correct_password_and_rejects_wrong() {
+    let catalog_path = temp_catalog_path();
+    let (_server, addr) = start_postgres_server(&catalog_path).await;
+
+    // Correct password — SCRAM exchange must succeed.
+    let response = protocol_json_response_with_auth_context(
+        "postgres",
+        &addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("postgres"),
+        "SELECT 1 AS n",
+    );
+    assert_eq!(
+        response.rows,
+        vec![vec!["1".to_string()]],
+        "SCRAM auth should succeed with correct password"
+    );
+
+    // analytics_reader also has SCRAM verifiers from bootstrap.
+    let reader_resp = protocol_json_response_with_auth_context(
+        "postgres",
+        &addr,
+        None,
+        None,
+        "analytics_reader",
+        Some("analytics_reader"),
+        Some("analytics_reader"),
+        "SELECT 42 AS n",
+    );
+    assert_eq!(reader_resp.rows, vec![vec!["42".to_string()]]);
+
+    // Wrong password — SCRAM exchange must fail with an auth error.
+    let err = protocol_stderr_failure_with_auth_context(
+        "postgres",
+        &addr,
+        None,
+        None,
+        "postgres",
+        Some("postgres"),
+        Some("wrong-password"),
+        "SELECT 1",
+    );
+    let err_lower = err.to_ascii_lowercase();
+    assert!(
+        err_lower.contains("password") || err_lower.contains("auth") || err_lower.contains("sasl"),
+        "expected SCRAM auth rejection, got: {err}"
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+// D4 + D5: GRANT/REVOKE enforces table access on both PG and Flight SQL.
+// Uses a SQLite catalog (.db extension) so object_permissions are persisted.
+// Both servers share the same PrototypeEngine so in-memory state is consistent.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_grant_revoke_enforces_table_access_on_postgres_and_flight_sql() {
+    let catalog_path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("analyticsdb-cli-test-{}.db", uuid::Uuid::now_v7()));
+        p.to_string_lossy().into_owned()
+    };
+
+    // Shared engine so that DDL changes (CREATE USER, GRANT) are immediately
+    // visible to both PG and Flight SQL handlers.
+    let engine = Arc::new(
+        PrototypeEngine::from_catalog_path(&catalog_path)
+            .await
+            .expect("engine should initialize"),
+    );
+    let pg_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg listener");
+    let pg_addr = format!("127.0.0.1:{}", pg_listener.local_addr().unwrap().port());
+    let fl_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fl listener");
+    let fl_addr = format!("http://127.0.0.1:{}", fl_listener.local_addr().unwrap().port());
+    let _pg_task = {
+        let eng = Arc::clone(&engine);
+        tokio::spawn(serve_postgres_wire(pg_listener, eng))
+    };
+    let _fl_task = {
+        let eng = Arc::clone(&engine);
+        tokio::spawn(serve_flight_sql(fl_listener, eng, None))
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Admin: create table and insert a row.
+    protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "CREATE TABLE access_test (id INT, val TEXT)",
+    );
+    protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "INSERT INTO access_test VALUES (1, 'hello')",
+    );
+
+    // Admin: create a non-admin user.
+    protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "CREATE USER alice PASSWORD 'alicepass'",
+    );
+
+    // PG: alice is denied before any grant.
+    let err_pg = protocol_stderr_failure_with_auth_context(
+        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    let err_pg_lower = err_pg.to_ascii_lowercase();
+    assert!(
+        err_pg_lower.contains("permission") || err_pg_lower.contains("denied") || err_pg_lower.contains("error"),
+        "PG should deny alice before grant, got: {err_pg}"
+    );
+
+    // Flight SQL: alice is also denied before grant.
+    let err_fl = protocol_stderr_failure_with_auth_context(
+        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    let err_fl_lower = err_fl.to_ascii_lowercase();
+    assert!(
+        err_fl_lower.contains("permission") || err_fl_lower.contains("denied") || err_fl_lower.contains("error"),
+        "Flight SQL should deny alice before grant, got: {err_fl}"
+    );
+
+    // Admin: grant SELECT on the table to alice.
+    protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "GRANT SELECT ON TABLE access_test TO alice",
+    );
+
+    // PG: alice can now SELECT.
+    let resp_pg = protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    assert_eq!(resp_pg.rows.len(), 1, "PG: alice should see 1 row after grant");
+
+    // Flight SQL: alice can also SELECT.
+    let resp_fl = protocol_json_response_with_auth_context(
+        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    assert_eq!(resp_fl.rows.len(), 1, "Flight SQL: alice should see 1 row after grant");
+
+    // Admin: revoke SELECT from alice.
+    protocol_json_response_with_auth_context(
+        "postgres", &pg_addr, None, None, "postgres", Some("postgres"), Some("postgres"),
+        "REVOKE SELECT ON TABLE access_test FROM alice",
+    );
+
+    // PG: alice is denied again after revoke.
+    let err_after_pg = protocol_stderr_failure_with_auth_context(
+        "postgres", &pg_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    let err_after_pg_lower = err_after_pg.to_ascii_lowercase();
+    assert!(
+        err_after_pg_lower.contains("permission") || err_after_pg_lower.contains("denied") || err_after_pg_lower.contains("error"),
+        "PG should deny alice after revoke, got: {err_after_pg}"
+    );
+
+    // Flight SQL: alice is denied again after revoke.
+    let err_after_fl = protocol_stderr_failure_with_auth_context(
+        "flight-sql", &fl_addr, None, None, "alice", Some("alice"), Some("alicepass"),
+        "SELECT * FROM access_test",
+    );
+    let err_after_fl_lower = err_after_fl.to_ascii_lowercase();
+    assert!(
+        err_after_fl_lower.contains("permission") || err_after_fl_lower.contains("denied") || err_after_fl_lower.contains("error"),
+        "Flight SQL should deny alice after revoke, got: {err_after_fl}"
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
