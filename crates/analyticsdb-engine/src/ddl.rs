@@ -1877,24 +1877,43 @@ impl PrototypeEngine {
                     // 3. Physically rename managed directories
                     for relation in relations {
                         if let Some(storage_path_str) = &relation.storage_path {
-                            let (store, old_obj_prefix) =
-                                storage::store_for_location(storage_path_str)?;
-                            let old_part = format!("{}__{}__", name, relation.schema);
-                            let new_part = format!("{}__{}__", new_name, relation.schema);
-                            let new_location_str = storage_path_str.replace(&old_part, &new_part);
-                            let (_, new_obj_prefix) =
-                                storage::store_for_location(&new_location_str)?;
-                            storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix)
-                                .await?;
-                            self.control_plane
-                                .update_relation_storage_path(
-                                    &request.session,
-                                    Some(new_name),
-                                    Some(&relation.schema),
-                                    &relation.name,
-                                    &new_location_str,
+                            // Support both path formats:
+                            //   new hierarchical: …/db={name}/schema={schema}/table={t}
+                            //   legacy flat:      …/{name}__{schema}__{t}.table.parquet
+                            let new_location_str = {
+                                let hier_old = format!("/db={}/", name);
+                                let hier_new = format!("/db={}/", new_name);
+                                if storage_path_str.contains(&hier_old) {
+                                    storage_path_str.replace(&hier_old, &hier_new)
+                                } else {
+                                    let flat_old =
+                                        format!("{}__{}__", name, relation.schema);
+                                    let flat_new =
+                                        format!("{}__{}__", new_name, relation.schema);
+                                    storage_path_str.replace(&flat_old, &flat_new)
+                                }
+                            };
+                            if new_location_str != *storage_path_str {
+                                let (store, old_obj_prefix) =
+                                    storage::store_for_location(storage_path_str)?;
+                                let (_, new_obj_prefix) =
+                                    storage::store_for_location(&new_location_str)?;
+                                storage::rename_prefix(
+                                    &store,
+                                    &old_obj_prefix,
+                                    &new_obj_prefix,
                                 )
                                 .await?;
+                                self.control_plane
+                                    .update_relation_storage_path(
+                                        &request.session,
+                                        Some(new_name),
+                                        Some(&relation.schema),
+                                        &relation.name,
+                                        &new_location_str,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
 
