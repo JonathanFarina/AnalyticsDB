@@ -1,0 +1,6 @@
+apiVersion: v2
+name: analyticsdb
+version: 0.1.0
+appVersion: "0.1.0"
+description: AnalyticsDB Helm chart for Kubernetes deployment
+type: application

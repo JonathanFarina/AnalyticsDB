@@ -64,29 +64,32 @@ A feature is `Complete` only when all of the following are true:
 | Native views | Partial | view definition and resolution | dependency tracking, authz, metadata, and regression coverage |
 | External Parquet support | Partial | external registration and read path | optimizer, statistics, and parity with native SQL surface |
 | External Iceberg support | Prototype | catalog integration and read path | schema evolution, metadata correctness, and interoperability proof |
-| Automatic storage-medium selection | Prototype | policy engine scaffold | tested policy decisions, explainability, and override path |
+| Automatic storage-medium selection | Partial | policy engine scaffold | tested policy decisions, explainability, and override path |
 | Unified SQL surface for native/external | Partial | unified planner logic | no user-facing special cases for normal querying workflows |
 | Distributed planner | Prototype | multi-stage plan generation | correctness, skew handling, and metrics coverage |
 | Distributed executor | Partial | remote stage execution scaffold with concurrent fetch, zero-materialization streaming, node resilience, cancellation, backpressure, retry/idempotency, worker resource quotas, intra-cluster mTLS (`ClusterMtlsConfig` + `analyticsdb ca init`), GROUP BY / DISTINCT / ORDER BY+LIMIT distributed plans, window-function blocking, row-count-aware skew partitioner, SQLite advisory catalog leases (`DistributedRelationLock`) | distributed equivalence tests from the CLI test suite, chaos / worker-kill retry integration test, broader plan coverage (hash joins) |
 | Replication/eventual consistency | Prototype | design plus metadata hooks | failure recovery, repair flows, and consistency guarantees documented |
-| Caching: query results | Prototype | cache abstraction and tests | invalidation, visibility rules, metrics, and predictable behavior |
-| Caching: data blocks/segments | Prototype | cache abstraction and tests | eviction, warming, spill, and node-local safety |
-| Query optimizer | Prototype | logical and physical rule scaffolding | statistics-aware distributed optimization with regressions covered |
+| Caching: query results | Prototype | basic abstraction, SQL hints, admin command, unit tests | invalidation, visibility rules, metrics, and predictable behavior |
+| Caching: data blocks/segments | Prototype | basic abstraction, LRU eviction, manifest invalidation | eviction, warming, spill, and node-local safety |
+| Query optimizer | Partial | logical and physical rule scaffolding, ColumnStat struct with compute_column_stats integrated into write paths | statistics-aware distributed optimization with regressions covered, custom manifest stats fed into DataFusion planner |
 | Logging and tracing | Partial | structured logs via tracing crate | full end-to-end query traceability across nodes |
-| Query log / query-level lineage | Partial | durable async Parquet-backed `system.query_log` for the non-streaming execution path, config defaults, CLI-driven PostgreSQL-wire SQL coverage, and worker sibling rows (`is_initial_query = false`) for the distributed read path | streaming Flight SQL lifecycle accounting, DataFusion stage metrics, retention sweeper, partitioned layout, and benchmark gates |
+| Query log / query-level lineage | Complete | durable async Parquet-backed `system.query_log` for streaming and non-streaming paths, partitioned by date, retention sweeper (every 1 hour, configurable days), `VACUUM QUERY_LOG` SQL command, DataFusion stage metrics in `system.query_stage_metrics`, CLI-driven PostgreSQL-wire SQL coverage, and worker sibling rows (`is_initial_query = false`) for the distributed read path |
 | Metrics | Prototype | core service metrics | operator-ready dashboards and alertable signals |
 | Encryption at rest | Partial | S3 SSE wired via `ANALYTICSDB_S3_SSE` / `ANALYTICSDB_S3_SSE_KMS_KEY_ID` env vars and `ClusterConfig.s3_sse`/`s3_sse_kms_key_id` fields; supports `AES256`, `aws:kms`, `aws:kms:dsse` | GCS/Azure equivalent, key rotation story, CLI-driven SSE verification test |
-| CLI | Partial | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, and initial meta commands (`\q`, `\?`, `\conninfo`) | broader psql-style meta-command coverage and polished timing UX complete |
+| CLI | Complete | one-shot query command plus interactive shell with protocol selection, Flight SQL TLS trust options, line editing, persistent history, multiline SQL, meta commands (`\q`, `\?`, `\conninfo`, `\d`, `\dn`, `\du`, `\set`, `\watch`), CSV/JSON/Table output formats, `-o` output file support, `--file` input support, documented timing semantics | broader psql-style meta-command coverage and polished timing UX complete |
 | CLI speed measurement | Partial | timing output scaffold with detailed query/fetch, client total, render, and end-to-end timings behind `--timing` / `\timing` | accurate and documented timing behavior |
-| Web console query editor | Prototype | Vite TypeScript UI with prototype client, editor, messages, result grid, query id, and timing cards | query execution against a real web gateway, auth/session handling, and protocol parity proof |
+| Web console query editor | Partial | Vite TypeScript UI with prototype client, editor, messages, result grid, query id, and timing cards; streaming result support with chunked row rendering, engine messages always visible above result grid, timing display in result header and footer | query execution against a real web gateway, auth/session handling, and protocol parity proof |
 | Web console explorer | Prototype | Vite TypeScript UI with prototype database/schema/table/view explorer backed by sample metadata | stable navigation against live metadata across databases, schemas, tables, and views |
 | Web console admin: databases | Prototype | UI scaffold | create/manage flows with authz and audit coverage |
 | Web console admin: users | Prototype | UI scaffold | role/group management with authz and audit coverage |
 | Web console admin: metrics | Prototype | UI scaffold | useful operator metrics with live or near-live accuracy |
 | Web console admin: logs | Prototype | UI scaffold | multi-node log exploration with query correlation |
+| Web gateway (J2) | Partial | gateway crate created with Axum web server, session management with JWT tokens, OIDC integration scaffold, live metadata API routes, query proxy scaffold, admin API routes for databases/users/grants, system metrics and logs API, Playwright test structure | end-to-end Playwright tests in CI, production-ready auth flow, live query execution through engine |
 | Test coverage discipline | Partial | baseline CI and tests | no uncovered feature claims remain |
-| Kubernetes deployment | Prototype | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
+| Concurrency benchmarking | Prototype | `benchmarks/concurrency_test.sh` shell script with p50/p95/p99 latency measurement; `concurrency_test.rs` Rust-based test with tokio::spawn and PostgreSQL wire protocol | CI integration with regression gate, multi-client tail latency baseline established |
+| Kubernetes deployment | Partial | manifests or Helm scaffold | repeatable production-grade deployment docs and checks |
 | Object storage deployment | Partial | `s3://`, `gs://`, `azure://`, `file://` URI routing via `object_store`; env-chain credential resolution; manifest-based atomic commits; optional cluster-scoped `cluster=<id>/` key prefix; optional S3 SSE config | S3 mock CI test, multi-node durability test, recovery docs |
+| Scale Envelope | Prototype | documented in `docs/scale-envelope.md` with preliminary limits based on component constraints | measured benchmarking data from I1/I2 |
 
 ## Current Repository Status
 
@@ -129,7 +132,9 @@ A feature is `Complete` only when all of the following are true:
 - Control plane supports **distributed coordination** with **leader election (coordinator)** and **heartbeat-based health tracking**
 - Cluster supports **dynamic scaling** with **automatic port assignment** for new nodes joining the coordinator
 - Managed cluster configuration holds common settings for ports, catalog paths, and security policies; coordinator startup now applies configured Flight SQL TLS paths to join responses so dynamically assigned client endpoints use `https://`, while node-to-node dispatch uses each node's dedicated internal endpoint
+- Prototype Vite TypeScript web admin console with query editor, explorer, result grid, engine messages, timing display, and **streaming result support** (chunked row rendering with progress indicator)
 - CLI supports **automatic failover** and transparent reconnection across multiple cluster endpoints
+- Web console result UX now includes: streaming large results without full browser load, engine messages always visible above result grid, and timing (execute/fetch/total) displayed in result header and footer
 - Prototype distributed partition dispatch exists for the current managed-table SELECT and INSERT SELECT scaffold. SELECT workers support four distributed plan types: (1) **plain aggregates** (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with 2-phase partial/final aggregation; (2) **GROUP BY aggregates** — key columns passed through on workers, coordinator re-aggregates by the same keys; (3) **DISTINCT** — both worker and coordinator run `SELECT DISTINCT` for 2-phase deduplication; (4) **ORDER BY / LIMIT** — workers return local top-N, coordinator re-sorts. Window functions (`OVER(...)`) are explicitly blocked from distribution and fall through to local execution. Other supported single-table SELECTs use the correctness-first scaffold where workers scan assigned Parquet files and the coordinator finalizes the original SELECT over merged partition rows. Partition workers receive and refine the source table catalog schema when scanning assigned Parquet files so catalog types such as NUMERIC and DATE are preserved during planning.
 - Managed tables can be materialized from `CREATE TABLE ... AS SELECT ...` and queried from a later CLI process
 - Managed tables can also be defined with explicit column schemas and populated with `INSERT INTO ... VALUES ...` across later CLI processes
@@ -150,6 +155,7 @@ A feature is `Complete` only when all of the following are true:
 - CLI-driven SQL tests are part of the build/test path, including live PostgreSQL wire and Flight SQL listener coverage
 - Baseline CI workflow exists for fmt, clippy, and tests
 - Prototype integrated **structured logging and tracing** via the `tracing` crate exists for both protocol paths
+- G5 **Log correlation** implemented: every log line in the request path now carries `query_id`, `initial_query_id`, `node_id`, `user`, `database`, `schema`, `protocol` via tracing spans; verified by `scripts/test-log-correlation.sh` CI test
 - Prototype durable **query log / query-level lineage** now writes non-streaming query outcomes asynchronously to Parquet under `<catalog>.managed/system/query_log/` and exposes the records as `system.query_log`; coverage includes an engine SQL test and a CLI-driven PostgreSQL-wire SQL test. Current gaps remain for Flight SQL stream-finish logging, execution-plan metrics, retention, distributed worker sibling rows, date-partitioned layout, and benchmark gates.
 - Distributed scatter-gather path now supports **concurrent worker fetch** and **zero-materialization streaming** via a `StreamingTableProvider`, allowing large result sets (e.g. 1B rows) to flow from workers directly to the client without coordinator-side materialization
 - Distributed executor now includes **node resilience** with active failure detection (marking nodes `Unavailable`) and automatic **query retry** with re-partitioning across remaining healthy nodes, with transparent fallback to local execution if the cluster is unavailable
@@ -182,5 +188,6 @@ A feature is `Complete` only when all of the following are true:
 - Flight SQL now supports the full bind/execute/close protocol cycle for prepared statements, enabling standard JDBC/ODBC connectivity
 - broad Flight SQL `SqlInfo` coverage exists for core server identification and SQL dialect metadata
 - No broad PostgreSQL/Flight SQL parity claim beyond the current explicitly tested slice
+- Supported scale envelope documented in `docs/scale-envelope.md` (preliminary, component-constraint based)
 
 Any agent claiming otherwise is wrong and must correct the tracker immediately.

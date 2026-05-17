@@ -129,14 +129,26 @@ fn run_ca_init(opts: &CaInitOptions) -> Result<()> {
 }
 
 async fn run_query(options: QueryOptions) -> Result<()> {
-    let sql = options.sql.clone();
+    let sql = if let Some(file_path) = &options.file {
+        std::fs::read_to_string(file_path)
+            .with_context(|| format!("failed to read SQL file '{}'", file_path.display()))?
+    } else if let Some(sql) = &options.sql {
+        sql.clone()
+    } else {
+        bail!("Either --sql or --file must be provided");
+    };
     let params = options.params.clone();
     let client_options = ClientOptions::from_query(options);
     let started_at = Instant::now();
     let response = execute_sql(sql, &client_options, params).await?;
     let response_received_at = Instant::now();
 
-    render_response(&response, client_options.format);
+    let rendered = render_response(&response, client_options.format);
+    if let Some(output_path) = &client_options.output_file {
+        std::fs::write(output_path, rendered)?;
+    } else {
+        print!("{rendered}");
+    }
     let rendered_at = Instant::now();
     if client_options.timing {
         render_timing(
@@ -181,6 +193,11 @@ async fn run_interactive(options: InteractiveOptions) -> Result<()> {
                     match handle_meta_command(trimmed, &mut client_options)? {
                         MetaCommandAction::Continue => continue,
                         MetaCommandAction::Quit => break,
+                        MetaCommandAction::ExecuteSql(sql) => {
+                            buffer.clear();
+                            buffer.push_str(&sql);
+                            buffer.push('\n');
+                        }
                     }
                 }
 
@@ -195,11 +212,18 @@ async fn run_interactive(options: InteractiveOptions) -> Result<()> {
                     let sql = buffer.trim().to_string();
                     buffer.clear();
 
+                    client_options.last_sql = Some(sql.clone());
+
                     let started_at = Instant::now();
                     match execute_sql(sql, &client_options, Vec::new()).await {
                         Ok(response) => {
                             let response_received_at = Instant::now();
-                            render_response(&response, client_options.format);
+                            let rendered = render_response(&response, client_options.format);
+                            if let Some(output_path) = &client_options.output_file {
+                                std::fs::write(output_path, rendered)?;
+                            } else {
+                                print!("{rendered}");
+                            }
                             let rendered_at = Instant::now();
                             if client_options.timing {
                                 render_timing(
@@ -209,6 +233,39 @@ async fn run_interactive(options: InteractiveOptions) -> Result<()> {
                                     rendered_at.duration_since(started_at).as_millis(),
                                     client_options.format,
                                 );
+                            }
+
+                            if let Some(interval) = client_options.watch_interval {
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                                    if let Some(ref sql) = client_options.last_sql {
+                                        match execute_sql(sql.clone(), &client_options, Vec::new()).await {
+                                            Ok(response) => {
+                                                let response_received_at = Instant::now();
+                                                let rendered = render_response(&response, client_options.format);
+                                                if let Some(output_path) = &client_options.output_file {
+                                                    std::fs::write(output_path, rendered)?;
+                                                } else {
+                                                    print!("{rendered}");
+                                                }
+                                                let rendered_at = Instant::now();
+                                                if client_options.timing {
+                                                    render_timing(
+                                                        &response,
+                                                        response_received_at.duration_since(started_at).as_millis(),
+                                                        rendered_at.duration_since(response_received_at).as_millis(),
+                                                        rendered_at.duration_since(started_at).as_millis(),
+                                                        client_options.format,
+                                                    );
+                                                }
+                                            }
+                                            Err(error) => eprintln!("ERROR: {error:#}"),
+                                        }
+                                    } else {
+                                        eprintln!("No query to watch.");
+                                        break;
+                                    }
+                                }
                             }
                         }
                         Err(error) => eprintln!("ERROR: {error:#}"),
@@ -875,21 +932,76 @@ fn flush_top_level_keyword(keywords: &mut Vec<String>, current: &mut String, par
     }
 }
 
-fn render_response(response: &QueryResponse, format: OutputFormat) {
+fn render_response(response: &QueryResponse, format: OutputFormat) -> String {
     match format {
         OutputFormat::Table => render_table(response),
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(response).expect("response should serialize")
-            );
+            serde_json::to_string_pretty(response).expect("response should serialize")
+        }
+        OutputFormat::Csv => render_csv(response),
+    }
+}
+
+fn render_csv(response: &QueryResponse) -> String {
+    let mut output = String::new();
+    if !response.columns.is_empty() {
+        output.push_str(&response.columns.join(","));
+        output.push('\n');
+        for row in &response.rows {
+            let escaped: Vec<String> = row.iter().map(|v| {
+                if v.contains(',') || v.contains('"') || v.contains('\n') {
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                } else {
+                    v.clone()
+                }
+            }).collect();
+            output.push_str(&escaped.join(","));
+            output.push('\n');
         }
     }
+    output
+}
+
+fn render_table(response: &QueryResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Query ID: {}\n", response.query_id));
+    output.push_str(&format!("Coordinator: {}\n", response.coordinator_node_id));
+    output.push_str(&format!(
+        "Session: user={} database={} schema={}\n",
+        response.session.user, response.session.database, response.session.schema
+    ));
+    output.push_str(&format!("Message: {}\n", response.message));
+    output.push_str(&format!("Execution Time: {} ms\n", response.execution_time_ms));
+
+    if response.columns.is_empty() {
+        output.push_str("No columns returned.\n");
+        return output;
+    }
+
+    let mut widths: Vec<usize> = response.columns.iter().map(|column| column.len()).collect();
+    for row in &response.rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(value.len());
+        }
+    }
+
+    let divider = build_divider(&widths);
+    output.push_str(&format!("{divider}\n"));
+    output.push_str(&format!("| {} |\n", format_cells(&response.columns, &widths)));
+    output.push_str(&format!("{divider}\n"));
+
+    for row in &response.rows {
+        output.push_str(&format!("| {} |\n", format_cells(row, &widths)));
+    }
+
+    output.push_str(&format!("{divider}\n"));
+    output.push_str(&format!("Rows: {}\n", response.row_count()));
+    output
 }
 
 fn handle_meta_command(command: &str, options: &mut ClientOptions) -> Result<MetaCommandAction> {
     let trimmed = command.trim();
-    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
     match parts.as_slice() {
         ["\\timing"] => {
             options.timing = !options.timing;
@@ -906,23 +1018,62 @@ fn handle_meta_command(command: &str, options: &mut ClientOptions) -> Result<Met
             println!("Timing is off.");
             Ok(MetaCommandAction::Continue)
         }
-        _ => match trimmed {
-            "\\q" | "\\quit" => Ok(MetaCommandAction::Quit),
-            "\\?" | "\\help" => {
-                print_interactive_help();
-                Ok(MetaCommandAction::Continue)
+        ["\\q"] | ["\\quit"] => Ok(MetaCommandAction::Quit),
+        ["\\?"] | ["\\help"] => {
+            print_interactive_help();
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\conninfo"] => {
+            print_connection_info(options);
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\d", table] => {
+            Ok(MetaCommandAction::ExecuteSql(format!("SHOW COLUMNS FROM {table}")))
+        }
+        ["\\dn"] => {
+            Ok(MetaCommandAction::ExecuteSql("SHOW SCHEMAS".to_string()))
+        }
+        ["\\du"] => {
+            Ok(MetaCommandAction::ExecuteSql(
+                "SELECT rolname, rolsuper, rolcreatedb, rolcanlogin FROM pg_roles ORDER BY rolname"
+                    .to_string(),
+            ))
+        }
+        ["\\set"] => {
+            if options.variables.is_empty() {
+                println!("No variables set.");
+            } else {
+                for (k, v) in &options.variables {
+                    println!("{k}={v}");
+                }
             }
-            "\\conninfo" => {
-                print_connection_info(options);
-                Ok(MetaCommandAction::Continue)
-            }
-            _ => {
-                bail!(
-                    "unknown meta command '{}'. Type \\? for available commands.",
-                    command
-                )
-            }
-        },
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\set", var, value] => {
+            options.variables.insert(var.to_string(), value.to_string());
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\set", var] => {
+            options.variables.remove(*var);
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\watch"] => {
+            options.watch_interval = Some(2);
+            println!("Watching last query every 2 seconds. Press Ctrl+C to stop.");
+            Ok(MetaCommandAction::Continue)
+        }
+        ["\\watch", seconds_str] => {
+            let seconds = seconds_str.parse().unwrap_or(2);
+            options.watch_interval = Some(seconds);
+            println!("Watching last query every {seconds} seconds. Press Ctrl+C to stop.");
+            Ok(MetaCommandAction::Continue)
+        }
+        _ => {
+            bail!(
+                "unknown meta command '{}'. Type \\? for available commands.",
+                command
+            )
+        }
     }
 }
 
@@ -932,6 +1083,11 @@ fn print_interactive_help() {
     println!("  \\?, \\help      show this help");
     println!("  \\conninfo      show current connection/session options");
     println!("  \\timing [on|off] toggle detailed timing output");
+    println!("  \\d <table>     describe table (columns, types)");
+    println!("  \\dn            list schemas");
+    println!("  \\du            list users/roles");
+    println!("  \\set [var] [value] set or list variables");
+    println!("  \\watch [seconds] execute last query every N seconds (default 2)");
     println!();
     println!("SQL input:");
     println!("  End SQL statements with ';'. Multiline statements are supported.");
@@ -998,42 +1154,7 @@ fn sql_statement_is_complete(sql: &str) -> bool {
     last_significant == Some(';') && !in_single_quote && !in_double_quote
 }
 
-fn render_table(response: &QueryResponse) {
-    println!("Query ID: {}", response.query_id);
-    println!("Coordinator: {}", response.coordinator_node_id);
-    println!(
-        "Session: user={} database={} schema={}",
-        response.session.user, response.session.database, response.session.schema
-    );
-    println!("Message: {}", response.message);
-    println!("Execution Time: {} ms", response.execution_time_ms);
 
-    if response.columns.is_empty() {
-        println!("No columns returned.");
-        return;
-    }
-
-    let mut widths: Vec<usize> = response.columns.iter().map(|column| column.len()).collect();
-
-    for row in &response.rows {
-        for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(value.len());
-        }
-    }
-
-    let divider = build_divider(&widths);
-
-    println!("{divider}");
-    println!("| {} |", format_cells(&response.columns, &widths));
-    println!("{divider}");
-
-    for row in &response.rows {
-        println!("| {} |", format_cells(row, &widths));
-    }
-
-    println!("{divider}");
-    println!("Rows: {}", response.row_count());
-}
 
 fn render_timing(
     response: &QueryResponse,
@@ -1048,7 +1169,7 @@ fn render_timing(
     );
     match format {
         OutputFormat::Table => println!("{text}"),
-        OutputFormat::Json => eprintln!("{text}"),
+        OutputFormat::Json | OutputFormat::Csv => eprintln!("{text}"),
     }
 }
 
@@ -1115,7 +1236,9 @@ struct CaInitOptions {
 #[derive(Clone, Debug, Parser)]
 struct QueryOptions {
     #[arg(long)]
-    sql: String,
+    sql: Option<String>,
+    #[arg(long)]
+    file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t = ClientProtocol::Embedded)]
@@ -1142,6 +1265,8 @@ struct QueryOptions {
     params: Vec<String>,
     #[arg(long)]
     timing: bool,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -1170,6 +1295,8 @@ struct InteractiveOptions {
     tls_domain: Option<String>,
     #[arg(long)]
     timing: bool,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -1186,6 +1313,10 @@ struct ClientOptions {
     tls_ca_cert: Option<String>,
     tls_domain: Option<String>,
     timing: bool,
+    output_file: Option<PathBuf>,
+    variables: std::collections::HashMap<String, String>,
+    watch_interval: Option<u64>,
+    last_sql: Option<String>,
 }
 
 impl ClientOptions {
@@ -1203,6 +1334,10 @@ impl ClientOptions {
             tls_ca_cert: options.tls_ca_cert,
             tls_domain: options.tls_domain,
             timing: options.timing,
+            output_file: options.output,
+            variables: std::collections::HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
         }
     }
 
@@ -1220,6 +1355,10 @@ impl ClientOptions {
             tls_ca_cert: options.tls_ca_cert,
             tls_domain: options.tls_domain,
             timing: options.timing,
+            output_file: options.output,
+            variables: std::collections::HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
         }
     }
 }
@@ -1227,6 +1366,7 @@ impl ClientOptions {
 enum MetaCommandAction {
     Continue,
     Quit,
+    ExecuteSql(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1240,6 +1380,7 @@ struct HandshakeAuthDecision {
 enum OutputFormat {
     Table,
     Json,
+    Csv,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1300,6 +1441,7 @@ impl CliParamValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn interactive_sql_completion_requires_semicolon_outside_quotes() {
@@ -1328,6 +1470,10 @@ mod tests {
             tls_ca_cert: None,
             tls_domain: None,
             timing: false,
+            output_file: None,
+            variables: HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
         };
 
         assert!(matches!(
@@ -1356,6 +1502,10 @@ mod tests {
             tls_ca_cert: None,
             tls_domain: None,
             timing: false,
+            output_file: None,
+            variables: HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
         };
 
         assert!(matches!(
@@ -1367,5 +1517,97 @@ mod tests {
         assert!(!options.timing);
         handle_meta_command("\\timing on", &mut options).expect("\\timing on should parse");
         assert!(options.timing);
+    }
+
+    #[test]
+    fn test_output_format_has_csv() {
+        let formats = OutputFormat::value_variants();
+        assert!(formats.contains(&OutputFormat::Csv));
+    }
+
+    #[test]
+    fn test_meta_command_d_returns_execute_sql() {
+        let mut options = ClientOptions {
+            format: OutputFormat::Table,
+            protocol: ClientProtocol::Embedded,
+            database: "postgres".to_string(),
+            role: None,
+            password: None,
+            schema: "public".to_string(),
+            user: "postgres".to_string(),
+            catalog_path: "analyticsdb-catalog.db".to_string(),
+            endpoint: None,
+            tls_ca_cert: None,
+            tls_domain: None,
+            timing: false,
+            output_file: None,
+            variables: HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
+        };
+        match handle_meta_command("\\d mytable", &mut options).unwrap() {
+            MetaCommandAction::ExecuteSql(sql) => {
+                assert_eq!(sql, "SHOW COLUMNS FROM mytable");
+            }
+            _ => panic!("Expected ExecuteSql"),
+        }
+    }
+
+    #[test]
+    fn test_meta_command_dn_returns_show_schemas() {
+        let mut options = ClientOptions {
+            format: OutputFormat::Table,
+            protocol: ClientProtocol::Embedded,
+            database: "postgres".to_string(),
+            role: None,
+            password: None,
+            schema: "public".to_string(),
+            user: "postgres".to_string(),
+            catalog_path: "analyticsdb-catalog.db".to_string(),
+            endpoint: None,
+            tls_ca_cert: None,
+            tls_domain: None,
+            timing: false,
+            output_file: None,
+            variables: HashMap::new(),
+            watch_interval: None,
+            last_sql: None,
+        };
+        match handle_meta_command("\\dn", &mut options).unwrap() {
+            MetaCommandAction::ExecuteSql(sql) => {
+                assert_eq!(sql, "SHOW SCHEMAS");
+            }
+            _ => panic!("Expected ExecuteSql"),
+        }
+    }
+
+    #[test]
+    fn test_render_csv() {
+        let response = QueryResponse {
+            query_id: "test".to_string(),
+            coordinator_node_id: "test".to_string(),
+            session: SessionContext {
+                user: "postgres".to_string(),
+                role: "postgres".to_string(),
+                database: "postgres".to_string(),
+                schema: "public".to_string(),
+                auth_method: "embedded".to_string(),
+                protocol: Protocol::Embedded,
+                transaction_status: analyticsdb_core::TransactionStatus::Idle,
+                statement_timeout_ms: 0,
+                idle_in_transaction_timeout_ms: 0,
+            },
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+            ],
+            message: "Query executed.".to_string(),
+            execution_time_ms: 100,
+        };
+        let csv = render_csv(&response);
+        assert!(csv.contains("id,name"));
+        assert!(csv.contains("1,Alice"));
+        assert!(csv.contains("2,Bob"));
     }
 }

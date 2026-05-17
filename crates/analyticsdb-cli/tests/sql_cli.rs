@@ -5329,6 +5329,125 @@ async fn cli_registers_external_parquet_table_and_queries_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_external_table_parity_with_managed() {
+    let catalog_path = temp_catalog_path();
+    let (_server, endpoint) = start_postgres_server(&catalog_path).await;
+
+    // 1. Create managed table with various column types
+    protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "CREATE TABLE parity_test (
+            id INT,
+            name TEXT,
+            score DOUBLE PRECISION,
+            created_at TIMESTAMP
+        )",
+    );
+
+    // 2. Insert test data
+    protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "INSERT INTO parity_test VALUES 
+            (1, 'Alice', 95.5, '2024-01-01 00:00:00'),
+            (2, 'Bob', 88.0, '2024-01-02 00:00:00'),
+            (3, 'Charlie', 92.3, '2024-01-03 00:00:00')",
+    );
+
+    // 3. Verify managed table row count
+    let managed_count = protocol_json_response(
+        "postgres",
+        &endpoint,
+        None,
+        "SELECT COUNT(*) FROM parity_test",
+    );
+    assert_eq!(
+        managed_count.rows,
+        vec![vec!["3".to_string()]],
+        "Managed table should have 3 rows"
+    );
+
+    // 4. Locate managed table's Parquet file
+    let managed_dir = managed_table_storage_dir(&catalog_path, "postgres", "public", "parity_test");
+    assert!(
+        managed_dir.exists(),
+        "Managed table directory should exist: {}",
+        managed_dir.display()
+    );
+
+    let mut parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir)
+        .expect("Should read managed table directory")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "parquet" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        !parquet_files.is_empty(),
+        "Managed table should have Parquet files"
+    );
+    let parquet_path = parquet_files[0].to_string_lossy().into_owned();
+
+    // 5. Create external table pointing to the same Parquet file
+    let create_external_sql = format!(
+        "CREATE EXTERNAL TABLE parity_test_external STORED AS PARQUET LOCATION '{parquet_path}'"
+    );
+    protocol_json_response("postgres", &endpoint, None, &create_external_sql);
+
+    // 6. Verify external table is registered
+    let show_tables = protocol_json_response("postgres", &endpoint, None, "SHOW TABLES");
+    assert!(
+        show_tables.rows.iter().any(|row| row[0] == "parity_test_external"),
+        "External table should be listed in SHOW TABLES"
+    );
+
+    // 7. Run parity queries on both tables and compare results
+    let parity_queries = vec![
+        (
+            "SELECT * FROM parity_test ORDER BY id",
+            "SELECT * FROM parity_test_external ORDER BY id",
+        ),
+        (
+            "SELECT COUNT(*) FROM parity_test",
+            "SELECT COUNT(*) FROM parity_test_external",
+        ),
+        (
+            "SELECT id, name FROM parity_test WHERE name = 'Alice'",
+            "SELECT id, name FROM parity_test_external WHERE name = 'Alice'",
+        ),
+        (
+            "SELECT COUNT(*), SUM(score) FROM parity_test",
+            "SELECT COUNT(*), SUM(score) FROM parity_test_external",
+        ),
+    ];
+
+    for (managed_sql, external_sql) in parity_queries {
+        let managed_resp = protocol_json_response("postgres", &endpoint, None, managed_sql);
+        let external_resp = protocol_json_response("postgres", &endpoint, None, external_sql);
+
+        assert_eq!(
+            managed_resp.columns, external_resp.columns,
+            "Column names must match for query: {managed_sql}"
+        );
+        assert_eq!(
+            managed_resp.rows, external_resp.rows,
+            "Row data must match for query: {managed_sql}"
+        );
+    }
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_ddl_comprehensive_lifecycle() {
     let catalog_path = temp_catalog_path();
     let (_server, endpoint) = start_postgres_server(&catalog_path).await;
@@ -7331,4 +7450,83 @@ async fn cli_boolean_type_roundtrips_correctly() {
     assert_eq!(pg.rows[1][1], fl.rows[1][1], "boolean: label column mismatch for row 1");
 
     cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test]
+async fn vacuum_query_log_succeeds() {
+    let catalog_path = setup_temp_catalog().await;
+    let mut cmd = start_embedded_cli(&catalog_path).await;
+
+    // Execute a query to generate log entry
+    cmd.write_stdin("SELECT 1;\n").assert().success();
+
+    // Run VACUUM QUERY_LOG (should not error)
+    let output = cmd.write_stdin("VACUUM QUERY_LOG;\n")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.to_lowercase().contains("query log vacuum") || stdout.contains("completed"),
+        "VACUUM QUERY_LOG should succeed: {}",
+        stdout
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test]
+async fn query_log_entry_created_after_query() {
+    let catalog_path = setup_temp_catalog().await;
+    let mut cmd = start_embedded_cli(&catalog_path).await;
+
+    // Execute a query
+    cmd.write_stdin("SELECT 1 AS test_col;\n").assert().success();
+
+    // Query system.query_log (if exposed as table)
+    let output = cmd.write_stdin("SELECT query FROM system.query_log;\n")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("SELECT 1") || stdout.contains("test_col"),
+        "Query log should contain the executed query: {}",
+        stdout
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test]
+async fn test_statistics_influence_plan() {
+    // Start embedded mode
+    let mut cmd = Command::cargo_bin("analyticsdb-cli").unwrap();
+    cmd.arg("--embedded")
+        .arg("--database=stats_test_db")
+        .arg("--schema=public")
+        .timeout(std::time::Duration::from_secs(30));
+
+    // Create table
+    let output = cmd.write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
+        .assert()
+        .success();
+
+    // Insert data with known range (id 1-3)
+    cmd.write_stdin("INSERT INTO stats_test VALUES (1, 1.0), (2, 2.0), (3, 3.0);\n")
+        .assert()
+        .success();
+
+    // Explain query with filter outside range (id=999)
+    let output = cmd.write_stdin("EXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    // Verify plan uses statistics (either shows statistics or empty result due to stats)
+    assert!(
+        stdout.contains("statistics") || stdout.contains("EmptyExec") || stdout.contains("Statistics"),
+        "Plan should reflect statistics usage: {}",
+        stdout
+    );
 }

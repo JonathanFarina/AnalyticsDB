@@ -20,7 +20,7 @@ use uuid::Uuid;
 const ARGON2ID_PREFIX: &str = "$argon2id$";
 
 /// Hashes `password` with Argon2id and returns a PHC string suitable for storage.
-fn hash_password(password: &str) -> Result<String> {
+pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -34,7 +34,7 @@ fn hash_password(password: &str) -> Result<String> {
 /// remains functional during the migration window.  Any login with a plaintext
 /// credential that succeeds triggers an in-place re-hash on the next write
 /// (see `authenticate_user`).
-fn verify_password(provided: &str, stored: &str) -> bool {
+pub fn verify_password(provided: &str, stored: &str) -> bool {
     if stored.starts_with(ARGON2ID_PREFIX) {
         let Ok(hash) = PasswordHash::new(stored) else { return false };
         Argon2::default()
@@ -176,6 +176,26 @@ pub enum CatalogRelationKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExternalStorageFormat {
     Parquet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StoragePolicyType {
+    #[serde(rename = "managed")]
+    Managed,
+    #[serde(rename = "external")]
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePolicy {
+    pub database: String,
+    pub schema: String,
+    pub table_name: String,
+    pub policy_type: StoragePolicyType,
+    #[serde(default)]
+    pub auto_select: bool,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,6 +428,8 @@ pub(crate) struct CatalogState {
     /// their cached snapshot is stale.
     #[serde(default)]
     pub(crate) catalogue_version: u64,
+    #[serde(default)]
+    pub(crate) storage_policies: BTreeMap<String, StoragePolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -758,6 +780,7 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
     },
+    VacuumQueryLog,
     GrantPrivilege {
         grantee: String,
         object_type: String,
@@ -784,6 +807,10 @@ pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
 struct NodeLiveness {
     status: NodeStatus,
     last_heartbeat_at_epoch_ms: u128,
+}
+
+fn relation_key(database: &str, schema: &str, table: &str) -> String {
+    format!("{}.{}.{}", database, schema, table)
 }
 
 #[derive(Debug)]
@@ -994,6 +1021,26 @@ impl ControlPlane {
             relations: state.relations.values().cloned().collect(),
             functions: state.functions.values().cloned().collect(),
         }
+    }
+
+    pub async fn get_storage_policy(
+        &self,
+        database: &str,
+        schema: &str,
+        table_name: &str,
+    ) -> Option<StoragePolicy> {
+        let key = relation_key(database, schema, table_name);
+        let state = self.state.read().await;
+        state.storage_policies.get(&key).cloned()
+    }
+
+    pub async fn set_storage_policy(&self, policy: StoragePolicy) -> Result<()> {
+        let key = relation_key(&policy.database, &policy.schema, &policy.table_name);
+        let mut state = self.state.write().await;
+        state.storage_policies.insert(key, policy);
+        drop(state);
+        self.persist().await?;
+        Ok(())
     }
 
     pub async fn execute_metadata_statement(
@@ -1256,7 +1303,8 @@ impl ControlPlane {
             | MetadataStatement::DropDatabase { .. }
             | MetadataStatement::DropSchema { .. }
             | MetadataStatement::KillQuery { .. }
-            | MetadataStatement::VacuumTable { .. } => {
+            | MetadataStatement::VacuumTable { .. }
+            | MetadataStatement::VacuumQueryLog { .. } => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases => {
@@ -1683,6 +1731,36 @@ impl ControlPlane {
                         rel.database = new_name.to_string();
                         let new_key = relation_key(&rel.database, &rel.schema, &rel.name);
                         state.relations.insert(new_key, rel);
+                    }
+
+                    // Rename physical storage directory
+                    if let Some(catalog_path) = &self.catalog_path {
+                        eprintln!("DEBUG: Renaming database storage, catalog_path={:?}", catalog_path);
+                        let stem = catalog_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .ok_or_else(|| anyhow::anyhow!("Invalid catalog path"))?;
+                        let mut managed_root = catalog_path.clone();
+                        managed_root.set_file_name(format!("{}.managed", stem));
+                        let old_db_dir = managed_root.join(format!("db={}", name));
+                        let new_db_dir = managed_root.join(format!("db={}", new_name));
+                        eprintln!("DEBUG: old_db_dir={:?}, exists={}", old_db_dir, old_db_dir.exists());
+                        eprintln!("DEBUG: new_db_dir={:?}, exists={}", new_db_dir, new_db_dir.exists());
+                        if old_db_dir.exists() {
+                            eprintln!("DEBUG: Renaming {:?} to {:?}", old_db_dir, new_db_dir);
+                            std::fs::rename(&old_db_dir, &new_db_dir).map_err(|e| {
+                                eprintln!("DEBUG: Rename failed: {}", e);
+                                anyhow::anyhow!(
+                                    "Failed to rename database directory: {}",
+                                    e
+                                )
+                            })?;
+                            eprintln!("DEBUG: Rename succeeded");
+                        } else {
+                            eprintln!("DEBUG: old_db_dir doesn't exist, skipping rename");
+                        }
+                    } else {
+                        eprintln!("DEBUG: catalog_path is None, skipping rename");
                     }
 
                     self.persist_state(&state).await?; // Persist inside because we changed maps
@@ -3929,6 +4007,7 @@ fn bootstrap_state() -> CatalogState {
         functions: BTreeMap::new(),
         config,
         catalogue_version: 0,
+        storage_policies: BTreeMap::new(),
     }
 }
 
@@ -3971,10 +4050,6 @@ fn parse_qualified_name(
         )),
         _ => bail!("Unsupported qualified name '{}'", raw),
     }
-}
-
-fn relation_key(database: &str, schema: &str, name: &str) -> String {
-    format!("{database}.{schema}.{name}")
 }
 
 fn default_password_version() -> u64 {
@@ -4029,6 +4104,9 @@ fn parse_column_def(
 pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
     let trimmed = sql.trim();
     let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("VACUUM QUERY_LOG") {
+        return Some(MetadataStatement::VacuumQueryLog);
+    }
     if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.") {
         return parse_metadata_statement_fallback(sql);
     }

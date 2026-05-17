@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "analyticsdb.fullname" . }}-compute
+  labels:
+    {{- include "analyticsdb.labels" . | nindent 4 }}
+    component: compute
+spec:
+  replicas: {{ .Values.computePool.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "analyticsdb.selectorLabels" . | nindent 6 }}
+      component: compute
+  template:
+    metadata:
+      labels:
+        {{- include "analyticsdb.selectorLabels" . | nindent 8 }}
+        component: compute
+    spec:
+      containers:
+        - name: compute
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--role", "compute", "--join", "{{ include "analyticsdb.fullname" . }}-control:8816", "--admin-addr", "0.0.0.0:9090"]
+          ports:
+            - containerPort: 8816
+              name: nodechannel
+            - containerPort: 9090
+              name: admin
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          env:
+            - name: ANALYTICSDB_STORAGE_ROOT
+              value: {{ .Values.storageRoot | quote }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "analyticsdb.fullname" . }}-compute
+  labels:
+    {{- include "analyticsdb.labels" . | nindent 4 }}
+    component: compute
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8816
+      targetPort: nodechannel
+      name: nodechannel
+  selector:
+    {{- include "analyticsdb.selectorLabels" . | nindent 4 }}
+    component: compute

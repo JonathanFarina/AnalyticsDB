@@ -1,0 +1,26 @@
+image:
+  repository: analyticsdb-server
+  tag: latest
+  pullPolicy: IfNotPresent
+
+controlPlane:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    ports:
+      pg: 5432
+      flight: 8815
+      admin: 9090
+
+computePool:
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    ports:
+      nodeChannel: 8816
+
+storageRoot: "s3://my-bucket/analyticsdb"
+
+clusterConfig:
+  storageRoot: s3://my-bucket/analyticsdb
+  jwtSecret: "change-me"

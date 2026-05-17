@@ -420,6 +420,39 @@ fn encode_empty_parquet(schema: &SchemaRef) -> Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
+/// Determines the storage policy for a given table.
+///
+/// For now, this simply returns the policy based on whether the table is external or managed.
+/// Future implementations can add more complex policy logic here.
+pub async fn determine_storage_policy(
+    control_plane: &crate::ControlPlane,
+    session: &analyticsdb_core::SessionContext,
+    table_name: &str,
+    database: Option<&str>,
+    schema: Option<&str>,
+) -> Result<(analyticsdb_control::StoragePolicyType, String)> {
+    let db = database.unwrap_or(&session.database);
+    let sc = schema.unwrap_or(&session.schema);
+    let relation = control_plane
+        .table_relation(session, Some(db), Some(sc), table_name)
+        .await?;
+    let policy_type = if relation.external_format.is_some() {
+        analyticsdb_control::StoragePolicyType::External
+    } else {
+        analyticsdb_control::StoragePolicyType::Managed
+    };
+    let storage_desc = match policy_type {
+        analyticsdb_control::StoragePolicyType::Managed => {
+            "managed (native Parquet)".to_string()
+        }
+        analyticsdb_control::StoragePolicyType::External => {
+            let path = relation.storage_path.as_deref().unwrap_or("unknown");
+            format!("external (Parquet at {})", path)
+        }
+    };
+    Ok((policy_type, storage_desc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

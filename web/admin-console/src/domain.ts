@@ -70,7 +70,23 @@ export interface QueryResult {
   readonly messages: readonly QueryMessage[];
 }
 
+export interface QueryResultChunk {
+  readonly columns?: readonly string[];
+  readonly rows: readonly (readonly CellValue[])[];
+  readonly isLast: boolean;
+  readonly timings?: QueryTiming;
+  readonly messages?: readonly QueryMessage[];
+}
+
+export interface StreamingQueryResult {
+  readonly queryId: string;
+  readonly statementType: QueryStatementType;
+  onChunk(callback: (chunk: QueryResultChunk) => void): void;
+  onComplete(): Promise<QueryResult>;
+}
+
 export interface AnalyticsConsoleClient {
   getExplorerSnapshot(): Promise<ExplorerSnapshot>;
   executeQuery(request: QueryRequest): Promise<QueryResult>;
+  executeQueryStreaming(request: QueryRequest): StreamingQueryResult;
 }

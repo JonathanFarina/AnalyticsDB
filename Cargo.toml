@@ -6,6 +6,7 @@ members = [
     "crates/analyticsdb-engine",
     "crates/analyticsdb-protocol",
     "crates/analyticsdb-server",
+    "crates/analyticsdb-gateway",
 ]
 resolver = "2"
 
@@ -61,3 +62,5 @@ async-stream = "0.3.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rcgen = "0.13"
 time = "0.3"
+password-hash = "0.5"
+argon2 = "0.5"

@@ -222,3 +222,7 @@ cargo run -p analyticsdb-cli -- query \
 - [AGENTS.md](/Users/jonathanfarina/Development/git/AnalyticsDB/AGENTS.md)
 - [docs/agents/feature-status.md](/Users/jonathanfarina/Development/git/AnalyticsDB/docs/agents/feature-status.md)
 - [docs/agents/testing-strategy.md](/Users/jonathanfarina/Development/git/AnalyticsDB/docs/agents/testing-strategy.md)
+
+## Scale Envelope
+
+For supported scale limits, configuration, and recommended production scale, see [Scale Envelope Documentation](docs/scale-envelope.md).

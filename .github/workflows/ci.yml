@@ -206,3 +206,45 @@ jobs:
       - name: Build
         working-directory: web/admin-console
         run: npm run build
+
+  benchmark:
+    name: benchmark gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: benchmark-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Download baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: target/criterion
+        continue-on-error: true
+      - name: Run benchmarks
+        run: cargo bench --workspace -- --baseline main 2>&1 | tee benchmark_output.txt
+      - name: Check for regressions
+        run: |
+          # Check if any benchmark regressed by more than 10%
+          if grep -E "regressed by [0-9]+(\.[0-9]+)?%" benchmark_output.txt; then
+            # Extract regression percentage and check if > 10%
+            regression=$(grep -oE "regressed by [0-9]+(\.[0-9]+)?%" benchmark_output.txt | grep -oE "[0-9]+(\.[0-9]+)?" | head -1)
+            if [ -n "$regression" ] && [ "$(echo "$regression > 10" | bc)" -eq 1 ]; then
+              echo "::error::Benchmark regression detected: $regression% (threshold: 10%)"
+              exit 1
+            fi
+          fi
+          echo "No significant benchmark regressions detected"
+      - name: Upload baseline
+        if: github.ref == 'refs/heads/main' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: target/criterion
+          retention-days: 90

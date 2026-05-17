@@ -1,4 +1,57 @@
 use super::*;
+use datafusion::arrow::datatypes::DataType;
+
+/// Computes basic column statistics from a RecordBatch.
+pub(crate) fn compute_column_stats(batch: &RecordBatch) -> Vec<crate::manifest::ColumnStat> {
+    let mut stats = Vec::new();
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let column = batch.column(i);
+        let null_count = column.null_count() as i64;
+        let mut min_value = None;
+        let mut max_value = None;
+        
+        // Only compute min/max for types that support it
+        match field.data_type() {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                if let Some(array) = column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+                    if let Some(min) = datafusion::arrow::compute::min(array) {
+                        min_value = Some(min.to_string());
+                    }
+                    if let Some(max) = datafusion::arrow::compute::max(array) {
+                        max_value = Some(max.to_string());
+                    }
+                }
+            }
+            DataType::Float32 | DataType::Float64 => {
+                if let Some(array) = column.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>() {
+                    if let Some(min) = datafusion::arrow::compute::min(array) {
+                        min_value = Some(min.to_string());
+                    }
+                    if let Some(max) = datafusion::arrow::compute::max(array) {
+                        max_value = Some(max.to_string());
+                    }
+                }
+            }
+            DataType::Utf8 => {
+                // String min/max not supported by arrow::compute::min/max directly
+                // Could implement custom, but skip for now
+                // If you want min/max for strings, you'd need to iterate
+                // For now, leave None
+            }
+            _ => {}
+        }
+        
+        stats.push(crate::manifest::ColumnStat {
+            name: field.name().clone(),
+            null_count,
+            min_value,
+            max_value,
+            ndv_estimate: None, // Would need hyperloglog or similar for accurate estimate
+        });
+    }
+    stats
+}
 
 pub(crate) fn build_record_batch_from_rows(
     schema: &SchemaRef,
@@ -147,11 +200,16 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
         )?;
         let size = bytes.len() as u64;
         let entry_row_count = prepared_batch.num_rows() as i64;
+        
+        // Compute column statistics
+        let column_stats = compute_column_stats(&prepared_batch);
+        
         store.put(&key, bytes.into()).await?;
         manifest_entries.push(crate::manifest::ManifestEntry {
             path: data_path,
             size,
             row_count: entry_row_count,
+            column_stats,
         });
     }
     // Atomic commit: replace the manifest so new files become visible.
