@@ -1,6 +1,6 @@
 //! Health check routes
 
-use axum::Json;
+use axum::{extract::State, Json};
 use serde_json::json;
 
 /// Liveness probe - always returns 200 if the server is running
