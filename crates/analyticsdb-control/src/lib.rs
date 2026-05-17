@@ -3883,6 +3883,20 @@ fn bootstrap_state() -> CatalogState {
             scram_salted_password_b64: aa_scram_sp,
         },
     );
+    let (adm_hash, adm_scram_salt, adm_scram_sp) = bootstrap_user_creds("admin");
+    users.insert(
+        "admin".to_string(),
+        CatalogUser {
+            name: "admin".to_string(),
+            is_admin: true,
+            password: adm_hash,
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
+            scram_salt_b64: adm_scram_salt,
+            scram_salted_password_b64: adm_scram_sp,
+        },
+    );
 
     let nodes = BTreeMap::new();
     let relations = BTreeMap::new();
