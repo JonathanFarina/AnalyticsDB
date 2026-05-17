@@ -225,7 +225,6 @@ async fn run() -> Result<()> {
         );
 
         let tls_cert = config.tls_cert.clone();
-        let tls_key = config.tls_key.clone();
         let tls_ca_cert = config.tls_ca_cert.clone();
         let tls_domain = config.tls_domain.clone();
 

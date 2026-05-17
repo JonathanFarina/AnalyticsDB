@@ -13,8 +13,7 @@
 //   ANALYTICSDB_DB       - Database name (default: postgres)
 //   ANALYTICSDB_SCHEMA   - Schema name (default: public)
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Config, NoTls};
 
@@ -158,7 +157,7 @@ async fn run_single_query(
 
             let _ = client.simple_query(query).await;
 
-            let _ = client.close().await;
+            drop(client);
             let _ = connection_handle.await;
         }
         Err(e) => {
