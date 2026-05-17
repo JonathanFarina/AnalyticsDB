@@ -625,13 +625,10 @@ pub(crate) fn rewrite_generate_series_range(
             span: sqlparser::tokenizer::Span::empty(),
         })))
     };
-    if let Some(ta) = args.as_mut() {
-        if ta.args.len() == 2 {
-            ta.args[0] = make_int(start);
-            ta.args[1] = make_int(end);
-        } else {
-            return None;
-        }
+    let ta = args.as_mut()?;
+    if ta.args.len() == 2 {
+        ta.args[0] = make_int(start);
+        ta.args[1] = make_int(end);
     } else {
         return None;
     }

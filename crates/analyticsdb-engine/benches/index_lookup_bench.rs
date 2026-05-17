@@ -1,4 +1,4 @@
-use criterion::{black_box, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_index_key_parsing(c: &mut Criterion) {
     c.bench_function("index_key_parse_and_compare", |b| {

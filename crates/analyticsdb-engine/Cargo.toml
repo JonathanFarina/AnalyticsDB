@@ -39,3 +39,18 @@ async-stream.workspace = true
 [dev-dependencies]
 rcgen = { workspace = true }
 time = { workspace = true }
+criterion = { workspace = true }
+analyticsdb-control = { path = "../analyticsdb-control" }
+datafusion = { workspace = true }
+
+[[bench]]
+name = "index_lookup_bench"
+harness = false
+
+[[bench]]
+name = "planner_bench"
+harness = false
+
+[[bench]]
+name = "query_log_bench"
+harness = false

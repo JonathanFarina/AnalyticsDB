@@ -2408,7 +2408,7 @@ fn postgres_session_from_state(state: &dyn Session) -> analyticsdb_core::Session
 
 fn synthetic_namespace_oid(database: &str, schema: &str) -> u32 {
     let mut hash = 2166136261_u32;
-    for byte in database.bytes().chain([b'.']).chain(schema.bytes()) {
+    for byte in database.bytes().chain(*b".").chain(schema.bytes()) {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16777619);
     }
@@ -2449,9 +2449,9 @@ fn synthetic_relation_oid(database: &str, schema: &str, name: &str) -> u32 {
     let mut hash = 2166136261_u32;
     for byte in database
         .bytes()
-        .chain([b'.'])
+        .chain(*b".")
         .chain(schema.bytes())
-        .chain([b'.'])
+        .chain(*b".")
         .chain(name.bytes())
     {
         hash ^= byte as u32;

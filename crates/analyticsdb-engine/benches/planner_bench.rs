@@ -1,5 +1,6 @@
+use analyticsdb_control::ControlPlane;
 use analyticsdb_engine::sql_rewriter;
-use criterion::{black_box, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_sql_rewrite(c: &mut Criterion) {
     let sql_cases = vec![
@@ -10,6 +11,7 @@ fn bench_sql_rewrite(c: &mut Criterion) {
     ];
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let control_plane = ControlPlane::new_bootstrap();
 
     c.bench_function("sql_rewrite_postgres_compatibility", |b| {
         b.iter(|| {
@@ -17,7 +19,7 @@ fn bench_sql_rewrite(c: &mut Criterion) {
                 let _ = rt.block_on(black_box(
                     sql_rewriter::rewrite_sql_for_postgres_compatibility(
                         black_box(sql),
-                        black_box(&analyticsdb_engine::ControlPlane::new_bootstrap()),
+                        black_box(&control_plane),
                         black_box(&analyticsdb_core::SessionContext::default()),
                     ),
                 ));

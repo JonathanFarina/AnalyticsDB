@@ -1,6 +1,7 @@
+use analyticsdb_control::QueryAdmission;
 use analyticsdb_core::{QueryRequest, SessionContext};
 use analyticsdb_engine::query_log::QueryLog;
-use criterion::{black_box, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 fn query_log_start_probe_benchmark(c: &mut Criterion) {
     let query_log = QueryLog::disabled();
@@ -10,7 +11,7 @@ fn query_log_start_probe_benchmark(c: &mut Criterion) {
         session: session.clone(),
         query_id: Some("test-query-id".to_string()),
     };
-    let admission = analyticsdb_control::QueryAdmission {
+    let admission = QueryAdmission {
         query_id: "admission-id".to_string(),
         coordinator_node_id: "node-1".to_string(),
     };
@@ -35,7 +36,7 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
         session,
         query_id: Some("test-query-id".to_string()),
     };
-    let admission = analyticsdb_control::QueryAdmission {
+    let admission = QueryAdmission {
         query_id: "admission-id".to_string(),
         coordinator_node_id: "node-1".to_string(),
     };
@@ -43,14 +44,6 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
     c.bench_function("query_log_observe_and_finish", |b| {
         b.iter(|| {
             let probe = query_log.start_probe(&request, &admission, "SELECT 1");
-            probe.observe_plan(black_box(
-                &datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                    datafusion::logical_expr::EmptyRelation {
-                        produce_one_row: false,
-                        schema: std::sync::Arc::new(datafusion::common::DFSchema::empty()),
-                    },
-                ),
-            ));
             probe.observe_read(black_box(100), black_box(1024));
             probe.finish_result(&Ok(analyticsdb_engine::QueryExecutionResult {
                 query_id: "test".to_string(),
@@ -66,9 +59,42 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
     });
 }
 
+fn query_log_sizing_benchmark(c: &mut Criterion) {
+    let query_log = QueryLog::disabled();
+    let session = SessionContext::default();
+
+    for size in [10, 100, 1000] {
+        let request = QueryRequest {
+            sql: "SELECT 1".to_string(),
+            session: session.clone(),
+            query_id: Some("test-query-id".to_string()),
+        };
+        let admission = QueryAdmission {
+            query_id: "admission-id".to_string(),
+            coordinator_node_id: "node-1".to_string(),
+        };
+
+        c.bench_with_input(
+            BenchmarkId::new("query_log_start_probe", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let probe = query_log.start_probe(
+                        black_box(&request),
+                        black_box(&admission),
+                        black_box("SELECT 1"),
+                    );
+                    black_box(probe);
+                })
+            },
+        );
+    }
+}
+
 criterion_group!(
     benches,
     query_log_start_probe_benchmark,
-    query_log_observe_and_finish_benchmark
+    query_log_observe_and_finish_benchmark,
+    query_log_sizing_benchmark
 );
 criterion_main!(benches);
