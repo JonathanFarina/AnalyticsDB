@@ -1,9 +1,7 @@
 //! Health check routes
 
-use axum::{extract::State, Json};
+use axum::Json;
 use serde_json::json;
-
-use crate::GatewayState;
 
 /// Liveness probe - always returns 200 if the server is running
 pub async fn liveness() -> Json<serde_json::Value> {

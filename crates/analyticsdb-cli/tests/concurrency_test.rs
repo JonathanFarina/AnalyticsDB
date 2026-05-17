@@ -130,14 +130,11 @@ async fn run_single_query(
 ) -> u64 {
     let start = Instant::now();
 
-    let mut config = Config::new()
-        .host(host)
-        .port(port)
-        .user(user)
-        .dbname(dbname);
+    let mut config = Config::new();
+    config.host(host).port(port).user(user).dbname(dbname);
 
     if let Some(pwd) = password {
-        config = config.password(pwd);
+        config.password(pwd);
     }
 
     match config.connect(NoTls).await {

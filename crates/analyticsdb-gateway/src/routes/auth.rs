@@ -4,14 +4,13 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Query, State},
-    http::StatusCode,
     response::{Json, Redirect},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::GatewayResult;
-use crate::session::{SessionClaims, SessionStore};
+use crate::session::SessionClaims;
 use crate::GatewayState;
 
 #[derive(Debug, Deserialize)]

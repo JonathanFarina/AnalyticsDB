@@ -5378,7 +5378,7 @@ async fn cli_external_table_parity_with_managed() {
         managed_dir.display()
     );
 
-    let mut parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir)
+    let parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir)
         .expect("Should read managed table directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -7744,7 +7744,7 @@ async fn test_statistics_influence_plan() {
         .timeout(std::time::Duration::from_secs(30));
 
     // Create table
-    let output = cmd
+    let _output = cmd
         .write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
         .assert()
         .success();
