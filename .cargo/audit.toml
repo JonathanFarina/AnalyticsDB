@@ -1,0 +1,17 @@
+[advisories]
+# rustls-webpki 0.101.x vulnerabilities — transitive via reqwest 0.11/rustls 0.21.
+# Patched in rustls-webpki >=0.103.12; upgrading requires bumping reqwest and rustls
+# across the workspace (breaking change). Ignoring until that migration is done.
+ignore = [
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # rustls-pemfile unmaintained — transitive dep via rustls ecosystem
+    "RUSTSEC-2025-0134",
+    # async-std discontinued — transitive dep, cannot easily remove
+    "RUSTSEC-2025-0052",
+    # bincode unmaintained — transitive dep, cannot easily remove
+    "RUSTSEC-2025-0141",
+    # paste unmaintained — transitive dep, cannot easily remove
+    "RUSTSEC-2024-0436",
+]

@@ -1308,7 +1308,7 @@ impl ControlPlane {
             | MetadataStatement::DropSchema { .. }
             | MetadataStatement::KillQuery { .. }
             | MetadataStatement::VacuumTable { .. }
-            | MetadataStatement::VacuumQueryLog { .. } => {
+            | MetadataStatement::VacuumQueryLog => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases => {
