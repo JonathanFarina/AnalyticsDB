@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       minio:
-        image: bitnami/minio:latest
+        image: minio/minio:latest
         env:
           MINIO_ROOT_USER: minio
           MINIO_ROOT_PASSWORD: miniominio
@@ -103,6 +103,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+        command: server /data
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
