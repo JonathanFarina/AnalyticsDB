@@ -11,6 +11,14 @@ ignore = [
     "RUSTSEC-2025-0141",
     # paste unmaintained (transitive dep, cannot easily remove)
     "RUSTSEC-2024-0436",
+    # rustls-pemfile unmaintained (transitive dep via rustls ecosystem)
+    "RUSTSEC-2025-0134",
+    # webpki: URI name constraints incorrectly accepted (transitive dep)
+    "RUSTSEC-2026-0098",
+    # webpki: wildcard name constraints accepted incorrectly (transitive dep)
+    "RUSTSEC-2026-0099",
+    # webpki: reachable panic in CRL parsing (transitive dep)
+    "RUSTSEC-2026-0104",
 ]
 
 [licenses]
