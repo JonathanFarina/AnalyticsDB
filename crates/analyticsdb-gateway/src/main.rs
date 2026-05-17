@@ -62,8 +62,14 @@ async fn main() -> anyhow::Result<()> {
         // Auth refresh (needs valid token)
         .route("/api/auth/refresh", post(routes::auth::refresh))
         // Explorer (live metadata)
-        .route("/api/explorer", get(routes::explorer::get_explorer_snapshot))
-        .route("/api/explorer/databases", get(routes::explorer::list_databases))
+        .route(
+            "/api/explorer",
+            get(routes::explorer::get_explorer_snapshot),
+        )
+        .route(
+            "/api/explorer/databases",
+            get(routes::explorer::list_databases),
+        )
         .route("/api/explorer/schemas", get(routes::explorer::list_schemas))
         .route("/api/explorer/tables", get(routes::explorer::list_tables))
         .route("/api/explorer/views", get(routes::explorer::list_views))
@@ -71,9 +77,18 @@ async fn main() -> anyhow::Result<()> {
         // Query execution
         .route("/api/query", post(routes::query::execute_query))
         // Admin
-        .route("/api/admin/databases", get(routes::admin::list_databases).post(routes::admin::create_database))
-        .route("/api/admin/databases/:name", delete(routes::admin::drop_database))
-        .route("/api/admin/users", get(routes::admin::list_users).post(routes::admin::create_user))
+        .route(
+            "/api/admin/databases",
+            get(routes::admin::list_databases).post(routes::admin::create_database),
+        )
+        .route(
+            "/api/admin/databases/:name",
+            delete(routes::admin::drop_database),
+        )
+        .route(
+            "/api/admin/users",
+            get(routes::admin::list_users).post(routes::admin::create_user),
+        )
         .route("/api/admin/users/:name", delete(routes::admin::drop_user))
         // System
         .route("/api/system/metrics", get(routes::system::get_metrics))
@@ -91,7 +106,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/readyz", get(routes::health::readiness))
         .route("/api/auth/login", post(routes::auth::login))
         .route("/api/auth/logout", post(routes::auth::logout))
-        .route("/api/auth/oidc/authorize", get(routes::auth::oidc_authorize))
+        .route(
+            "/api/auth/oidc/authorize",
+            get(routes::auth::oidc_authorize),
+        )
         .route("/api/auth/oidc/callback", get(routes::auth::oidc_callback))
         .with_state(Arc::clone(&state));
 

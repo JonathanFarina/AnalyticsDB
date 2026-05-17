@@ -69,10 +69,7 @@ pub async fn optional_auth(
 
 /// Middleware that validates the session `SessionClaims` is present AND the
 /// user has admin role.  Apply after `require_auth`.
-pub async fn require_admin(
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn require_admin(req: Request<Body>, next: Next) -> Response {
     let claims = req.extensions().get::<SessionClaims>().cloned();
     match claims {
         Some(c) if c.role == "admin" || c.sub == "admin" || c.sub == "postgres" => {

@@ -247,7 +247,6 @@ pub async fn append_to_manifest(
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
                 // Another writer committed between our read and write; retry.
                 if attempt + 1 == MAX_CAS_RETRIES {
-                    
                     anyhow::bail!(
                         "manifest CAS failed after {} retries for prefix {}",
                         MAX_CAS_RETRIES,
@@ -265,7 +264,6 @@ pub async fn append_to_manifest(
                     .map_err(Into::into);
             }
             Err(e) => {
-                
                 return Err(e.into());
             }
         }
@@ -297,7 +295,6 @@ pub async fn replace_manifest(
             Ok(_) => return Ok(()),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
                 if attempt + 1 == MAX_CAS_RETRIES {
-                    
                     anyhow::bail!(
                         "manifest CAS failed after {} retries for prefix {}",
                         MAX_CAS_RETRIES,
@@ -313,7 +310,6 @@ pub async fn replace_manifest(
                     .map_err(Into::into);
             }
             Err(e) => {
-                
                 return Err(e.into());
             }
         }

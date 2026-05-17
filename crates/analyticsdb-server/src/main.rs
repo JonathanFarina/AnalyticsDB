@@ -136,7 +136,6 @@ async fn main() {
     }
 }
 
-
 /// Merge CLI arguments into the config. CLI args take precedence over config file values.
 fn merge_config_with_cli(config: &mut Config, cli: &Cli) {
     if let Some(node_id) = &cli.node_id {

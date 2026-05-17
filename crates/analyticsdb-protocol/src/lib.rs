@@ -452,7 +452,7 @@ impl PerConnectionStartupHandler {
             Ok(d) => d,
             Err(e) => {
                 // Record auth failure metric
-                
+
                 return Err(status_to_pgwire(e));
             }
         };
@@ -2634,10 +2634,7 @@ impl AnalyticsFlightSqlService {
             &jsonwebtoken::DecodingKey::from_secret(self.jwt_secret.as_bytes()),
             &validation,
         )
-        .map_err(|e| {
-            
-            Status::unauthenticated(format!("invalid JWT: {e}"))
-        })?;
+        .map_err(|e| Status::unauthenticated(format!("invalid JWT: {e}")))?;
 
         let claims = token_data.claims;
 
@@ -2647,12 +2644,8 @@ impl AnalyticsFlightSqlService {
             .control_plane()
             .catalog_user(&claims.sub)
             .await
-            .map_err(|e| {
-                
-                Status::unauthenticated(format!("user lookup failed: {e}"))
-            })?;
+            .map_err(|e| Status::unauthenticated(format!("user lookup failed: {e}")))?;
         if catalog_user.password_version != claims.pwd_ver {
-            
             return Err(Status::unauthenticated(
                 "token has been invalidated by a password rotation — please re-authenticate",
             ));
