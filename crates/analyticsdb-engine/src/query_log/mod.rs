@@ -506,11 +506,9 @@ pub(crate) async fn cleanup_expired_logs(
         // Check if path contains a date=YYYY-MM-DD partition
         let mut parts = rel_path.split('/');
         if let Some(first_part) = parts.next() {
-            if first_part.starts_with("date=") {
-                let date_str = &first_part[5..]; // strip "date="
+            if let Some(date_str) = first_part.strip_prefix("date=") {
                 if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                    let partition_date = Utc.ymd(date.year(), date.month(), date.day());
-                    if partition_date < expiration.date() {
+                    if date < expiration.date_naive() {
                         if let Err(e) = store.delete(&meta.location).await {
                             debug!("failed to delete expired query log {}: {}", path, e);
                         }

@@ -512,6 +512,7 @@ pub async fn compact_table(
 }
 
 /// Converts a Manifest to DataFusion Statistics for query planning.
+#[allow(dead_code)]
 pub fn manifest_to_statistics(manifest: &Manifest, schema: &SchemaRef) -> Statistics {
     let num_rows: usize = manifest.files.iter().map(|e| e.row_count as usize).sum();
     let total_byte_size: usize = manifest.files.iter().map(|e| e.size as usize).sum();
@@ -608,6 +609,7 @@ pub fn manifest_to_statistics(manifest: &Manifest, schema: &SchemaRef) -> Statis
 }
 
 /// Parse a string into ScalarValue based on the target data type.
+#[allow(dead_code)]
 fn parse_scalar_value(data_type: &DataType, s: &str) -> Option<ScalarValue> {
     match data_type {
         DataType::Int8 => s.parse::<i8>().ok().map(|v| ScalarValue::Int8(Some(v))),
