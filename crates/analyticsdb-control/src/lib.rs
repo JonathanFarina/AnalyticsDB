@@ -1733,6 +1733,36 @@ impl ControlPlane {
                         state.relations.insert(new_key, rel);
                     }
 
+                    // Rename physical storage directory
+                    if let Some(catalog_path) = &self.catalog_path {
+                        eprintln!("DEBUG: Renaming database storage, catalog_path={:?}", catalog_path);
+                        let stem = catalog_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .ok_or_else(|| anyhow::anyhow!("Invalid catalog path"))?;
+                        let mut managed_root = catalog_path.clone();
+                        managed_root.set_file_name(format!("{}.managed", stem));
+                        let old_db_dir = managed_root.join(format!("db={}", name));
+                        let new_db_dir = managed_root.join(format!("db={}", new_name));
+                        eprintln!("DEBUG: old_db_dir={:?}, exists={}", old_db_dir, old_db_dir.exists());
+                        eprintln!("DEBUG: new_db_dir={:?}, exists={}", new_db_dir, new_db_dir.exists());
+                        if old_db_dir.exists() {
+                            eprintln!("DEBUG: Renaming {:?} to {:?}", old_db_dir, new_db_dir);
+                            std::fs::rename(&old_db_dir, &new_db_dir).map_err(|e| {
+                                eprintln!("DEBUG: Rename failed: {}", e);
+                                anyhow::anyhow!(
+                                    "Failed to rename database directory: {}",
+                                    e
+                                )
+                            })?;
+                            eprintln!("DEBUG: Rename succeeded");
+                        } else {
+                            eprintln!("DEBUG: old_db_dir doesn't exist, skipping rename");
+                        }
+                    } else {
+                        eprintln!("DEBUG: catalog_path is None, skipping rename");
+                    }
+
                     self.persist_state(&state).await?; // Persist inside because we changed maps
                     return Ok(format!(
                         "Database '{}' renamed to '{}' successfully.",
@@ -3929,6 +3959,20 @@ fn bootstrap_state() -> CatalogState {
             members: BTreeSet::new(),
             scram_salt_b64: aa_scram_salt,
             scram_salted_password_b64: aa_scram_sp,
+        },
+    );
+    let (adm_hash, adm_scram_salt, adm_scram_sp) = bootstrap_user_creds("admin");
+    users.insert(
+        "admin".to_string(),
+        CatalogUser {
+            name: "admin".to_string(),
+            is_admin: true,
+            password: adm_hash,
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
+            scram_salt_b64: adm_scram_salt,
+            scram_salted_password_b64: adm_scram_sp,
         },
     );
 

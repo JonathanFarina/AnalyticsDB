@@ -53,6 +53,7 @@ function renderLoginView(container: HTMLElement): void {
         </form>
         <div class="login-info">
           <small>Gateway: ${import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:8080"}</small>
+          <small>Default credentials: <strong>admin</strong> / <strong>admin</strong></small>
         </div>
       </div>
     </div>
