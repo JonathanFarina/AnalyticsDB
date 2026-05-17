@@ -43,10 +43,6 @@ impl Service<hyper::Request<hyper::body::Incoming>> for HealthService {
                 } else {
                     (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string(), "text/plain")
                 }
-            } else if path == "/metrics" {
-                // Expose Prometheus metrics
-                let metrics = analyticsdb_engine::metrics::get_metrics();
-                (hyper::StatusCode::OK, metrics, "text/plain; version=0.0.4")
             } else {
                 (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string(), "text/plain")
             };
