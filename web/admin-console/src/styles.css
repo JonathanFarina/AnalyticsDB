@@ -1269,3 +1269,120 @@ textarea {
 
   .topbar { padding: 0 12px; gap: 8px; }
 }
+
+/* ── Result header with timing ────────────────────────────── */
+.result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.result-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.result-timing-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timing-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.timing-item {
+  white-space: nowrap;
+}
+
+/* ── Timing footer ────────────────────────────────────────── */
+.result-timing-footer {
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.timing-detail {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.timing-grid {
+  display: grid;
+  grid-template-columns: repeat(5, auto);
+  gap: 8px 16px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  justify-content: start;
+}
+
+.timing-total {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+@media (max-width: 720px) {
+  .timing-grid {
+    grid-template-columns: repeat(3, auto);
+  }
+}
+
+/* ── Streaming progress ───────────────────────────────────── */
+.streaming-progress {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-style: italic;
+  padding: 12px 14px !important;
+  background: var(--surface-alt);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.data-grid.streaming tbody tr:last-child td {
+  border-bottom: 2px dashed var(--primary);
+}
+
+/* ── Messages always visible ──────────────────────────────── */
+.message-list {
+  display: grid;
+  gap: 6px;
+  order: -1;
+}
+
+.card-body {
+  display: grid;
+  gap: 14px;
+}
+
+.result-summary {
+  order: 0;
+}
+
+.result-grid {
+  order: 1;
+}
+
+.message-list:empty {
+  display: none;
+}
+
+.result-timing-footer:empty {
+  display: none;
+  padding: 0;
+  margin: 0;
+}

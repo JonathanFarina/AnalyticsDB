@@ -4,7 +4,10 @@ import type {
   DatabaseMetadata,
   ExplorerSnapshot,
   Protocol,
+  QueryMessage,
   QueryResult,
+  QueryResultChunk,
+  QueryTiming,
   RelationMetadata,
   SchemaMetadata,
 } from "../domain";
@@ -28,6 +31,11 @@ interface QueryViewState {
   isRunning: boolean;
   latestResult?: QueryResult;
   history: readonly QueryResult[];
+  streamingRows: readonly (readonly CellValue[])[];
+  streamingColumns: readonly string[];
+  streamingTimings?: QueryTiming;
+  streamingMessages: readonly QueryMessage[];
+  isStreaming: boolean;
 }
 
 export function mountQueryView(container: HTMLElement): void {
@@ -41,6 +49,10 @@ export function mountQueryView(container: HTMLElement): void {
     filter: "",
     isRunning: false,
     history: [],
+    streamingRows: [],
+    streamingColumns: [],
+    streamingMessages: [],
+    isStreaming: false,
   };
 
   container.innerHTML = `
@@ -140,14 +152,18 @@ export function mountQueryView(container: HTMLElement): void {
           </div>
 
           <div class="card result-card" aria-labelledby="results-heading">
-            <div class="card-header">
+            <div class="card-header result-header">
               <h3 id="results-heading" class="card-title">Results</h3>
-              <span id="result-state" class="badge">Idle</span>
+              <div class="result-header-right">
+                <span id="result-state" class="badge">Idle</span>
+                <div id="result-timing-header" class="result-timing-header"></div>
+              </div>
             </div>
             <div class="card-body">
+              <div id="result-messages" class="message-list"></div>
               <div id="result-summary" class="result-summary"></div>
               <div id="result-grid" class="result-grid" aria-live="polite"></div>
-              <div id="result-messages" class="message-list"></div>
+              <div id="result-timing-footer" class="result-timing-footer"></div>
             </div>
           </div>
         </section>
@@ -390,16 +406,36 @@ export function mountQueryView(container: HTMLElement): void {
   function renderResult(): void {
     resultState.textContent = state.isRunning
       ? "Running"
-      : state.latestResult
-        ? state.latestResult.statementType
-        : "Idle";
-    resultState.classList.toggle("badge-running", state.isRunning);
+      : state.isStreaming
+        ? "Streaming"
+        : state.latestResult
+          ? state.latestResult.statementType
+          : "Idle";
+    resultState.classList.toggle("badge-running", state.isRunning || state.isStreaming);
+
     resultSummary.replaceChildren();
     resultGrid.replaceChildren();
     resultMessages.replaceChildren();
 
-    if (state.isRunning) {
+    const timingHeader = mustQuery<HTMLDivElement>(container, "#result-timing-header");
+    const timingFooter = mustQuery<HTMLDivElement>(container, "#result-timing-footer");
+    timingHeader.replaceChildren();
+    timingFooter.replaceChildren();
+
+    if (state.isRunning || state.isStreaming) {
       resultSummary.append(loadingCard());
+
+      if (state.isStreaming && state.streamingColumns.length > 0) {
+        resultGrid.append(renderGridFromState());
+
+        if (state.streamingMessages.length > 0) {
+          renderMessages(state.streamingMessages);
+        }
+
+        if (state.streamingTimings) {
+          renderTimingDisplay(state.streamingTimings, timingHeader, timingFooter);
+        }
+      }
       return;
     }
 
@@ -411,16 +447,25 @@ export function mountQueryView(container: HTMLElement): void {
       return;
     }
 
+    renderMessages(result.messages);
+
     resultSummary.append(
       statCard("Query id", result.queryId),
       statCard("Rows", String(result.rows.length)),
-      statCard("Total", `${result.timings.totalMs} ms`),
-      statCard("Plan", `${result.timings.planMs} ms`),
     );
 
-    resultGrid.append(renderGrid(result));
+    renderTimingDisplay(result.timings, timingHeader, timingFooter);
 
-    for (const message of result.messages) {
+    resultGrid.append(renderGrid(result));
+  }
+
+  function renderMessages(messages: readonly QueryMessage[]): void {
+    resultMessages.replaceChildren();
+    if (messages.length === 0) {
+      return;
+    }
+
+    for (const message of messages) {
       const messageNode = element("div", `message message-${message.level}`);
       const iconName =
         message.level === "error"
@@ -431,6 +476,34 @@ export function mountQueryView(container: HTMLElement): void {
       messageNode.innerHTML = `${icon(iconName, 14)}<span>${escapeHtml(message.text)}</span>`;
       resultMessages.append(messageNode);
     }
+  }
+
+  function renderTimingDisplay(
+    timings: QueryTiming,
+    header: HTMLElement,
+    footer: HTMLElement,
+  ): void {
+    const timingHtml = `
+      <span class="timing-item" title="Query execution time">Execute: ${timings.executeMs}ms</span>
+      <span class="timing-item" title="Data fetch time">Fetch: ${timings.fetchMs}ms</span>
+      <span class="timing-item" title="Total time">Total: ${timings.totalMs}ms</span>
+    `;
+
+    const headerBlock = element("div", "timing-inline");
+    headerBlock.innerHTML = timingHtml;
+    header.append(headerBlock);
+
+    const footerBlock = element("div", "timing-detail");
+    footerBlock.innerHTML = `
+      <div class="timing-grid">
+        <span>Queue: ${timings.queueMs}ms</span>
+        <span>Plan: ${timings.planMs}ms</span>
+        <span>Execute: ${timings.executeMs}ms</span>
+        <span>Fetch: ${timings.fetchMs}ms</span>
+        <span class="timing-total">Total: ${timings.totalMs}ms</span>
+      </div>
+    `;
+    footer.append(footerBlock);
   }
 
   function renderHistory(): void {
@@ -458,22 +531,55 @@ export function mountQueryView(container: HTMLElement): void {
   async function runCurrentQuery(): Promise<void> {
     state.queryText = queryInput.value;
     state.isRunning = true;
+    state.isStreaming = false;
+    state.streamingRows = [];
+    state.streamingColumns = [];
+    state.streamingMessages = [];
+    state.streamingTimings = undefined;
     renderEditor();
     renderResult();
 
-    const result = await state.client.executeQuery({
+    const streamingResult = state.client.executeQueryStreaming({
       sql: state.queryText,
       protocol: state.protocol,
       database: state.selectedDatabase,
       schema: state.selectedSchema,
     });
 
-    state.latestResult = result;
-    state.history = [result, ...state.history].slice(0, 6);
     state.isRunning = false;
+    state.isStreaming = true;
     renderEditor();
     renderResult();
-    renderHistory();
+
+    streamingResult.onChunk(async (chunk: QueryResultChunk) => {
+      if (chunk.columns) {
+        state.streamingColumns = chunk.columns;
+      }
+      state.streamingRows = [...state.streamingRows, ...chunk.rows];
+
+      if (chunk.messages) {
+        state.streamingMessages = chunk.messages;
+      }
+      if (chunk.timings) {
+        state.streamingTimings = chunk.timings;
+      }
+
+      renderResult();
+
+      if (chunk.isLast) {
+        state.isStreaming = false;
+        const finalResult = await streamingResult.onComplete();
+        state.latestResult = finalResult;
+        state.history = [finalResult, ...state.history].slice(0, 6);
+        state.streamingRows = [];
+        state.streamingColumns = [];
+        state.streamingMessages = [];
+        state.streamingTimings = undefined;
+        renderEditor();
+        renderResult();
+        renderHistory();
+      }
+    });
   }
 
   function selectRelation(relation: RelationMetadata): void {
@@ -537,6 +643,47 @@ export function mountQueryView(container: HTMLElement): void {
     }
 
     table.append(thead, tbody);
+    return table;
+  }
+
+  function renderGridFromState(): HTMLElement {
+    if (state.streamingColumns.length === 0) {
+      return emptyState("Waiting for column information...");
+    }
+
+    const table = element("table", "data-grid streaming");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const column of state.streamingColumns) {
+      const th = document.createElement("th");
+      th.textContent = column;
+      headRow.append(th);
+    }
+    thead.append(headRow);
+
+    const tbody = document.createElement("tbody");
+    for (const row of state.streamingRows) {
+      const tr = document.createElement("tr");
+      for (const cell of row) {
+        const td = document.createElement("td");
+        td.textContent = formatCell(cell);
+        tr.append(td);
+      }
+      tbody.append(tr);
+    }
+
+    table.append(thead, tbody);
+
+    if (state.isStreaming) {
+      const progressRow = document.createElement("tr");
+      const progressCell = document.createElement("td");
+      progressCell.colSpan = state.streamingColumns.length;
+      progressCell.className = "streaming-progress";
+      progressCell.textContent = `Loading... (${state.streamingRows.length} rows loaded)`;
+      progressRow.append(progressCell);
+      tbody.append(progressRow);
+    }
+
     return table;
   }
 

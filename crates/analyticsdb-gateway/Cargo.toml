@@ -1,0 +1,57 @@
+[package]
+name = "analyticsdb-gateway"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+analyticsdb-control = { path = "../analyticsdb-control" }
+analyticsdb-engine = { path = "../analyticsdb-engine" }
+analyticsdb-protocol = { path = "../analyticsdb-protocol" }
+analyticsdb-server = { path = "../analyticsdb-server" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+
+# Web framework
+axum = { version = "0.7", features = ["json"] }
+tower = { workspace = true }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Authentication & Security
+jsonwebtoken = { workspace = true }
+oauth2 = { version = "4.0", features = ["reqwest"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+password-hash = { workspace = true }
+argon2 = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = "1.0"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# CORS
+http = "1.0"
+
+# TLS
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pki-types = "1.0"
+tokio-rustls = "0.26"
+
+# Database for session storage
+# Using SQLite for session storage (via analyticsdb-control's store)

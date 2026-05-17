@@ -4,9 +4,11 @@ import type {
   ExplorerSnapshot,
   QueryRequest,
   QueryResult,
+  QueryResultChunk,
   QueryStatementType,
   QueryTiming,
   RelationMetadata,
+  StreamingQueryResult,
 } from "./domain";
 import {
   allRelations,
@@ -29,6 +31,112 @@ export class PrototypeConsoleClient implements AnalyticsConsoleClient {
     const sql = request.sql.trim();
     const statementType = classifyStatement(sql);
     const queryId = this.nextQueryId();
+
+    if (sql.length === 0) {
+      return {
+        queryId,
+        statementType: "unknown",
+        columns: [],
+        rows: [],
+        timings: timingFor(sql),
+        messages: [{ level: "error", text: "No SQL was submitted." }],
+      };
+    }
+
+    const metadataResult = executeMetadataQuery(request, queryId, statementType);
+    if (metadataResult) {
+      return metadataResult;
+    }
+
+    const relationResult = executeRelationQuery(request, queryId, statementType);
+    if (relationResult) {
+      return relationResult;
+    }
+
+    const scalarResult = executeScalarQuery(request, queryId, statementType);
+    if (scalarResult) {
+      return scalarResult;
+    }
+
+    return {
+      queryId,
+      statementType,
+      columns: [],
+      rows: [],
+      affectedRows: statementType === "dml" || statementType === "ddl" ? 0 : undefined,
+      timings: timingFor(sql),
+      messages: [
+        {
+          level: statementType === "select" ? "warning" : "info",
+          text:
+            statementType === "select"
+              ? "Prototype console client could not match this SELECT to sample metadata."
+              : "Prototype console client accepted the statement for UI flow only; no engine mutation was persisted.",
+        },
+      ],
+    };
+  }
+
+  executeQueryStreaming(request: QueryRequest): StreamingQueryResult {
+    const queryId = this.nextQueryId();
+    const statementType = classifyStatement(request.sql.trim());
+    const chunkCallbacks: Array<(chunk: QueryResultChunk) => void> = [];
+    const rows: CellValue[][] = [];
+    let columns: string[] = [];
+    let resolvedResult: QueryResult | undefined;
+
+    const completePromise = new Promise<QueryResult>((resolve) => {
+      setTimeout(() => {
+        const result = this.buildStreamingResult(request, queryId, statementType);
+        columns = [...result.columns];
+        rows.push(...result.rows as CellValue[][]);
+
+        const chunkSize = Math.max(1, Math.ceil(result.rows.length / 5));
+        let sentIndex = 0;
+
+        function sendChunk() {
+          const chunkRows = result.rows.slice(sentIndex, sentIndex + chunkSize);
+          sentIndex += chunkSize;
+
+          const isLast = sentIndex >= result.rows.length;
+          const chunk: QueryResultChunk = {
+            columns: sentIndex <= chunkSize ? result.columns : undefined,
+            rows: chunkRows,
+            isLast,
+            timings: isLast ? result.timings : undefined,
+            messages: isLast ? result.messages : undefined,
+          };
+
+          chunkCallbacks.forEach((cb) => cb(chunk));
+
+          if (!isLast) {
+            setTimeout(sendChunk, 150);
+          } else {
+            resolvedResult = result;
+            resolve(result);
+          }
+        }
+
+        sendChunk();
+      }, 50);
+    });
+
+    return {
+      queryId,
+      statementType,
+      onChunk(callback: (chunk: QueryResultChunk) => void) {
+        chunkCallbacks.push(callback);
+      },
+      onComplete: () => completePromise,
+    };
+  }
+
+  private buildStreamingResult(
+    request: QueryRequest,
+    queryId: string,
+    statementType: QueryStatementType,
+  ): QueryResult {
+    const sql = request.sql.trim();
 
     if (sql.length === 0) {
       return {

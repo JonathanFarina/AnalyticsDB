@@ -20,7 +20,7 @@ use uuid::Uuid;
 const ARGON2ID_PREFIX: &str = "$argon2id$";
 
 /// Hashes `password` with Argon2id and returns a PHC string suitable for storage.
-fn hash_password(password: &str) -> Result<String> {
+pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -34,7 +34,7 @@ fn hash_password(password: &str) -> Result<String> {
 /// remains functional during the migration window.  Any login with a plaintext
 /// credential that succeeds triggers an in-place re-hash on the next write
 /// (see `authenticate_user`).
-fn verify_password(provided: &str, stored: &str) -> bool {
+pub fn verify_password(provided: &str, stored: &str) -> bool {
     if stored.starts_with(ARGON2ID_PREFIX) {
         let Ok(hash) = PasswordHash::new(stored) else { return false };
         Argon2::default()
