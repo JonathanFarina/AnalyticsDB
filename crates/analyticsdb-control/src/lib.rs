@@ -4121,11 +4121,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 name: db_name.to_string(),
             })
         }
-        sqlparser::ast::Statement::CreateSchema {
-            schema_name,
-            if_not_exists: _,
-            ..
-        } => {
+        sqlparser::ast::Statement::CreateSchema { schema_name, .. } => {
             let (db, name) = match schema_name {
                 sqlparser::ast::SchemaName::Simple(n) => {
                     let idents: Vec<String> = n.0.iter().map(|i| i.to_string()).collect();
@@ -4296,8 +4292,9 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                 )
             };
 
-            let rows = match insert.source.as_deref() {
-                Some(query) => match &*query.body {
+            let rows = {
+                let query = insert.source.as_deref()?;
+                match &*query.body {
                     sqlparser::ast::SetExpr::Values(values) => {
                         let mut result_rows = Vec::new();
                         for row in &values.rows {
@@ -4310,8 +4307,7 @@ pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
                         result_rows
                     }
                     _ => return None,
-                },
-                None => return None,
+                }
             };
 
             Some(MetadataStatement::InsertInto {
@@ -4917,10 +4913,9 @@ fn parse_alter_object_remainder(
         (&remainder[..idx], &remainder[idx..])
     } else if let Some(idx) = upper.find(" OWNER TO ") {
         (&remainder[..idx], &remainder[idx..])
-    } else if let Some(idx) = upper.find(" SET SCHEMA ") {
-        (&remainder[..idx], &remainder[idx..])
     } else {
-        return None;
+        let idx = upper.find(" SET SCHEMA ")?;
+        (&remainder[..idx], &remainder[idx..])
     };
 
     let (database, schema, name) = parse_qualified_name(name_part.trim(), None, None).ok()?;
