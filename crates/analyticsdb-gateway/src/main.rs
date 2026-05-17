@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod config;
 pub mod error;
+pub mod middleware;
 pub mod routes;
 pub mod session;
 pub mod proxy;
@@ -54,21 +55,14 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build router
-    let app = Router::new()
-        // Health check
-        .route("/healthz", get(routes::health::liveness))
-        .route("/readyz", get(routes::health::readiness))
-        // Auth routes
-        .route("/api/auth/login", post(routes::auth::login))
-        .route("/api/auth/logout", post(routes::auth::logout))
-        .route("/api/auth/refresh", post(routes::auth::refresh))
-        .route("/api/auth/oidc/authorize", get(routes::auth::oidc_authorize))
-        .route("/api/auth/oidc/callback", get(routes::auth::oidc_callback))
-        // Session routes
+    // Protected routes — all require a valid Bearer JWT.
+    let protected = Router::new()
+        // Session
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session", post(routes::session::update_session))
-        // Explorer routes (live metadata)
+        // Auth refresh (needs valid token)
+        .route("/api/auth/refresh", post(routes::auth::refresh))
+        // Explorer (live metadata)
         .route("/api/explorer", get(routes::explorer::get_explorer_snapshot))
         .route("/api/explorer/databases", get(routes::explorer::list_databases))
         .route("/api/explorer/schemas", get(routes::explorer::list_schemas))
@@ -77,19 +71,35 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/explorer/columns", get(routes::explorer::list_columns))
         // Query execution
         .route("/api/query", post(routes::query::execute_query))
-        // Admin routes (placeholder)
+        // Admin
         .route("/api/admin/databases", get(routes::admin::list_databases).post(routes::admin::create_database))
         .route("/api/admin/databases/:name", delete(routes::admin::drop_database))
         .route("/api/admin/users", get(routes::admin::list_users).post(routes::admin::create_user))
         .route("/api/admin/users/:name", delete(routes::admin::drop_user))
-        // System metrics
+        // System
         .route("/api/system/metrics", get(routes::system::get_metrics))
         .route("/api/system/query-log", get(routes::system::get_query_log))
         .route("/api/system/audit-log", get(routes::system::get_audit_log))
-        // Add middleware
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state.session_store),
+            middleware::require_auth,
+        ))
+        .with_state(Arc::clone(&state));
+
+    // Public routes — no auth required.
+    let public = Router::new()
+        .route("/healthz", get(routes::health::liveness))
+        .route("/readyz", get(routes::health::readiness))
+        .route("/api/auth/login", post(routes::auth::login))
+        .route("/api/auth/logout", post(routes::auth::logout))
+        .route("/api/auth/oidc/authorize", get(routes::auth::oidc_authorize))
+        .route("/api/auth/oidc/callback", get(routes::auth::oidc_callback))
+        .with_state(Arc::clone(&state));
+
+    let app = public
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
-        .layer(cors)
-        .with_state(state);
+        .layer(cors);
 
     // Start server
     let addr: SocketAddr = config.bind_addr.parse()?;

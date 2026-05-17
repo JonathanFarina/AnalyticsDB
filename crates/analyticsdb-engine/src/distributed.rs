@@ -185,18 +185,8 @@ pub struct ClusterMtlsConfig {
 
 // ─── Trace Context Propagation ──────────────────────────────────────────
 
-/// Injects the current OpenTelemetry trace context into gRPC metadata using W3C Trace Context.
-fn inject_trace_context(request: &mut tonic::Request<Action>) {
-    let propagator = opentelemetry::propagation::TraceContextPropagator::new();
-    let mut carrier = std::collections::HashMap::new();
-    propagator.inject_context(&OtelContext::current(), &mut carrier);
-    let metadata = request.metadata_mut();
-    for (key, value) in carrier {
-        if let Ok(val) = tonic::metadata::MetadataValue::try_from(value) {
-            metadata.insert(key.as_str(), val);
-        }
-    }
-}
+/// No-op stub: OpenTelemetry trace propagation is not yet wired (G2 roadmap item).
+fn inject_trace_context(_request: &mut tonic::Request<Action>) {}
 
 // ─── Coordinator-side client ─────────────────────────────────────────────────
 

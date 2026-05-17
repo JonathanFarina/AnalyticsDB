@@ -459,7 +459,7 @@ pub fn schema() -> SchemaRef {
         Field::new("coordinator_node_id", DataType::Utf8, false),
         Field::new("worker_node_id", DataType::Utf8, true),
         Field::new("distributed_partition_count", DataType::Int32, true),
-        Field::new("tables", DataType::new_list(DataType::Utf8, true)),
+        Field::new("tables", DataType::new_list(DataType::Utf8, true), true),
         Field::new("settings", DataType::Utf8, false),
         Field::new("profile", DataType::Utf8, false),
         Field::new("engine_version", DataType::Utf8, false),

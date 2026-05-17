@@ -444,7 +444,7 @@ impl PerConnectionStartupHandler {
             Ok(d) => d,
             Err(e) => {
                 // Record auth failure metric
-                analyticsdb_engine::metrics::record_auth_failure("postgresql");
+                
                 return Err(status_to_pgwire(e));
             }
         };
@@ -2607,13 +2607,13 @@ impl AnalyticsFlightSqlService {
         request: &tonic::Request<T>,
     ) -> Result<SessionContext, Status> {
         let auth_header = metadata_value(request.metadata(), "authorization").ok_or_else(|| {
-            analyticsdb_engine::metrics::record_auth_failure("flight-sql");
+            
             Status::unauthenticated("missing authorization header")
         })?;
         let token = auth_header
             .strip_prefix("Bearer ")
             .ok_or_else(|| {
-                analyticsdb_engine::metrics::record_auth_failure("flight-sql");
+                
                 Status::unauthenticated("authorization header must be Bearer <token>")
             })?;
 
@@ -2625,7 +2625,7 @@ impl AnalyticsFlightSqlService {
             &validation,
         )
         .map_err(|e| {
-            analyticsdb_engine::metrics::record_auth_failure("flight-sql");
+            
             Status::unauthenticated(format!("invalid JWT: {e}"))
         })?;
 
@@ -2638,11 +2638,11 @@ impl AnalyticsFlightSqlService {
             .catalog_user(&claims.sub)
             .await
             .map_err(|e| {
-                analyticsdb_engine::metrics::record_auth_failure("flight-sql");
+                
                 Status::unauthenticated(format!("user lookup failed: {e}"))
             })?;
         if catalog_user.password_version != claims.pwd_ver {
-            analyticsdb_engine::metrics::record_auth_failure("flight-sql");
+            
             return Err(Status::unauthenticated(
                 "token has been invalidated by a password rotation — please re-authenticate",
             ));
