@@ -1,6 +1,6 @@
-use criterion::{black_box, Criterion, BenchmarkId};
-use analyticsdb_engine::query_log::QueryLog;
 use analyticsdb_core::{QueryRequest, SessionContext};
+use analyticsdb_engine::query_log::QueryLog;
+use criterion::{black_box, BenchmarkId, Criterion};
 
 fn query_log_start_probe_benchmark(c: &mut Criterion) {
     let query_log = QueryLog::disabled();
@@ -42,17 +42,15 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
 
     c.bench_function("query_log_observe_and_finish", |b| {
         b.iter(|| {
-            let probe = query_log.start_probe(
-                &request,
-                &admission,
-                "SELECT 1",
-            );
-            probe.observe_plan(black_box(&datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
-                    produce_one_row: false,
-                    schema: std::sync::Arc::new(datafusion::common::DFSchema::empty()),
-                },
-            )));
+            let probe = query_log.start_probe(&request, &admission, "SELECT 1");
+            probe.observe_plan(black_box(
+                &datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                    datafusion::logical_expr::EmptyRelation {
+                        produce_one_row: false,
+                        schema: std::sync::Arc::new(datafusion::common::DFSchema::empty()),
+                    },
+                ),
+            ));
             probe.observe_read(black_box(100), black_box(1024));
             probe.finish_result(&Ok(analyticsdb_engine::QueryExecutionResult {
                 query_id: "test".to_string(),
@@ -68,5 +66,9 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, query_log_start_probe_benchmark, query_log_observe_and_finish_benchmark);
+criterion_group!(
+    benches,
+    query_log_start_probe_benchmark,
+    query_log_observe_and_finish_benchmark
+);
 criterion_main!(benches);

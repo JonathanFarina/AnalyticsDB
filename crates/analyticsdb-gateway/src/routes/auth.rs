@@ -48,12 +48,9 @@ pub async fn login(
     }
 
     // Create session
-    let token = state.session_store.create_session(
-        "admin",
-        "admin",
-        "default",
-        "public",
-    )?;
+    let token = state
+        .session_store
+        .create_session("admin", "admin", "default", "public")?;
 
     let claims = state.session_store.validate_token(&token)?;
 

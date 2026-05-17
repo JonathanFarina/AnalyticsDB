@@ -5,8 +5,8 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use datafusion::scalar::ScalarValue;
-use datafusion_common::{ColumnStatistics, Statistics};
 use datafusion_common::stats::Precision;
+use datafusion_common::{ColumnStatistics, Statistics};
 use futures::StreamExt;
 use object_store::path::Path as OPath;
 use object_store::{

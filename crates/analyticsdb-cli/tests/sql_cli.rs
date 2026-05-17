@@ -5406,7 +5406,10 @@ async fn cli_external_table_parity_with_managed() {
     // 6. Verify external table is registered
     let show_tables = protocol_json_response("postgres", &endpoint, None, "SHOW TABLES");
     assert!(
-        show_tables.rows.iter().any(|row| row[0] == "parity_test_external"),
+        show_tables
+            .rows
+            .iter()
+            .any(|row| row[0] == "parity_test_external"),
         "External table should be listed in SHOW TABLES"
     );
 
@@ -6835,11 +6838,7 @@ async fn cli_pg_catalog_pg_proc_lists_builtin_functions() {
     );
 
     // Verify some known functions are present
-    let pronames: Vec<&str> = all_procs
-        .rows
-        .iter()
-        .map(|row| row[0].as_str())
-        .collect();
+    let pronames: Vec<&str> = all_procs.rows.iter().map(|row| row[0].as_str()).collect();
     assert!(
         pronames.contains(&"length"),
         "pg_proc should list 'length' function"
@@ -6864,7 +6863,11 @@ async fn cli_pg_catalog_pg_proc_lists_builtin_functions() {
         None,
         "SELECT proname, pronargs FROM pg_catalog.pg_proc WHERE proname = 'length'",
     );
-    assert_eq!(length_fn.rows.len(), 1, "should find exactly one 'length' function");
+    assert_eq!(
+        length_fn.rows.len(),
+        1,
+        "should find exactly one 'length' function"
+    );
     assert_eq!(length_fn.rows[0][0], "length");
     assert_eq!(length_fn.rows[0][1], "1", "length takes 1 argument");
 
@@ -7028,7 +7031,15 @@ fn local_sql(catalog_path: &str, schema: Option<&str>, sql: &str) {
 
 fn local_json(catalog_path: &str, schema: Option<&str>, sql: &str) -> QueryResponse {
     let mut cmd = Command::cargo_bin("analyticsdb").expect("binary should build");
-    cmd.args(["query", "--format", "json", "--catalog-path", catalog_path, "--sql", sql]);
+    cmd.args([
+        "query",
+        "--format",
+        "json",
+        "--catalog-path",
+        catalog_path,
+        "--sql",
+        sql,
+    ]);
     if let Some(s) = schema {
         cmd.args(["--schema", s]);
     }
@@ -7044,7 +7055,11 @@ async fn cli_scalar_string_functions_work_on_both_protocols() {
     let catalog_path = temp_catalog_path();
 
     // Set up the table via reliable local mode.
-    local_sql(&catalog_path, Some("public"), "CREATE TABLE str_test (val TEXT NOT NULL)");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "CREATE TABLE str_test (val TEXT NOT NULL)",
+    );
     local_sql(
         &catalog_path,
         Some("public"),
@@ -7068,15 +7083,15 @@ async fn cli_scalar_string_functions_work_on_both_protocols() {
     );
     assert_eq!(local.rows.len(), 1, "scalar_string: expected 1 row");
     let row = &local.rows[0];
-    assert_eq!(row[0], "HELLO",   "UPPER");
-    assert_eq!(row[1], "world",   "LOWER");
-    assert_eq!(row[2], "3",       "LENGTH");
-    assert_eq!(row[3], "hi",      "TRIM");
-    assert_eq!(row[4], "XbcXbc",  "REPLACE");
-    assert_eq!(row[5], "bcd",     "SUBSTRING");
-    assert_eq!(row[6], "foobar",  "CONCAT");
-    assert_eq!(row[7], "abc",     "LEFT");
-    assert_eq!(row[8], "def",     "RIGHT");
+    assert_eq!(row[0], "HELLO", "UPPER");
+    assert_eq!(row[1], "world", "LOWER");
+    assert_eq!(row[2], "3", "LENGTH");
+    assert_eq!(row[3], "hi", "TRIM");
+    assert_eq!(row[4], "XbcXbc", "REPLACE");
+    assert_eq!(row[5], "bcd", "SUBSTRING");
+    assert_eq!(row[6], "foobar", "CONCAT");
+    assert_eq!(row[7], "abc", "LEFT");
+    assert_eq!(row[8], "def", "RIGHT");
 
     // Protocol parity: a single query through postgres and flight-sql must match.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7085,7 +7100,11 @@ async fn cli_scalar_string_functions_work_on_both_protocols() {
     let parity_sql = "SELECT UPPER(val) AS r FROM str_test WHERE val = 'foo'";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert_eq!(pg.rows, vec![vec!["FOO".to_string()]], "upper_col: unexpected postgres result");
+    assert_eq!(
+        pg.rows,
+        vec![vec!["FOO".to_string()]],
+        "upper_col: unexpected postgres result"
+    );
     assert_supported_protocol_equivalence("scalar_string_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7099,8 +7118,16 @@ async fn cli_scalar_string_functions_work_on_both_protocols() {
 async fn cli_aggregate_functions_work_on_both_protocols() {
     let catalog_path = temp_catalog_path();
 
-    local_sql(&catalog_path, Some("public"), "CREATE TABLE agg_test (n BIGINT NOT NULL)");
-    local_sql(&catalog_path, Some("public"), "INSERT INTO agg_test VALUES (1), (2), (3), (4), (5)");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "CREATE TABLE agg_test (n BIGINT NOT NULL)",
+    );
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "INSERT INTO agg_test VALUES (1), (2), (3), (4), (5)",
+    );
 
     // Verify via local mode (multi-column, single query).
     let local = local_json(
@@ -7110,13 +7137,17 @@ async fn cli_aggregate_functions_work_on_both_protocols() {
     );
     assert_eq!(local.rows.len(), 1, "aggregate: expected 1 row");
     let row = &local.rows[0];
-    assert_eq!(row[0], "5",  "COUNT");
+    assert_eq!(row[0], "5", "COUNT");
     assert_eq!(row[1], "15", "SUM");
-    assert_eq!(row[2], "1",  "MIN");
-    assert_eq!(row[3], "5",  "MAX");
+    assert_eq!(row[2], "1", "MIN");
+    assert_eq!(row[3], "5", "MAX");
 
     // Verify AVG separately (returns a decimal which may vary in precision).
-    let avg_local = local_json(&catalog_path, Some("public"), "SELECT AVG(n) AS r FROM agg_test");
+    let avg_local = local_json(
+        &catalog_path,
+        Some("public"),
+        "SELECT AVG(n) AS r FROM agg_test",
+    );
     assert!(
         avg_local.rows[0][0].starts_with('3'),
         "AVG expected to start with 3, got {:?}",
@@ -7127,10 +7158,14 @@ async fn cli_aggregate_functions_work_on_both_protocols() {
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
     let (_fl_server, fl_endpoint) = start_flight_sql_server(&catalog_path).await;
 
-    let parity_sql = "SELECT COUNT(*) AS cnt, SUM(n) AS sm, MIN(n) AS mn, MAX(n) AS mx FROM agg_test";
+    let parity_sql =
+        "SELECT COUNT(*) AS cnt, SUM(n) AS sm, MIN(n) AS mn, MAX(n) AS mx FROM agg_test";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert!(!pg.rows.is_empty(), "aggregate parity: postgres returned no rows");
+    assert!(
+        !pg.rows.is_empty(),
+        "aggregate parity: postgres returned no rows"
+    );
     assert_supported_protocol_equivalence("aggregate_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7159,15 +7194,35 @@ async fn cli_math_functions_work_on_both_protocols() {
     );
     assert_eq!(local.rows.len(), 1, "math: expected 1 row");
     let row = &local.rows[0];
-    assert_eq!(row[0], "7",    "ABS");
+    assert_eq!(row[0], "7", "ABS");
     // CEIL/FLOOR/ROUND may return integer or decimal representation depending
     // on the Arrow type DataFusion infers from the literal.
-    assert!(row[1].starts_with('5'), "CEIL expected ~5, got {:?}", row[1]);
-    assert!(row[2].starts_with('4'), "FLOOR expected ~4, got {:?}", row[2]);
-    assert!(row[3].starts_with('5'), "ROUND expected ~5, got {:?}", row[3]);
-    assert!(row[4].starts_with('3'), "SQRT(9) expected ~3, got {:?}", row[4]);
-    assert_eq!(row[5], "1",    "MOD");
-    assert!(row[6].starts_with("1024"), "POWER(2,10) expected 1024.x, got {:?}", row[6]);
+    assert!(
+        row[1].starts_with('5'),
+        "CEIL expected ~5, got {:?}",
+        row[1]
+    );
+    assert!(
+        row[2].starts_with('4'),
+        "FLOOR expected ~4, got {:?}",
+        row[2]
+    );
+    assert!(
+        row[3].starts_with('5'),
+        "ROUND expected ~5, got {:?}",
+        row[3]
+    );
+    assert!(
+        row[4].starts_with('3'),
+        "SQRT(9) expected ~3, got {:?}",
+        row[4]
+    );
+    assert_eq!(row[5], "1", "MOD");
+    assert!(
+        row[6].starts_with("1024"),
+        "POWER(2,10) expected 1024.x, got {:?}",
+        row[6]
+    );
 
     // Protocol parity.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7177,7 +7232,10 @@ async fn cli_math_functions_work_on_both_protocols() {
                       ROUND(4.5) AS round_r, 10 % 3 AS mod_r, POWER(2.0, 10.0) AS pow_r";
     let pg = protocol_json_response("postgres", &pg_endpoint, None, parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, None, parity_sql);
-    assert!(!pg.rows.is_empty(), "math parity: postgres returned no rows");
+    assert!(
+        !pg.rows.is_empty(),
+        "math parity: postgres returned no rows"
+    );
     assert_supported_protocol_equivalence("math_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7213,17 +7271,24 @@ async fn cli_date_functions_work_on_both_protocols() {
     );
     assert_eq!(local.rows.len(), 1, "date_fns: expected 1 row");
     let row = &local.rows[0];
-    assert!(row[0].contains("2024-06"), "DATE_TRUNC month, got {:?}", row[0]);
+    assert!(
+        row[0].contains("2024-06"),
+        "DATE_TRUNC month, got {:?}",
+        row[0]
+    );
     assert!(row[1].starts_with("2024"), "EXTRACT YEAR, got {:?}", row[1]);
-    assert!(row[2].starts_with('6'),    "EXTRACT MONTH, got {:?}", row[2]);
-    assert!(row[3].starts_with("15"),   "EXTRACT DAY, got {:?}", row[3]);
-    assert!(row[4].starts_with("13"),   "DATE_PART hour, got {:?}", row[4]);
+    assert!(row[2].starts_with('6'), "EXTRACT MONTH, got {:?}", row[2]);
+    assert!(row[3].starts_with("15"), "EXTRACT DAY, got {:?}", row[3]);
+    assert!(row[4].starts_with("13"), "DATE_PART hour, got {:?}", row[4]);
 
     // NOW() and CURRENT_DATE via local mode.
     let now_local = local_json(&catalog_path, None, "SELECT NOW() AS r");
     assert!(!now_local.rows[0][0].is_empty(), "NOW() returned empty");
-    let cd_local  = local_json(&catalog_path, None, "SELECT CURRENT_DATE AS r");
-    assert!(!cd_local.rows[0][0].is_empty(), "CURRENT_DATE returned empty");
+    let cd_local = local_json(&catalog_path, None, "SELECT CURRENT_DATE AS r");
+    assert!(
+        !cd_local.rows[0][0].is_empty(),
+        "CURRENT_DATE returned empty"
+    );
 
     // Protocol parity: one query through both protocol servers.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7236,7 +7301,10 @@ async fn cli_date_functions_work_on_both_protocols() {
     );
     let pg = protocol_json_response("postgres", &pg_endpoint, None, &parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, None, &parity_sql);
-    assert!(!pg.rows.is_empty(), "date_fns parity: postgres returned no rows");
+    assert!(
+        !pg.rows.is_empty(),
+        "date_fns parity: postgres returned no rows"
+    );
     assert_supported_protocol_equivalence("date_fns_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7263,15 +7331,18 @@ async fn cli_conditional_functions_work_on_both_protocols() {
     );
     assert_eq!(local.rows.len(), 1, "conditional: expected 1 row");
     let row = &local.rows[0];
-    assert_eq!(row[0], "yes",      "CASE WHEN");
+    assert_eq!(row[0], "yes", "CASE WHEN");
     assert_eq!(row[1], "fallback", "COALESCE(NULL,…)");
-    assert_eq!(row[2], "first",    "COALESCE('first',…)");
-    assert_eq!(row[3], "9",        "GREATEST");
-    assert_eq!(row[4], "1",        "LEAST");
+    assert_eq!(row[2], "first", "COALESCE('first',…)");
+    assert_eq!(row[3], "9", "GREATEST");
+    assert_eq!(row[4], "1", "LEAST");
 
     // NULLIF separately (NULL serialises differently from other values).
     let nullif_local = local_json(&catalog_path, None, "SELECT NULLIF(1, 1) AS r");
-    assert_eq!(nullif_local.rows[0][0], "", "NULLIF(x,x) should serialise as empty string");
+    assert_eq!(
+        nullif_local.rows[0][0], "",
+        "NULLIF(x,x) should serialise as empty string"
+    );
 
     // Protocol parity (one query each).
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7282,7 +7353,10 @@ async fn cli_conditional_functions_work_on_both_protocols() {
                       GREATEST(3,1,4,1,5,9) AS greatest_r, LEAST(3,1,4,1,5,9) AS least_r";
     let pg = protocol_json_response("postgres", &pg_endpoint, None, parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, None, parity_sql);
-    assert!(!pg.rows.is_empty(), "conditional parity: postgres returned no rows");
+    assert!(
+        !pg.rows.is_empty(),
+        "conditional parity: postgres returned no rows"
+    );
     assert_supported_protocol_equivalence("conditional_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7319,22 +7393,32 @@ async fn cli_window_functions_work_on_both_protocols() {
             LEAD(val, 1) OVER (ORDER BY val) AS next_val \
          FROM win_test ORDER BY val",
     );
-    assert_eq!(local.rows.len(), 4, "window_fns: expected 4 rows, got {}", local.rows.len());
+    assert_eq!(
+        local.rows.len(),
+        4,
+        "window_fns: expected 4 rows, got {}",
+        local.rows.len()
+    );
     // First row (val=5): ROW_NUMBER=1, RANK=1, LAG=NULL, LEAD=10.
-    assert_eq!(local.rows[0][0], "5",  "val row0");
-    assert_eq!(local.rows[0][1], "1",  "ROW_NUMBER row0");
-    assert_eq!(local.rows[0][2], "1",  "RANK row0");
-    assert_eq!(local.rows[0][3], "",   "LAG row0 (NULL)");
+    assert_eq!(local.rows[0][0], "5", "val row0");
+    assert_eq!(local.rows[0][1], "1", "ROW_NUMBER row0");
+    assert_eq!(local.rows[0][2], "1", "RANK row0");
+    assert_eq!(local.rows[0][3], "", "LAG row0 (NULL)");
     assert_eq!(local.rows[0][4], "10", "LEAD row0");
 
     // Protocol parity — a single representative window query through both.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
     let (_fl_server, fl_endpoint) = start_flight_sql_server(&catalog_path).await;
 
-    let parity_sql = "SELECT val, ROW_NUMBER() OVER (ORDER BY val) AS rn FROM win_test ORDER BY val";
+    let parity_sql =
+        "SELECT val, ROW_NUMBER() OVER (ORDER BY val) AS rn FROM win_test ORDER BY val";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert_eq!(pg.rows.len(), 4, "window parity: expected 4 rows from postgres");
+    assert_eq!(
+        pg.rows.len(),
+        4,
+        "window parity: expected 4 rows from postgres"
+    );
     assert_supported_protocol_equivalence("window_parity", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7353,8 +7437,16 @@ async fn cli_numeric_decimal_type_roundtrips_correctly() {
         Some("public"),
         "CREATE TABLE num_test (a NUMERIC(10,2) NOT NULL, b DECIMAL(8,4) NOT NULL)",
     );
-    local_sql(&catalog_path, Some("public"), "INSERT INTO num_test VALUES (123.45, -67.8900)");
-    local_sql(&catalog_path, Some("public"), "INSERT INTO num_test VALUES (-0.01, 9999.9999)");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "INSERT INTO num_test VALUES (123.45, -67.8900)",
+    );
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "INSERT INTO num_test VALUES (-0.01, 9999.9999)",
+    );
 
     // Verify via local mode.
     let local = local_json(
@@ -7377,7 +7469,11 @@ async fn cli_numeric_decimal_type_roundtrips_correctly() {
     let parity_sql = "SELECT a, b FROM num_test ORDER BY a";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert_eq!(pg.columns, vec!["a", "b"], "numeric_decimal: unexpected columns");
+    assert_eq!(
+        pg.columns,
+        vec!["a", "b"],
+        "numeric_decimal: unexpected columns"
+    );
     assert_eq!(pg.rows.len(), 2, "numeric_decimal parity: expected 2 rows");
     assert_supported_protocol_equivalence("numeric_decimal", &pg, &fl);
 
@@ -7397,13 +7493,32 @@ async fn cli_date_type_roundtrips_correctly() {
     let catalog_path = temp_catalog_path();
 
     // DATE columns must be nullable to avoid Arrow null-value validation errors.
-    local_sql(&catalog_path, Some("public"), "CREATE TABLE date_test (d DATE)");
-    local_sql(&catalog_path, Some("public"), "INSERT INTO date_test VALUES (DATE '2024-01-15')");
-    local_sql(&catalog_path, Some("public"), "INSERT INTO date_test VALUES (DATE '2024-12-31')");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "CREATE TABLE date_test (d DATE)",
+    );
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "INSERT INTO date_test VALUES (DATE '2024-01-15')",
+    );
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "INSERT INTO date_test VALUES (DATE '2024-12-31')",
+    );
 
     // Verify row count is correct (the values are stored even if serialisation is limited).
-    let local = local_json(&catalog_path, Some("public"), "SELECT COUNT(*) AS n FROM date_test");
-    assert_eq!(local.rows[0][0], "2", "date_roundtrip: expected 2 stored rows");
+    let local = local_json(
+        &catalog_path,
+        Some("public"),
+        "SELECT COUNT(*) AS n FROM date_test",
+    );
+    assert_eq!(
+        local.rows[0][0], "2",
+        "date_roundtrip: expected 2 stored rows"
+    );
 
     // Protocol parity: COUNT works on both protocols.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7412,7 +7527,10 @@ async fn cli_date_type_roundtrips_correctly() {
     let parity_sql = "SELECT COUNT(*) AS n FROM date_test";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert_eq!(pg.rows[0][0], "2", "date_roundtrip parity postgres: expected 2");
+    assert_eq!(
+        pg.rows[0][0], "2",
+        "date_roundtrip parity postgres: expected 2"
+    );
     assert_supported_protocol_equivalence("date_roundtrip", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7433,7 +7551,11 @@ async fn cli_timestamp_type_roundtrips_correctly() {
     let catalog_path = temp_catalog_path();
 
     // TIMESTAMP columns must be nullable to avoid Arrow null-value validation errors.
-    local_sql(&catalog_path, Some("public"), "CREATE TABLE ts_rt_test (ts TIMESTAMP)");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "CREATE TABLE ts_rt_test (ts TIMESTAMP)",
+    );
     local_sql(
         &catalog_path,
         Some("public"),
@@ -7446,8 +7568,15 @@ async fn cli_timestamp_type_roundtrips_correctly() {
     );
 
     // Verify row count is correct.
-    let local = local_json(&catalog_path, Some("public"), "SELECT COUNT(*) AS n FROM ts_rt_test");
-    assert_eq!(local.rows[0][0], "2", "timestamp_roundtrip: expected 2 stored rows");
+    let local = local_json(
+        &catalog_path,
+        Some("public"),
+        "SELECT COUNT(*) AS n FROM ts_rt_test",
+    );
+    assert_eq!(
+        local.rows[0][0], "2",
+        "timestamp_roundtrip: expected 2 stored rows"
+    );
 
     // Protocol parity: COUNT works on both protocols.
     let (_pg_server, pg_endpoint) = start_postgres_server(&catalog_path).await;
@@ -7456,7 +7585,10 @@ async fn cli_timestamp_type_roundtrips_correctly() {
     let parity_sql = "SELECT COUNT(*) AS n FROM ts_rt_test";
     let pg = protocol_json_response("postgres", &pg_endpoint, Some("public"), parity_sql);
     let fl = protocol_json_response("flight-sql", &fl_endpoint, Some("public"), parity_sql);
-    assert_eq!(pg.rows[0][0], "2", "timestamp_roundtrip parity postgres: expected 2");
+    assert_eq!(
+        pg.rows[0][0], "2",
+        "timestamp_roundtrip parity postgres: expected 2"
+    );
     assert_supported_protocol_equivalence("timestamp_roundtrip", &pg, &fl);
 
     cleanup_catalog_artifacts(&catalog_path);
@@ -7472,7 +7604,11 @@ async fn cli_uuid_type_roundtrips_correctly() {
 
     let well_known_uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-    local_sql(&catalog_path, Some("public"), "CREATE TABLE uuid_test (id TEXT NOT NULL)");
+    local_sql(
+        &catalog_path,
+        Some("public"),
+        "CREATE TABLE uuid_test (id TEXT NOT NULL)",
+    );
     local_sql(
         &catalog_path,
         Some("public"),
@@ -7531,10 +7667,20 @@ async fn cli_boolean_type_roundtrips_correctly() {
         Some("public"),
         "SELECT flag, label FROM bool_test ORDER BY label",
     );
-    assert_eq!(local.rows.len(), 2, "boolean_roundtrip local: expected 2 rows");
+    assert_eq!(
+        local.rows.len(),
+        2,
+        "boolean_roundtrip local: expected 2 rows"
+    );
     // Ordered by label: 'no' < 'yes'.
-    assert_eq!(local.rows[0][0], "false", "boolean_roundtrip: expected false for 'no' row");
-    assert_eq!(local.rows[1][0], "true",  "boolean_roundtrip: expected true for 'yes' row");
+    assert_eq!(
+        local.rows[0][0], "false",
+        "boolean_roundtrip: expected false for 'no' row"
+    );
+    assert_eq!(
+        local.rows[1][0], "true",
+        "boolean_roundtrip: expected true for 'yes' row"
+    );
 
     // Protocol coverage: both protocols must return semantically-correct boolean values.
     // Note: the postgres wire protocol serialises BOOLEAN as "t"/"f" (PostgreSQL short
@@ -7553,7 +7699,7 @@ async fn cli_boolean_type_roundtrips_correctly() {
 
     // Postgres wire: "f" and "t" (PostgreSQL boolean short form).
     let pg_false = pg.rows[0][0].as_str();
-    let pg_true  = pg.rows[1][0].as_str();
+    let pg_true = pg.rows[1][0].as_str();
     assert!(
         pg_false == "f" || pg_false == "false",
         "boolean postgres: expected 'f' or 'false' for false row, got {pg_false:?}"
@@ -7565,7 +7711,7 @@ async fn cli_boolean_type_roundtrips_correctly() {
 
     // Flight-SQL: "false" and "true".
     let fl_false = fl.rows[0][0].as_str();
-    let fl_true  = fl.rows[1][0].as_str();
+    let fl_true = fl.rows[1][0].as_str();
     assert!(
         fl_false == "f" || fl_false == "false",
         "boolean flight-sql: expected 'f' or 'false' for false row, got {fl_false:?}"
@@ -7576,8 +7722,14 @@ async fn cli_boolean_type_roundtrips_correctly() {
     );
 
     // Non-boolean columns (label) must match across protocols.
-    assert_eq!(pg.rows[0][1], fl.rows[0][1], "boolean: label column mismatch for row 0");
-    assert_eq!(pg.rows[1][1], fl.rows[1][1], "boolean: label column mismatch for row 1");
+    assert_eq!(
+        pg.rows[0][1], fl.rows[0][1],
+        "boolean: label column mismatch for row 0"
+    );
+    assert_eq!(
+        pg.rows[1][1], fl.rows[1][1],
+        "boolean: label column mismatch for row 1"
+    );
 
     cleanup_catalog_artifacts(&catalog_path);
 }
@@ -7591,9 +7743,7 @@ async fn vacuum_query_log_succeeds() {
     cmd.write_stdin("SELECT 1;\n").assert().success();
 
     // Run VACUUM QUERY_LOG (should not error)
-    let output = cmd.write_stdin("VACUUM QUERY_LOG;\n")
-        .assert()
-        .success();
+    let output = cmd.write_stdin("VACUUM QUERY_LOG;\n").assert().success();
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     assert!(
@@ -7611,10 +7761,13 @@ async fn query_log_entry_created_after_query() {
     let mut cmd = start_embedded_cli(&catalog_path).await;
 
     // Execute a query
-    cmd.write_stdin("SELECT 1 AS test_col;\n").assert().success();
+    cmd.write_stdin("SELECT 1 AS test_col;\n")
+        .assert()
+        .success();
 
     // Query system.query_log (if exposed as table)
-    let output = cmd.write_stdin("SELECT query FROM system.query_log;\n")
+    let output = cmd
+        .write_stdin("SELECT query FROM system.query_log;\n")
         .assert()
         .success();
 
@@ -7638,7 +7791,8 @@ async fn test_statistics_influence_plan() {
         .timeout(std::time::Duration::from_secs(30));
 
     // Create table
-    let output = cmd.write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
+    let output = cmd
+        .write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
         .assert()
         .success();
 
@@ -7648,14 +7802,17 @@ async fn test_statistics_influence_plan() {
         .success();
 
     // Explain query with filter outside range (id=999)
-    let output = cmd.write_stdin("EXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
+    let output = cmd
+        .write_stdin("EXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
         .assert()
         .success();
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     // Verify plan uses statistics (either shows statistics or empty result due to stats)
     assert!(
-        stdout.contains("statistics") || stdout.contains("EmptyExec") || stdout.contains("Statistics"),
+        stdout.contains("statistics")
+            || stdout.contains("EmptyExec")
+            || stdout.contains("Statistics"),
         "Plan should reflect statistics usage: {}",
         stdout
     );

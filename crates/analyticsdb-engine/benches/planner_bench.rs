@@ -1,5 +1,5 @@
-use criterion::{black_box, Criterion};
 use analyticsdb_engine::sql_rewriter;
+use criterion::{black_box, Criterion};
 
 fn bench_sql_rewrite(c: &mut Criterion) {
     let sql_cases = vec![
@@ -14,11 +14,13 @@ fn bench_sql_rewrite(c: &mut Criterion) {
     c.bench_function("sql_rewrite_postgres_compatibility", |b| {
         b.iter(|| {
             for sql in &sql_cases {
-                let _ = rt.block_on(black_box(sql_rewriter::rewrite_sql_for_postgres_compatibility(
-                    black_box(sql),
-                    black_box(&analyticsdb_engine::ControlPlane::new_bootstrap()),
-                    black_box(&analyticsdb_core::SessionContext::default()),
-                )));
+                let _ = rt.block_on(black_box(
+                    sql_rewriter::rewrite_sql_for_postgres_compatibility(
+                        black_box(sql),
+                        black_box(&analyticsdb_engine::ControlPlane::new_bootstrap()),
+                        black_box(&analyticsdb_core::SessionContext::default()),
+                    ),
+                ));
             }
         })
     });

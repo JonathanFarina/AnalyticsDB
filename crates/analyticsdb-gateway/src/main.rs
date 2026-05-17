@@ -18,7 +18,6 @@ pub mod error;
 pub mod middleware;
 pub mod routes;
 pub mod session;
-pub mod proxy;
 
 #[derive(Clone)]
 pub struct GatewayState {

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tokio_postgres::{NoTls, Config};
+use tokio_postgres::{Config, NoTls};
 
 #[tokio::test]
 #[ignore]
@@ -52,7 +52,16 @@ async fn concurrency_profile_benchmark() {
 
     // Warm-up
     println!("Warming up (1 query)...");
-    let _ = run_single_query(&host, port, &user, password.as_deref(), &dbname, &schema, query).await;
+    let _ = run_single_query(
+        &host,
+        port,
+        &user,
+        password.as_deref(),
+        &dbname,
+        &schema,
+        query,
+    )
+    .await;
     println!();
 
     for &concurrency in &concurrency_levels {
@@ -73,7 +82,16 @@ async fn concurrency_profile_benchmark() {
             let handle: JoinHandle<Vec<u64>> = tokio::spawn(async move {
                 let mut latencies = Vec::new();
                 for _ in 0..queries_per_client {
-                    let lat = run_single_query(&host, port, &user, password.as_deref(), &dbname, &schema, &query).await;
+                    let lat = run_single_query(
+                        &host,
+                        port,
+                        &user,
+                        password.as_deref(),
+                        &dbname,
+                        &schema,
+                        &query,
+                    )
+                    .await;
                     latencies.push(lat);
                 }
                 latencies
@@ -133,7 +151,9 @@ async fn run_single_query(
 
             // Set search_path if not public
             if schema != "public" {
-                let _ = client.execute(&format!("SET search_path TO {}", schema), &[]).await;
+                let _ = client
+                    .execute(&format!("SET search_path TO {}", schema), &[])
+                    .await;
             }
 
             let _ = client.simple_query(query).await;

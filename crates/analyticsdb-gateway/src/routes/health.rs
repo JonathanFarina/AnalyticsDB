@@ -15,7 +15,9 @@ pub async fn liveness() -> Json<serde_json::Value> {
 }
 
 /// Readiness probe - checks if dependencies are available
-pub async fn readiness(State(_state): State<std::sync::Arc<crate::GatewayState>>) -> Json<serde_json::Value> {
+pub async fn readiness(
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
+) -> Json<serde_json::Value> {
     // For now, always return ready
     // In production, check dependencies like control plane, etc.
     Json(json!({

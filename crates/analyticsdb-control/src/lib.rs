@@ -1739,7 +1739,10 @@ impl ControlPlane {
 
                     // Rename physical storage directory
                     if let Some(catalog_path) = &self.catalog_path {
-                        eprintln!("DEBUG: Renaming database storage, catalog_path={:?}", catalog_path);
+                        eprintln!(
+                            "DEBUG: Renaming database storage, catalog_path={:?}",
+                            catalog_path
+                        );
                         let stem = catalog_path
                             .file_stem()
                             .and_then(|s| s.to_str())
@@ -1748,16 +1751,21 @@ impl ControlPlane {
                         managed_root.set_file_name(format!("{}.managed", stem));
                         let old_db_dir = managed_root.join(format!("db={}", name));
                         let new_db_dir = managed_root.join(format!("db={}", new_name));
-                        eprintln!("DEBUG: old_db_dir={:?}, exists={}", old_db_dir, old_db_dir.exists());
-                        eprintln!("DEBUG: new_db_dir={:?}, exists={}", new_db_dir, new_db_dir.exists());
+                        eprintln!(
+                            "DEBUG: old_db_dir={:?}, exists={}",
+                            old_db_dir,
+                            old_db_dir.exists()
+                        );
+                        eprintln!(
+                            "DEBUG: new_db_dir={:?}, exists={}",
+                            new_db_dir,
+                            new_db_dir.exists()
+                        );
                         if old_db_dir.exists() {
                             eprintln!("DEBUG: Renaming {:?} to {:?}", old_db_dir, new_db_dir);
                             std::fs::rename(&old_db_dir, &new_db_dir).map_err(|e| {
                                 eprintln!("DEBUG: Rename failed: {}", e);
-                                anyhow::anyhow!(
-                                    "Failed to rename database directory: {}",
-                                    e
-                                )
+                                anyhow::anyhow!("Failed to rename database directory: {}", e)
                             })?;
                             eprintln!("DEBUG: Rename succeeded");
                         } else {

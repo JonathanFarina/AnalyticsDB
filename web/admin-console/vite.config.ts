@@ -270,6 +270,9 @@ function relativeFromRepo(absolute: string): string {
 
 export default defineConfig({
   plugins: [clusterAdminPlugin()],
+  test: {
+    include: ["src/**/*.test.ts"],
+  },
   server: {
     host: "127.0.0.1",
     proxy: {

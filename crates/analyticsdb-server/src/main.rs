@@ -1,7 +1,7 @@
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::net::SocketAddr;
 
 use analyticsdb_control::{ClusterNode, NodeRole, NodeStatus};
 use analyticsdb_engine::PrototypeEngine;
@@ -10,6 +10,9 @@ use anyhow::{Context as AnyhowContext, Result};
 use clap::Parser;
 use futures::Future;
 use hyper_util::rt::tokio::TokioIo;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{trace::TracerProvider, Resource};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
@@ -207,7 +210,9 @@ async fn run() -> Result<()> {
     merge_config_with_cli(&mut config, &cli);
 
     // Validate the merged configuration
-    config.validate().context("Configuration validation failed")?;
+    config
+        .validate()
+        .context("Configuration validation failed")?;
 
     // If joining a cluster, request configuration from the coordinator
     if let Some(coordinator_endpoint) = &config.join {
@@ -332,12 +337,19 @@ async fn run() -> Result<()> {
     engine
         .control_plane()
         .set_tls_paths(
-            tls_cert_path.as_ref().and_then(|p| p.to_str().map(String::from)),
-            tls_key_path.as_ref().and_then(|p| p.to_str().map(String::from)),
+            tls_cert_path
+                .as_ref()
+                .and_then(|p| p.to_str().map(String::from)),
+            tls_key_path
+                .as_ref()
+                .and_then(|p| p.to_str().map(String::from)),
         )
         .await?;
 
-    let node_id = config.node_id.clone().unwrap_or_else(|| "standalone".to_string());
+    let node_id = config
+        .node_id
+        .clone()
+        .unwrap_or_else(|| "standalone".to_string());
 
     // Create a root span with node_id - all child spans will inherit this field
     let root_span = tracing::info_span!("node", node_id = %node_id);
@@ -380,7 +392,10 @@ async fn run() -> Result<()> {
                     "gateway" => NodeRole::Gateway,
                     _ => NodeRole::Control,
                 },
-                endpoint: format!("{}://{}:{}", flight_scheme, config.advertise_host, flight_port),
+                endpoint: format!(
+                    "{}://{}:{}",
+                    flight_scheme, config.advertise_host, flight_port
+                ),
                 internal_endpoint: Some(format!("http://{}:{}", config.advertise_host, node_port)),
                 status: NodeStatus::Ready,
                 last_heartbeat_at_epoch_ms: 0,
@@ -436,7 +451,10 @@ async fn run() -> Result<()> {
     };
 
     let pg_addr = config.postgres_addr.as_deref().unwrap_or("127.0.0.1:5432");
-    let flight_addr = config.flight_sql_addr.as_deref().unwrap_or("127.0.0.1:8815");
+    let flight_addr = config
+        .flight_sql_addr
+        .as_deref()
+        .unwrap_or("127.0.0.1:8815");
     let node_addr = config.node_addr.as_deref().unwrap_or("127.0.0.1:8816");
     let admin_addr = config
         .admin_addr
@@ -457,7 +475,10 @@ async fn run() -> Result<()> {
     info!("PostgreSQL protocol listening on: {}", pg_addr);
     info!("Flight SQL protocol listening on: {}", flight_addr);
     info!("Node communication channel listening on: {}", node_addr);
-    info!("Admin HTTP server (health checks) listening on {}", admin_addr);
+    info!(
+        "Admin HTTP server (health checks) listening on {}",
+        admin_addr
+    );
 
     // Start health server
     let (ready_tx, ready_rx) = watch::channel(false);

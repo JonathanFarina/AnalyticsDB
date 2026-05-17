@@ -35,9 +35,7 @@ pub struct GrantRequest {
 pub async fn list_databases(
     State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
-    let result = vec![
-        json!({ "name": "default", "owner": "admin" }),
-    ];
+    let result = vec![json!({ "name": "default", "owner": "admin" })];
     Ok(Json(result))
 }
 
@@ -50,16 +48,12 @@ pub async fn create_database(
 }
 
 /// Get a specific database (placeholder)
-pub async fn get_database(
-    Path(_name): Path<String>,
-) -> GatewayResult<Json<serde_json::Value>> {
+pub async fn get_database(Path(_name): Path<String>) -> GatewayResult<Json<serde_json::Value>> {
     Ok(Json(json!({ "name": "default", "owner": "admin" })))
 }
 
 /// Drop a database (placeholder)
-pub async fn drop_database(
-    Path(_name): Path<String>,
-) -> GatewayResult<Json<serde_json::Value>> {
+pub async fn drop_database(Path(_name): Path<String>) -> GatewayResult<Json<serde_json::Value>> {
     Ok(Json(json!({ "message": "Database dropped (placeholder)" })))
 }
 
@@ -67,9 +61,7 @@ pub async fn drop_database(
 pub async fn list_users(
     State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
-    let result = vec![
-        json!({ "name": "admin", "role": "admin" }),
-    ];
+    let result = vec![json!({ "name": "admin", "role": "admin" })];
     Ok(Json(result))
 }
 
@@ -82,16 +74,12 @@ pub async fn create_user(
 }
 
 /// Get a specific user (placeholder)
-pub async fn get_user(
-    Path(_name): Path<String>,
-) -> GatewayResult<Json<serde_json::Value>> {
+pub async fn get_user(Path(_name): Path<String>) -> GatewayResult<Json<serde_json::Value>> {
     Ok(Json(json!({ "name": "admin", "role": "admin" })))
 }
 
 /// Drop a user (placeholder)
-pub async fn drop_user(
-    Path(_name): Path<String>,
-) -> GatewayResult<Json<serde_json::Value>> {
+pub async fn drop_user(Path(_name): Path<String>) -> GatewayResult<Json<serde_json::Value>> {
     Ok(Json(json!({ "message": "User dropped (placeholder)" })))
 }
 
@@ -108,12 +96,14 @@ pub async fn grant_privilege(
     Extension(_claims): Extension<SessionClaims>,
     Json(_req): Json<GrantRequest>,
 ) -> GatewayResult<Json<serde_json::Value>> {
-    Ok(Json(json!({ "message": "Privilege granted (placeholder)" })))
+    Ok(Json(
+        json!({ "message": "Privilege granted (placeholder)" }),
+    ))
 }
 
 /// Revoke privilege (placeholder)
-pub async fn revoke_privilege(
-    Path(_id): Path<String>,
-) -> GatewayResult<Json<serde_json::Value>> {
-    Ok(Json(json!({ "message": "Privilege revoked (placeholder)" })))
+pub async fn revoke_privilege(Path(_id): Path<String>) -> GatewayResult<Json<serde_json::Value>> {
+    Ok(Json(
+        json!({ "message": "Privilege revoked (placeholder)" }),
+    ))
 }

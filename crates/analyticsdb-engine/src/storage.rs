@@ -444,9 +444,7 @@ pub async fn determine_storage_policy(
         analyticsdb_control::StoragePolicyType::Managed
     };
     let storage_desc = match policy_type {
-        analyticsdb_control::StoragePolicyType::Managed => {
-            "managed (native Parquet)".to_string()
-        }
+        analyticsdb_control::StoragePolicyType::Managed => "managed (native Parquet)".to_string(),
         analyticsdb_control::StoragePolicyType::External => {
             let path = relation.storage_path.as_deref().unwrap_or("unknown");
             format!("external (Parquet at {})", path)

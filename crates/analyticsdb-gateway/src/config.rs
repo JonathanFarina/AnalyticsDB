@@ -1,7 +1,7 @@
 //! Gateway configuration
 
-use std::env;
 use serde::{Deserialize, Serialize};
+use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -81,7 +81,11 @@ impl Default for OidcConfig {
             client_id: None,
             client_secret: None,
             redirect_url: None,
-            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            scopes: vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+            ],
             providers: vec![],
         }
     }

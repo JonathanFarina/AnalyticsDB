@@ -7,8 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::session::SessionClaims;
 use crate::error::GatewayResult;
+use crate::session::SessionClaims;
 
 #[derive(Debug, Deserialize)]
 pub struct ExplorerQuery {
@@ -57,37 +57,31 @@ pub async fn get_explorer_snapshot(
 ) -> GatewayResult<Json<ExplorerSnapshot>> {
     // Placeholder implementation
     let snapshot = ExplorerSnapshot {
-        databases: vec![
-            DatabaseInfo {
-                name: "default".to_string(),
-                owner: "admin".to_string(),
-                schemas: vec![
-                    SchemaInfo {
-                        name: "public".to_string(),
-                        relations: vec![
-                            RelationInfo {
-                                name: "sample_table".to_string(),
-                                kind: "table".to_string(),
-                                schema: "public".to_string(),
-                                storage: "managed".to_string(),
-                                columns: vec![
-                                    ColumnInfo {
-                                        name: "id".to_string(),
-                                        data_type: "INTEGER".to_string(),
-                                        nullable: false,
-                                    },
-                                    ColumnInfo {
-                                        name: "name".to_string(),
-                                        data_type: "TEXT".to_string(),
-                                        nullable: true,
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                ],
-            },
-        ],
+        databases: vec![DatabaseInfo {
+            name: "default".to_string(),
+            owner: "admin".to_string(),
+            schemas: vec![SchemaInfo {
+                name: "public".to_string(),
+                relations: vec![RelationInfo {
+                    name: "sample_table".to_string(),
+                    kind: "table".to_string(),
+                    schema: "public".to_string(),
+                    storage: "managed".to_string(),
+                    columns: vec![
+                        ColumnInfo {
+                            name: "id".to_string(),
+                            data_type: "INTEGER".to_string(),
+                            nullable: false,
+                        },
+                        ColumnInfo {
+                            name: "name".to_string(),
+                            data_type: "TEXT".to_string(),
+                            nullable: true,
+                        },
+                    ],
+                }],
+            }],
+        }],
     };
 
     Ok(Json(snapshot))
@@ -97,9 +91,7 @@ pub async fn get_explorer_snapshot(
 pub async fn list_databases(
     State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
-    let result = vec![
-        json!({ "name": "default", "owner": "admin" }),
-    ];
+    let result = vec![json!({ "name": "default", "owner": "admin" })];
     Ok(Json(result))
 }
 
@@ -108,9 +100,7 @@ pub async fn list_schemas(
     Query(_query): Query<ExplorerQuery>,
     State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
-    let result = vec![
-        json!({ "name": "public" }),
-    ];
+    let result = vec![json!({ "name": "public" })];
     Ok(Json(result))
 }
 
@@ -119,9 +109,7 @@ pub async fn list_tables(
     Query(_query): Query<ExplorerQuery>,
     State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
-    let result = vec![
-        json!({ "name": "sample_table", "schema": "public" }),
-    ];
+    let result = vec![json!({ "name": "sample_table", "schema": "public" })];
     Ok(Json(result))
 }
 

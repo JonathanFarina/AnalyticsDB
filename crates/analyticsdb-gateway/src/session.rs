@@ -14,13 +14,13 @@ use crate::error::GatewayResult;
 /// Session information stored in JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionClaims {
-    pub sub: String,         // username
-    pub role: String,         // user role
-    pub database: String,     // current database
-    pub schema: String,       // current schema
-    pub exp: usize,           // expiration timestamp
-    pub iat: usize,          // issued at timestamp
-    pub session_id: String,   // unique session ID
+    pub sub: String,        // username
+    pub role: String,       // user role
+    pub database: String,   // current database
+    pub schema: String,     // current schema
+    pub exp: usize,         // expiration timestamp
+    pub iat: usize,         // issued at timestamp
+    pub session_id: String, // unique session ID
 }
 
 /// Session store for managing active sessions

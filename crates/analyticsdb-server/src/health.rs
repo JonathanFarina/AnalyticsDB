@@ -6,13 +6,10 @@ use std::task::{Context, Poll};
 
 use hyper::body::{Body, Bytes};
 use hyper::service::Service;
+use hyper_util::{rt::TokioIo, server::conn::auto::Builder};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, error};
-use hyper_util::{
-    rt::TokioIo,
-    server::conn::auto::Builder,
-};
 
 /// Health service handler for liveness and readiness probes, plus metrics endpoint.
 struct HealthService {
@@ -41,10 +38,18 @@ impl Service<hyper::Request<hyper::body::Incoming>> for HealthService {
                 if ready {
                     (hyper::StatusCode::OK, "OK\n".to_string(), "text/plain")
                 } else {
-                    (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string(), "text/plain")
+                    (
+                        hyper::StatusCode::SERVICE_UNAVAILABLE,
+                        "NOT READY\n".to_string(),
+                        "text/plain",
+                    )
                 }
             } else {
-                (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string(), "text/plain")
+                (
+                    hyper::StatusCode::NOT_FOUND,
+                    "NOT FOUND\n".to_string(),
+                    "text/plain",
+                )
             };
             debug!("Health check {} -> {}", path, status);
             let body_bytes = Bytes::from(body);

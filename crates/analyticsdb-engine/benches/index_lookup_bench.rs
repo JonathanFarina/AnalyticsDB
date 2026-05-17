@@ -2,9 +2,7 @@ use criterion::{black_box, Criterion};
 
 fn bench_index_key_parsing(c: &mut Criterion) {
     c.bench_function("index_key_parse_and_compare", |b| {
-        let keys: Vec<String> = (0..1000)
-            .map(|i| format!("key_{}", i))
-            .collect();
+        let keys: Vec<String> = (0..1000).map(|i| format!("key_{}", i)).collect();
 
         b.iter(|| {
             let mut sorted = black_box(keys.clone());
@@ -30,5 +28,9 @@ fn bench_index_lookup_simulation(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_index_key_parsing, bench_index_lookup_simulation);
+criterion_group!(
+    benches,
+    bench_index_key_parsing,
+    bench_index_lookup_simulation
+);
 criterion_main!(benches);

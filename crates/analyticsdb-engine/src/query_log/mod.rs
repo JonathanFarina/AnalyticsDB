@@ -432,8 +432,16 @@ pub struct QueryLogRecord {
 
 pub fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("event_time_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-        Field::new("query_start_time_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new(
+            "event_time_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            "query_start_time_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         Field::new("query_id", DataType::Utf8, false),
         Field::new("initial_query_id", DataType::Utf8, false),
         Field::new("is_initial_query", DataType::Boolean, false),
@@ -477,8 +485,7 @@ pub(crate) async fn cleanup_expired_logs(
 
     let (store, prefix) = storage::store_for_location(root_location)?;
 
-    let expiration =
-        Utc::now() - Duration::from_secs(86400 * config.retention_days as u64);
+    let expiration = Utc::now() - Duration::from_secs(86400 * config.retention_days as u64);
 
     debug!(
         "query log retention: cleaning up logs older than {}",
@@ -683,7 +690,6 @@ impl QueryLogWriter {
             .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
         storage::write_parquet_batches(&store, &key, schema(), &[batch]).await
     }
-
 }
 
 fn protocol_label(protocol: &Protocol) -> &'static str {

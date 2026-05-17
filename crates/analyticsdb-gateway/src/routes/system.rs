@@ -7,8 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::GatewayState;
 use crate::error::GatewayResult;
+use crate::GatewayState;
 
 #[derive(Debug, Deserialize)]
 pub struct LogQuery {

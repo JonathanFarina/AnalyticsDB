@@ -6,14 +6,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::GatewayState;
-use crate::session::SessionClaims;
 use crate::error::GatewayResult;
+use crate::session::SessionClaims;
+use crate::GatewayState;
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     pub sql: String,
-    pub protocol: Option<String>,  // "pg" or "flight"
+    pub protocol: Option<String>, // "pg" or "flight"
 }
 
 #[derive(Debug, Serialize)]
@@ -38,7 +38,7 @@ pub struct QueryTimings {
 
 #[derive(Debug, Serialize)]
 pub struct QueryMessage {
-    pub level: String,  // "info", "warning", "error"
+    pub level: String, // "info", "warning", "error"
     pub text: String,
 }
 

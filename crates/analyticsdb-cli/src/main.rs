@@ -230,13 +230,21 @@ async fn run_interactive(options: InteractiveOptions) -> Result<()> {
 
                             if let Some(interval) = client_options.watch_interval {
                                 loop {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(interval))
+                                        .await;
                                     if let Some(ref sql) = client_options.last_sql {
-                                        match execute_sql(sql.clone(), &client_options, Vec::new()).await {
+                                        match execute_sql(sql.clone(), &client_options, Vec::new())
+                                            .await
+                                        {
                                             Ok(response) => {
                                                 let response_received_at = Instant::now();
-                                                let rendered = render_response(&response, client_options.format);
-                                                if let Some(output_path) = &client_options.output_file {
+                                                let rendered = render_response(
+                                                    &response,
+                                                    client_options.format,
+                                                );
+                                                if let Some(output_path) =
+                                                    &client_options.output_file
+                                                {
                                                     std::fs::write(output_path, rendered)?;
                                                 } else {
                                                     print!("{rendered}");
@@ -245,9 +253,15 @@ async fn run_interactive(options: InteractiveOptions) -> Result<()> {
                                                 if client_options.timing {
                                                     render_timing(
                                                         &response,
-                                                        response_received_at.duration_since(started_at).as_millis(),
-                                                        rendered_at.duration_since(response_received_at).as_millis(),
-                                                        rendered_at.duration_since(started_at).as_millis(),
+                                                        response_received_at
+                                                            .duration_since(started_at)
+                                                            .as_millis(),
+                                                        rendered_at
+                                                            .duration_since(response_received_at)
+                                                            .as_millis(),
+                                                        rendered_at
+                                                            .duration_since(started_at)
+                                                            .as_millis(),
                                                         client_options.format,
                                                     );
                                                 }
@@ -945,13 +959,16 @@ fn render_csv(response: &QueryResponse) -> String {
         output.push_str(&response.columns.join(","));
         output.push('\n');
         for row in &response.rows {
-            let escaped: Vec<String> = row.iter().map(|v| {
-                if v.contains(',') || v.contains('"') || v.contains('\n') {
-                    format!("\"{}\"", v.replace('"', "\"\""))
-                } else {
-                    v.clone()
-                }
-            }).collect();
+            let escaped: Vec<String> = row
+                .iter()
+                .map(|v| {
+                    if v.contains(',') || v.contains('"') || v.contains('\n') {
+                        format!("\"{}\"", v.replace('"', "\"\""))
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect();
             output.push_str(&escaped.join(","));
             output.push('\n');
         }
@@ -968,7 +985,10 @@ fn render_table(response: &QueryResponse) -> String {
         response.session.user, response.session.database, response.session.schema
     ));
     output.push_str(&format!("Message: {}\n", response.message));
-    output.push_str(&format!("Execution Time: {} ms\n", response.execution_time_ms));
+    output.push_str(&format!(
+        "Execution Time: {} ms\n",
+        response.execution_time_ms
+    ));
 
     if response.columns.is_empty() {
         output.push_str("No columns returned.\n");
@@ -984,7 +1004,10 @@ fn render_table(response: &QueryResponse) -> String {
 
     let divider = build_divider(&widths);
     output.push_str(&format!("{divider}\n"));
-    output.push_str(&format!("| {} |\n", format_cells(&response.columns, &widths)));
+    output.push_str(&format!(
+        "| {} |\n",
+        format_cells(&response.columns, &widths)
+    ));
     output.push_str(&format!("{divider}\n"));
 
     for row in &response.rows {
@@ -1024,18 +1047,14 @@ fn handle_meta_command(command: &str, options: &mut ClientOptions) -> Result<Met
             print_connection_info(options);
             Ok(MetaCommandAction::Continue)
         }
-        ["\\d", table] => {
-            Ok(MetaCommandAction::ExecuteSql(format!("SHOW COLUMNS FROM {table}")))
-        }
-        ["\\dn"] => {
-            Ok(MetaCommandAction::ExecuteSql("SHOW SCHEMAS".to_string()))
-        }
-        ["\\du"] => {
-            Ok(MetaCommandAction::ExecuteSql(
-                "SELECT rolname, rolsuper, rolcreatedb, rolcanlogin FROM pg_roles ORDER BY rolname"
-                    .to_string(),
-            ))
-        }
+        ["\\d", table] => Ok(MetaCommandAction::ExecuteSql(format!(
+            "SHOW COLUMNS FROM {table}"
+        ))),
+        ["\\dn"] => Ok(MetaCommandAction::ExecuteSql("SHOW SCHEMAS".to_string())),
+        ["\\du"] => Ok(MetaCommandAction::ExecuteSql(
+            "SELECT rolname, rolsuper, rolcreatedb, rolcanlogin FROM pg_roles ORDER BY rolname"
+                .to_string(),
+        )),
         ["\\set"] => {
             if options.variables.is_empty() {
                 println!("No variables set.");
@@ -1150,8 +1169,6 @@ fn sql_statement_is_complete(sql: &str) -> bool {
 
     last_significant == Some(';') && !in_single_quote && !in_double_quote
 }
-
-
 
 fn render_timing(
     response: &QueryResponse,

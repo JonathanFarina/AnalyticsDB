@@ -9,12 +9,21 @@ pub(crate) fn compute_column_stats(batch: &RecordBatch) -> Vec<crate::manifest::
         let null_count = column.null_count() as i64;
         let mut min_value = None;
         let mut max_value = None;
-        
+
         // Only compute min/max for types that support it
         match field.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                if let Some(array) = column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                if let Some(array) = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                {
                     if let Some(min) = datafusion::arrow::compute::min(array) {
                         min_value = Some(min.to_string());
                     }
@@ -24,7 +33,10 @@ pub(crate) fn compute_column_stats(batch: &RecordBatch) -> Vec<crate::manifest::
                 }
             }
             DataType::Float32 | DataType::Float64 => {
-                if let Some(array) = column.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>() {
+                if let Some(array) = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                {
                     if let Some(min) = datafusion::arrow::compute::min(array) {
                         min_value = Some(min.to_string());
                     }
@@ -41,7 +53,7 @@ pub(crate) fn compute_column_stats(batch: &RecordBatch) -> Vec<crate::manifest::
             }
             _ => {}
         }
-        
+
         stats.push(crate::manifest::ColumnStat {
             name: field.name().clone(),
             null_count,
@@ -200,10 +212,10 @@ pub(crate) async fn write_dataframe_to_table_snapshot(
         )?;
         let size = bytes.len() as u64;
         let entry_row_count = prepared_batch.num_rows() as i64;
-        
+
         // Compute column statistics
         let column_stats = compute_column_stats(&prepared_batch);
-        
+
         store.put(&key, bytes.into()).await?;
         manifest_entries.push(crate::manifest::ManifestEntry {
             path: data_path,

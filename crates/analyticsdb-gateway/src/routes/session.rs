@@ -3,9 +3,9 @@
 use axum::{extract::State, Extension, Json};
 use serde_json::json;
 
-use crate::GatewayState;
-use crate::session::SessionClaims;
 use crate::error::GatewayResult;
+use crate::session::SessionClaims;
+use crate::GatewayState;
 
 /// Get current session info
 pub async fn get_session(

@@ -9,52 +9,52 @@ use std::path::PathBuf;
 pub struct Config {
     /// Node role: control, compute, storage, gateway
     pub role: String,
-    
+
     /// Node ID (auto-assigned if None)
     pub node_id: Option<String>,
-    
+
     /// Address to bind PostgreSQL wire protocol
     pub postgres_addr: Option<String>,
-    
+
     /// Address to bind Flight SQL protocol
     pub flight_sql_addr: Option<String>,
-    
+
     /// Address to bind node-to-node communication
     pub node_addr: Option<String>,
-    
+
     /// Address to bind admin HTTP server (health checks)
     pub admin_addr: Option<String>,
-    
+
     /// Hostname/IP that peer nodes use to reach this node
     pub advertise_host: String,
-    
+
     /// Path to catalog database
     pub catalog_path: String,
-    
+
     /// Path to cluster config file
     pub cluster_config: Option<String>,
-    
+
     /// Whether to initialize a new cluster
     pub init_cluster: bool,
-    
+
     /// Coordinator endpoint to join
     pub join: Option<String>,
-    
+
     /// Storage root URI (s3://, gs://, azure://, file://)
     pub storage_root: Option<String>,
-    
+
     /// TLS certificate path
     pub tls_cert: Option<PathBuf>,
-    
+
     /// TLS key path
     pub tls_key: Option<PathBuf>,
-    
+
     /// TLS CA certificate path
     pub tls_ca_cert: Option<PathBuf>,
-    
+
     /// TLS domain for verification
     pub tls_domain: Option<String>,
-    
+
     /// Disable TLS verification (insecure)
     pub tls_insecure: bool,
 }
@@ -91,7 +91,7 @@ impl Config {
         serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path))
     }
-    
+
     /// Validate configuration.
     pub fn validate(&self) -> Result<()> {
         // Validate TLS config

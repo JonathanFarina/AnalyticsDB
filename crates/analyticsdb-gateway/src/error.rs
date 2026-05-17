@@ -35,8 +35,14 @@ impl IntoResponse for GatewayError {
             GatewayError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
             GatewayError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             GatewayError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            GatewayError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string()),
-            GatewayError::Jwt(_) => (StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string()),
+            GatewayError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ),
+            GatewayError::Jwt(_) => (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or expired token".to_string(),
+            ),
             GatewayError::Oidc(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
         };
 
