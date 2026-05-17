@@ -160,8 +160,7 @@ jobs:
       - name: Run JDBC smoke test
         run: |
           # Pick three free ports: postgres wire, flight SQL, and node communication
-          CATALOG=$(mktemp)/catalog.db
-          mkdir -p "$(dirname "$CATALOG")"
+          CATALOG=$(mktemp -d)/catalog.db
           PG_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
           FL_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
           ND_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")

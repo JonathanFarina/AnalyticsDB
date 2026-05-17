@@ -81,6 +81,17 @@ fn build_s3_store(rest: &str) -> Result<(Arc<dyn ObjectStore>, OPath)> {
 
     let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
 
+    // MinIO and other S3-compatible services use path-style URLs
+    // (http://host:port/bucket/key) rather than virtual-hosted-style
+    // (http://bucket.host:port/key). Disable virtual hosted style when
+    // a custom endpoint is configured.
+    if std::env::var("AWS_ENDPOINT_URL")
+        .or_else(|_| std::env::var("AWS_ENDPOINT"))
+        .is_ok()
+    {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+
     // SSE: ANALYTICSDB_S3_SSE takes precedence over ClusterConfig; the engine
     // propagates ClusterConfig values into these env vars at startup if needed.
     // Accepted values: "AES256" (SSE-S3) or "aws:kms" (SSE-KMS).

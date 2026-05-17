@@ -6463,15 +6463,15 @@ async fn cli_s3_storage_root_supports_full_dml_ddl_lifecycle() {
     let select_stdout = String::from_utf8(select_out).expect("stdout should be utf-8");
     assert!(
         select_stdout.contains("alpha"),
-        "S3 SELECT should return alpha row"
+        "S3 SELECT should return alpha row. stdout: {select_stdout}"
     );
     assert!(
         select_stdout.contains("beta"),
-        "S3 SELECT should return beta row"
+        "S3 SELECT should return beta row. stdout: {select_stdout}"
     );
     assert!(
         select_stdout.contains("gamma"),
-        "S3 SELECT should return gamma row"
+        "S3 SELECT should return gamma row. stdout: {select_stdout}"
     );
 
     // UPDATE
