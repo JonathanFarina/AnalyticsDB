@@ -7453,6 +7453,52 @@ async fn cli_boolean_type_roundtrips_correctly() {
 }
 
 #[tokio::test]
+async fn vacuum_query_log_succeeds() {
+    let catalog_path = setup_temp_catalog().await;
+    let mut cmd = start_embedded_cli(&catalog_path).await;
+
+    // Execute a query to generate log entry
+    cmd.write_stdin("SELECT 1;\n").assert().success();
+
+    // Run VACUUM QUERY_LOG (should not error)
+    let output = cmd.write_stdin("VACUUM QUERY_LOG;\n")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.to_lowercase().contains("query log vacuum") || stdout.contains("completed"),
+        "VACUUM QUERY_LOG should succeed: {}",
+        stdout
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test]
+async fn query_log_entry_created_after_query() {
+    let catalog_path = setup_temp_catalog().await;
+    let mut cmd = start_embedded_cli(&catalog_path).await;
+
+    // Execute a query
+    cmd.write_stdin("SELECT 1 AS test_col;\n").assert().success();
+
+    // Query system.query_log (if exposed as table)
+    let output = cmd.write_stdin("SELECT query FROM system.query_log;\n")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("SELECT 1") || stdout.contains("test_col"),
+        "Query log should contain the executed query: {}",
+        stdout
+    );
+
+    cleanup_catalog_artifacts(&catalog_path);
+}
+
+#[tokio::test]
 async fn test_statistics_influence_plan() {
     // Start embedded mode
     let mut cmd = Command::cargo_bin("analyticsdb-cli").unwrap();

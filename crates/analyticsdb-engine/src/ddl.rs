@@ -1374,6 +1374,16 @@ impl PrototypeEngine {
                     request.session.clone(),
                 )
             }
+            MetadataStatement::VacuumQueryLog => {
+                self.query_log.vacuum().await?;
+                (
+                    Arc::new(Schema::empty()),
+                    Vec::new(),
+                    "Query log vacuum completed successfully.".to_string(),
+                    command_outcome("VACUUM", 0),
+                    request.session.clone(),
+                )
+            }
             MetadataStatement::AlterTable {
                 database,
                 schema,

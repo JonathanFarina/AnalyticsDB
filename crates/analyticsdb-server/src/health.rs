@@ -14,7 +14,7 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 
-/// Health service handler for liveness and readiness probes.
+/// Health service handler for liveness and readiness probes, plus metrics endpoint.
 struct HealthService {
     ready_rx: watch::Receiver<bool>,
 }
@@ -34,23 +34,27 @@ impl Service<hyper::Request<hyper::body::Incoming>> for HealthService {
         let ready_rx = self.ready_rx.clone();
         Box::pin(async move {
             let path = req.uri().path();
-            let (status, body) = if path == "/healthz" {
-                (hyper::StatusCode::OK, "OK\n".to_string())
+            let (status, body, content_type) = if path == "/healthz" {
+                (hyper::StatusCode::OK, "OK\n".to_string(), "text/plain")
             } else if path == "/readyz" {
                 let ready = *ready_rx.borrow();
                 if ready {
-                    (hyper::StatusCode::OK, "OK\n".to_string())
+                    (hyper::StatusCode::OK, "OK\n".to_string(), "text/plain")
                 } else {
-                    (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string())
+                    (hyper::StatusCode::SERVICE_UNAVAILABLE, "NOT READY\n".to_string(), "text/plain")
                 }
+            } else if path == "/metrics" {
+                // Expose Prometheus metrics
+                let metrics = analyticsdb_engine::metrics::get_metrics();
+                (hyper::StatusCode::OK, metrics, "text/plain; version=0.0.4")
             } else {
-                (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string())
+                (hyper::StatusCode::NOT_FOUND, "NOT FOUND\n".to_string(), "text/plain")
             };
             debug!("Health check {} -> {}", path, status);
             let body_bytes = Bytes::from(body);
             Ok(hyper::Response::builder()
                 .status(status)
-                .header("Content-Type", "text/plain")
+                .header("Content-Type", content_type)
                 .body(HttpBody::new(body_bytes))
                 .unwrap())
         })

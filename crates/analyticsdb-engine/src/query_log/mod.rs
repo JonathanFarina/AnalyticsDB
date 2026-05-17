@@ -43,6 +43,11 @@ pub struct QueryLog {
 }
 
 impl QueryLog {
+    /// Trigger manual vacuum of expired query log partitions.
+    pub async fn vacuum(&self) -> Result<()> {
+        cleanup_expired_logs(&self.config, &self.root_location).await
+    }
+
     pub fn new(config: QueryLogConfig, root: PathBuf) -> Self {
         let root_location = format!("file://{}", root.display());
         if let Err(error) = std::fs::create_dir_all(&root) {
@@ -427,18 +432,8 @@ pub struct QueryLogRecord {
 
 pub fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("event_type", DataType::Utf8, false),
-        Field::new(
-            "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-        Field::new("event_time_us", DataType::Int64, false),
-        Field::new(
-            "query_start_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
+        Field::new("event_time_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("query_start_time_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("query_id", DataType::Utf8, false),
         Field::new("initial_query_id", DataType::Utf8, false),
         Field::new("is_initial_query", DataType::Boolean, false),
@@ -464,15 +459,60 @@ pub fn schema() -> SchemaRef {
         Field::new("coordinator_node_id", DataType::Utf8, false),
         Field::new("worker_node_id", DataType::Utf8, true),
         Field::new("distributed_partition_count", DataType::Int32, true),
-        Field::new(
-            "tables",
-            DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
-            true,
-        ),
+        Field::new("tables", DataType::new_list(DataType::Utf8, true)),
         Field::new("settings", DataType::Utf8, false),
         Field::new("profile", DataType::Utf8, false),
         Field::new("engine_version", DataType::Utf8, false),
     ]))
+}
+
+/// Standalone function to clean up expired query log partitions.
+pub(crate) async fn cleanup_expired_logs(
+    config: &QueryLogConfig,
+    root_location: &str,
+) -> Result<()> {
+    if config.retention_days == 0 {
+        return Ok(());
+    }
+
+    let (store, prefix) = storage::store_for_location(root_location)?;
+
+    let expiration =
+        Utc::now() - Duration::from_secs(86400 * config.retention_days as u64);
+
+    debug!(
+        "query log retention: cleaning up logs older than {}",
+        expiration
+    );
+
+    let mut stream = store.list(Some(&prefix));
+    while let Some(meta) = stream.next().await {
+        let meta = match meta {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let path = meta.location.as_ref();
+        let Some(rel_path) = path.strip_prefix(prefix.as_ref()) else {
+            continue;
+        };
+        let rel_path = rel_path.trim_start_matches('/');
+        // Check if path contains a date=YYYY-MM-DD partition
+        let mut parts = rel_path.split('/');
+        if let Some(first_part) = parts.next() {
+            if first_part.starts_with("date=") {
+                let date_str = &first_part[5..]; // strip "date="
+                if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                    let partition_date = Utc.ymd(date.year(), date.month(), date.day());
+                    if partition_date < expiration.date() {
+                        if let Err(e) = store.delete(&meta.location).await {
+                            debug!("failed to delete expired query log {}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn records_to_batch(records: &[QueryLogRecord]) -> Result<RecordBatch> {
@@ -582,8 +622,8 @@ impl QueryLogWriter {
         let interval = Duration::from_millis(self.config.batch_interval_ms.max(1));
         let mut ticker = tokio::time::interval(interval);
 
-        // Retention sweeper: once per day
-        let mut retention_ticker = tokio::time::interval(Duration::from_secs(86400));
+        // Retention sweeper: once per hour
+        let mut retention_ticker = tokio::time::interval(Duration::from_secs(3600));
 
         loop {
             tokio::select! {
@@ -605,7 +645,7 @@ impl QueryLogWriter {
                     self.flush(&mut buffer).await;
                 }
                 _ = retention_ticker.tick() => {
-                    self.cleanup_expired_logs().await;
+                    let _ = cleanup_expired_logs(&self.config, &self.root_location).await;
                 }
             }
         }
@@ -632,57 +672,18 @@ impl QueryLogWriter {
             .timestamp_micros(records[0].event_time_us)
             .single()
             .unwrap_or_else(Utc::now);
+        let date_partition = format!(
+            "date={:04}-{:02}-{:02}",
+            event_time.year(),
+            event_time.month(),
+            event_time.day()
+        );
         let key = prefix
-            .join(format!("{:04}", event_time.year()).as_str())
-            .join(format!("{:02}", event_time.month()).as_str())
-            .join(format!("{:02}", event_time.day()).as_str())
+            .join(&*date_partition)
             .join(format!("{}.parquet", uuid::Uuid::now_v7()).as_str());
         storage::write_parquet_batches(&store, &key, schema(), &[batch]).await
     }
 
-    async fn cleanup_expired_logs(&self) {
-        if self.config.retention_days == 0 {
-            return;
-        }
-
-        let (store, prefix) = match storage::store_for_location(&self.root_location) {
-            Ok(res) => res,
-            Err(_) => return,
-        };
-
-        let expiration =
-            Utc::now() - Duration::from_secs(86400 * self.config.retention_days as u64);
-        let expiration_prefix = format!(
-            "{:04}/{:02}/{:02}/",
-            expiration.year(),
-            expiration.month(),
-            expiration.day()
-        );
-
-        debug!(
-            "query log retention: cleaning up logs older than {}",
-            expiration
-        );
-
-        // List root and find YYYY/ directories
-        let mut stream = store.list(Some(&prefix));
-        while let Some(meta) = stream.next().await {
-            let Ok(meta) = meta else { continue };
-            let path = meta.location.as_ref();
-            if let Some(rel_path) = path.strip_prefix(prefix.as_ref()) {
-                let rel_path = rel_path.trim_start_matches('/');
-                if rel_path.len() >= 10 && rel_path[0..4].chars().all(|c| c.is_ascii_digit()) {
-                    // It looks like YYYY/MM/DD/...
-                    let day_prefix = &rel_path[0..10]; // YYYY/MM/DD
-                    if day_prefix < &expiration_prefix[0..10] {
-                        if let Err(e) = store.delete(&meta.location).await {
-                            debug!("failed to delete expired query log {}: {}", path, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn protocol_label(protocol: &Protocol) -> &'static str {

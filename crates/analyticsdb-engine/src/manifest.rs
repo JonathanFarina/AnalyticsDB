@@ -16,6 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::storage;
+// use crate::metrics;
 
 const MAX_CAS_RETRIES: usize = 10;
 
@@ -235,6 +236,7 @@ pub async fn append_to_manifest(
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
                 // Another writer committed between our read and write; retry.
                 if attempt + 1 == MAX_CAS_RETRIES {
+                    metrics::record_manifest_publish_failure();
                     anyhow::bail!(
                         "manifest CAS failed after {} retries for prefix {}",
                         MAX_CAS_RETRIES,
@@ -251,7 +253,10 @@ pub async fn append_to_manifest(
                     .map(|_| ())
                     .map_err(Into::into);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                metrics::record_manifest_publish_failure();
+                return Err(e.into());
+            }
         }
     }
     Ok(())
@@ -278,6 +283,7 @@ pub async fn replace_manifest(
             Ok(_) => return Ok(()),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => {
                 if attempt + 1 == MAX_CAS_RETRIES {
+                    metrics::record_manifest_publish_failure();
                     anyhow::bail!(
                         "manifest CAS failed after {} retries for prefix {}",
                         MAX_CAS_RETRIES,
@@ -292,7 +298,10 @@ pub async fn replace_manifest(
                     .map(|_| ())
                     .map_err(Into::into);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                metrics::record_manifest_publish_failure();
+                return Err(e.into());
+            }
         }
     }
     Ok(())

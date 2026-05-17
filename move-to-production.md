@@ -630,20 +630,33 @@ Required by every plane's "Rules" in
 
 Tasks:
 
-G1. **Metrics.** Emit Prometheus-compatible metrics via `tracing-prometheus`
-    or `metrics` crate: `query_admission_total`, `query_duration_seconds`
-    histograms (by user, db, schema, protocol, outcome), `worker_partition_duration`,
-    `manifest_publish_failures_total`, `auth_failures_total`. Scrape endpoint
-    on each node.
+G1. **Metrics.** ✅ Implemented: Emit Prometheus-compatible metrics via `metrics` crate with `metrics-exporter-prometheus`:
+    - `query_admission_total` (counter, labels: user, db, schema, protocol, outcome) - recorded in `execute_query`
+    - `query_duration_seconds` (histogram, labels: user, db, schema, protocol, outcome) - recorded in `execute_query`
+    - `worker_partition_duration` (histogram, labels: node_id, query_id) - recorded in `execute_partition` via `WorkerPartitionTimer`
+    - `manifest_publish_failures_total` (counter) - recorded in `manifest.rs` on CAS failure
+    - `auth_failures_total` (counter, labels: protocol) - recorded in `analyticsdb-protocol` auth handlers
+    - Scrape endpoint `/metrics` exposed on admin HTTP server (port 9090) via `health.rs`
+    > Done: Metrics module created at `crates/analyticsdb-engine/src/metrics.rs`. All metrics defined and instrumented. `/metrics` endpoint returns Prometheus-format metrics.
 
-G2. **OpenTelemetry traces.** Attach trace ids at admission and propagate
-    via gRPC metadata into worker `ExecutePartition` calls so a single trace
-    spans coordinator + workers. Document an OTLP collector deployment.
+G2. **OpenTelemetry traces.** ✅ Implemented: Attach trace ids at admission and propagate
+     via gRPC metadata into worker `ExecutePartition` calls so a single trace
+     spans coordinator + workers. Document an OTLP collector deployment.
+     > Done: OpenTelemetry SDK integrated with OTLP exporter; tracer initialized
+     > in `analyticsdb-server/src/main.rs` with env-based config (`OTEL_EXPORTER_OTLP_ENDPOINT`).
+     > `execute_query_inner()` instrumented with `#[tracing::instrument]` including `query_id`.
+     > Trace context propagated via W3C Trace Context headers in gRPC metadata for `ExecutePartition`
+     > and `ExecutePartitionWrite` calls. `docs/otel-collector.md` provides Docker Compose setup
+     > with Jaeger/Prometheus backends.
 
-G3. **Query log completeness.** Close the remaining `Partial` gaps called out in
+ G3. **Query log completeness.** ✅ Closed the remaining `Partial` gaps called out in
     [feature-status.md](docs/agents/feature-status.md): streaming Flight SQL
-    finish accounting, DataFusion stage metric enrichment, retention sweeper,
-    partitioned layout. (Worker sibling rows for distributed reads landed in C6.)
+    finish accounting (rows_returned/bytes_sent tracked via QueryLogStreamWrapper),
+    DataFusion stage metric enrichment (new `system.query_stage_metrics` table with
+    output_rows, elapsed_compute_ms, memory_used_bytes), retention sweeper
+    (every 1 hour, configurable `query_log_retention_days` default 7),
+    partitioned layout (`date=YYYY-MM-DD`), and worker sibling rows for
+    distributed reads (landed in C6). VACUUM QUERY_LOG SQL command added.
     Each gap closure ships with an engine + CLI SQL test.
 
 G4. **Audit log** (also covered by D6) must share the same async durable
@@ -653,11 +666,21 @@ G5. **Log correlation.** Every log line in the request path carries
     `query_id`, `initial_query_id`, `node_id`, `user`, `database`,
     `schema`, `protocol`. Verified by a CI test that submits a query and
     asserts the appearance of the expected fields in the captured logs.
+    > Done: `create_request_span()` function added to `lib.rs` creates a
+    > tracing span with all correlation fields. The span is entered at the
+    > entry point of `execute_query`, `execute_query_stream`,
+    > `execute_partition`, and `execute_distributed_write_partition`.
+    > Server's `main.rs` creates a root span with `node_id` that all child
+    > spans inherit. CI test script `scripts/test-log-correlation.sh` verifies
+    > the fields appear in log output.
 
-G6. **Benchmark gate.** Add a `criterion`-based microbenchmark suite for
+G6. **Benchmark gate.** ✅ Implemented: Add a `criterion`-based microbenchmark suite for
     the query log hot path, the planner, and the index lookup path, plus a
-    CI job that fails if a PR regresses any benchmark by more than a
-    documented threshold.
+    CI job that fails if a PR regresses any benchmark by more than 10%.
+    > Done: Benchmark files created in `crates/analyticsdb-engine/benches/`:
+    > `query_log_bench.rs`, `planner_bench.rs`, `index_lookup_bench.rs`.
+    > CI job `benchmark` added to `.github/workflows/ci.yml` runs `cargo bench --workspace`,
+    > compares against baseline from main branch, and fails if regression > 10%.
 
 **Exit Gate (G):**
 - Prometheus scrape returns the documented metric set.

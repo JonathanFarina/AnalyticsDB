@@ -29,6 +29,7 @@ async-stream.workspace = true
 bincode.workspace = true
 jsonwebtoken.workspace = true
 rand = "0.9"
+metrics = "0.22"
 
 [dev-dependencies]
 tokio-postgres.workspace = true

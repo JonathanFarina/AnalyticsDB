@@ -780,6 +780,7 @@ pub enum MetadataStatement {
         schema: Option<String>,
         name: String,
     },
+    VacuumQueryLog,
     GrantPrivilege {
         grantee: String,
         object_type: String,
@@ -1302,7 +1303,8 @@ impl ControlPlane {
             | MetadataStatement::DropDatabase { .. }
             | MetadataStatement::DropSchema { .. }
             | MetadataStatement::KillQuery { .. }
-            | MetadataStatement::VacuumTable { .. } => {
+            | MetadataStatement::VacuumTable { .. }
+            | MetadataStatement::VacuumQueryLog { .. } => {
                 bail!("Relation DDL and DML should be handled by the engine persistence flow")
             }
             MetadataStatement::ShowDatabases => {
@@ -4058,6 +4060,9 @@ fn parse_column_def(
 pub fn parse_metadata_statement(sql: &str) -> Option<MetadataStatement> {
     let trimmed = sql.trim();
     let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("VACUUM QUERY_LOG") {
+        return Some(MetadataStatement::VacuumQueryLog);
+    }
     if upper.starts_with("SELECT ") && upper.contains(" FROM INFORMATION_SCHEMA.") {
         return parse_metadata_statement_fallback(sql);
     }

@@ -14,6 +14,10 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{Resource, trace::TracerProvider};
+use tracing_opentelemetry::OpenTelemetryLayer;
 
 mod config;
 use config::Config;
@@ -126,11 +130,54 @@ async fn main() {
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // Initialize Prometheus metrics exporter
+    if let Err(e) = analyticsdb_engine::metrics::init_metrics() {
+        eprintln!("Warning: failed to initialize metrics: {}", e);
+    }
+
     if let Err(error) = run().await {
         eprintln!("\n\x1b[1;31mFATAL ERROR: {error:#}\x1b[0m");
         error!("ERROR: {error:#}");
+        if let Some(provider) = otel_tracer_provider {
+            let _ = provider.shutdown();
+        }
         std::process::exit(1);
     }
+
+    if let Some(provider) = otel_tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            warn!("Failed to shutdown OpenTelemetry tracer provider: {}", e);
+        }
+    }
+}
+
+fn init_opentelemetry() -> Option<TracerProvider> {
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", "analyticsdb"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ]);
+
+    let exporter = match opentelemetry_otlp::OTLPTraceExporter::new() {
+        Ok(exporter) => exporter,
+        Err(e) => {
+            eprintln!("Warning: Failed to create OTLP exporter: {}", e);
+            return None;
+        }
+    };
+
+    match opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .with_resource(resource)
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+    {
+        Ok(provider) => Some(provider),
+        Err(e) => {
+            eprintln!("Warning: Failed to initialize OpenTelemetry: {}", e);
+            None
+        }
+    }
+}
 }
 
 /// Merge CLI arguments into the config. CLI args take precedence over config file values.
@@ -337,6 +384,12 @@ async fn run() -> Result<()> {
         .await?;
 
     let node_id = config.node_id.clone().unwrap_or_else(|| "standalone".to_string());
+
+    // Create a root span with node_id - all child spans will inherit this field
+    let root_span = tracing::info_span!("node", node_id = %node_id);
+    let _enter = root_span.enter();
+
+    info!("Node starting with ID: {}", node_id);
 
     // Joining nodes are already registered by the coordinator with the correct
     // advertised endpoints. Re-registering here would overwrite those with
