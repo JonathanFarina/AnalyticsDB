@@ -175,7 +175,39 @@ impl TableProvider for QueryLogListingTable {
             .with_listing_options(listing_options)
             .with_schema(Arc::clone(&self.schema));
         let table = ListingTable::try_new(config)?;
-        table.scan(_state, projection, filters, limit).await
+        // Pass None for projection so DataFusion applies it above the scan.
+        // Passing the projection indices through to ListingTable triggers a
+        // DataFusion internal assertion (ProjectionMapping::try_new) because
+        // the scan's output schema column positions differ from the full schema.
+        let exec = table.scan(_state, None, filters, limit).await?;
+        if let Some(proj) = projection {
+            let projection_exprs: Vec<(
+                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                String,
+            )> = proj
+                .iter()
+                .map(|&i| {
+                    let field = self.schema.field(i);
+                    (
+                        Arc::new(datafusion::physical_expr::expressions::Column::new(
+                            field.name(),
+                            i,
+                        ))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                        field.name().clone(),
+                    )
+                })
+                .collect();
+            Ok(Arc::new(
+                datafusion::physical_plan::projection::ProjectionExec::try_new(
+                    projection_exprs,
+                    exec,
+                )
+                .map_err(datafusion::error::DataFusionError::from)?,
+            ))
+        } else {
+            Ok(exec)
+        }
     }
 }
 
@@ -266,7 +298,35 @@ impl TableProvider for AuditLogListingTable {
             .with_listing_options(listing_options)
             .with_schema(Arc::clone(&self.schema));
         let table = ListingTable::try_new(config)?;
-        table.scan(_state, projection, filters, limit).await
+        let exec = table.scan(_state, None, filters, limit).await?;
+        if let Some(proj) = projection {
+            let projection_exprs: Vec<(
+                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                String,
+            )> = proj
+                .iter()
+                .map(|&i| {
+                    let field = self.schema.field(i);
+                    (
+                        Arc::new(datafusion::physical_expr::expressions::Column::new(
+                            field.name(),
+                            i,
+                        ))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                        field.name().clone(),
+                    )
+                })
+                .collect();
+            Ok(Arc::new(
+                datafusion::physical_plan::projection::ProjectionExec::try_new(
+                    projection_exprs,
+                    exec,
+                )
+                .map_err(datafusion::error::DataFusionError::from)?,
+            ))
+        } else {
+            Ok(exec)
+        }
     }
 }
 
