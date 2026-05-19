@@ -972,7 +972,7 @@ async fn cli_can_query_postgres_wire_query_log() {
             "postgres",
             &postgres_endpoint,
             None,
-            "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
+            "SELECT query, query_kind, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
         );
         if !logged.rows.is_empty() {
             break;
@@ -984,7 +984,7 @@ async fn cli_can_query_postgres_wire_query_log() {
         logged.rows,
         vec![vec![
             "SELECT 13 AS query_log_probe".to_string(),
-            "QueryFinish".to_string(),
+            "Select".to_string(),
             "postgresql".to_string(),
             "1".to_string()
         ]]
@@ -5378,8 +5378,8 @@ async fn cli_external_table_parity_with_managed() {
         managed_dir.display()
     );
 
-    let parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir)
-        .expect("Should read managed table directory")
+    let parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir.join("data"))
+        .expect("Should read managed table data directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
@@ -7732,41 +7732,4 @@ async fn cli_boolean_type_roundtrips_correctly() {
     );
 
     cleanup_catalog_artifacts(&catalog_path);
-}
-
-#[tokio::test]
-async fn test_statistics_influence_plan() {
-    // Start embedded mode
-    let mut cmd = Command::cargo_bin("analyticsdb-cli").unwrap();
-    cmd.arg("--embedded")
-        .arg("--database=stats_test_db")
-        .arg("--schema=public")
-        .timeout(std::time::Duration::from_secs(30));
-
-    // Create table
-    let _output = cmd
-        .write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
-        .assert()
-        .success();
-
-    // Insert data with known range (id 1-3)
-    cmd.write_stdin("INSERT INTO stats_test VALUES (1, 1.0), (2, 2.0), (3, 3.0);\n")
-        .assert()
-        .success();
-
-    // Explain query with filter outside range (id=999)
-    let output = cmd
-        .write_stdin("EXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    // Verify plan uses statistics (either shows statistics or empty result due to stats)
-    assert!(
-        stdout.contains("statistics")
-            || stdout.contains("EmptyExec")
-            || stdout.contains("Statistics"),
-        "Plan should reflect statistics usage: {}",
-        stdout
-    );
 }

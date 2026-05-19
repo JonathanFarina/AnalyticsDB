@@ -154,6 +154,20 @@ pub fn manifest_file_paths(prefix: &OPath, manifest: &Manifest) -> Vec<String> {
         .collect()
 }
 
+/// Returns committed file paths as full URIs suitable for DataFusion `ListingTableUrl`.
+///
+/// For cloud storage (`s3://`, `gs://`, `az://`) the returned strings are proper
+/// cloud URIs.  For local/file:// storage they are absolute paths (same as
+/// `manifest_file_paths`).
+pub fn manifest_file_uris(location: &str, manifest: &Manifest) -> Vec<String> {
+    let base = location.trim_end_matches('/');
+    manifest
+        .files
+        .iter()
+        .map(|e| format!("{}/{}", base, e.path))
+        .collect()
+}
+
 /// Returns the committed file paths for the table at `prefix`.
 ///
 /// If a manifest exists, uses it. Falls back to a directory scan via
@@ -164,6 +178,45 @@ pub async fn list_files(store: &Arc<dyn ObjectStore>, prefix: &OPath) -> Result<
     }
     // Fallback: directory scan for pre-manifest tables.
     storage::list_parquet_files(store, prefix).await
+}
+
+/// Like `list_files` but returns full URIs suitable for DataFusion `ListingTableUrl`.
+///
+/// For cloud storage the returned strings include the scheme and bucket
+/// (e.g. `s3://bucket/prefix/data/uuid.parquet`).  For local storage they
+/// are absolute paths identical to what `list_files` would return.
+pub async fn list_file_uris(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &OPath,
+    location: &str,
+) -> Result<Vec<String>> {
+    if let Some(manifest) = read_manifest(store, prefix).await? {
+        return Ok(manifest_file_uris(location, &manifest));
+    }
+    // Fallback: directory scan.  For cloud storage, rebase the raw /<key> paths
+    // returned by storage::list_parquet_files to proper cloud URIs.
+    let raw = storage::list_parquet_files(store, prefix).await?;
+    if let Some(scheme_bucket) = cloud_scheme_and_bucket(location) {
+        Ok(raw
+            .iter()
+            .map(|p| format!("{}{}", scheme_bucket, p))
+            .collect())
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Extracts `scheme://bucket` from a cloud storage URI, or `None` for local paths.
+fn cloud_scheme_and_bucket(location: &str) -> Option<String> {
+    let scheme_end = location.find("://")?;
+    let scheme = &location[..scheme_end];
+    if matches!(scheme, "s3" | "s3a" | "gs" | "az" | "azure" | "abfss") {
+        let rest = &location[scheme_end + 3..];
+        let bucket = rest.split('/').next().unwrap_or(rest);
+        Some(format!("{}://{}", scheme, bucket))
+    } else {
+        None
+    }
 }
 
 /// Returns the committed file paths and sizes for the table at `prefix`.

@@ -396,16 +396,23 @@ impl SchemaProvider for AnalyticsSchemaProvider {
                 // Resolve committed file paths from the manifest once and reuse
                 // them for both schema inference and the final ListingTable,
                 // so neither step scans the directory (avoiding stale staged files).
+                let infer_context = DfSessionContext::new();
                 let committed_files: Vec<String> =
                     if let Ok((store, prefix)) = crate::storage::store_for_location(storage_path) {
-                        crate::manifest::list_files(&store, &prefix)
+                        // Register the object store with the inference context so that
+                        // DataFusion can read cloud-backed files during schema inference.
+                        if let Ok(listing_url) = ListingTableUrl::parse(storage_path) {
+                            infer_context.register_object_store(
+                                listing_url.object_store().as_ref(),
+                                Arc::clone(&store),
+                            );
+                        }
+                        crate::manifest::list_file_uris(&store, &prefix, storage_path)
                             .await
                             .unwrap_or_default()
                     } else {
                         Vec::new()
                     };
-
-                let infer_context = DfSessionContext::new();
                 if !committed_files.is_empty() {
                     if let Ok(inferred_config) = ListingTableConfig::new_with_multi_paths(
                         committed_files

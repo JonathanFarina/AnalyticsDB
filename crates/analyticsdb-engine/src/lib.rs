@@ -1623,6 +1623,20 @@ impl PrototypeEngine {
             .map_err(|e| anyhow::anyhow!("RuntimeEnv build failed: {}", e))?;
         let ctx = DfSessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
+        // Register object store for the configured storage root so that
+        // ListingTable scans on cloud-backed tables can resolve the store.
+        if let Some(cluster_config) = self.control_plane.cluster_config().await {
+            if let Some(ref root) = cluster_config.storage_root {
+                if let Ok((store, _)) = crate::storage::store_for_location(root) {
+                    if let Ok(listing_url) =
+                        datafusion::datasource::listing::ListingTableUrl::parse(root)
+                    {
+                        ctx.register_object_store(listing_url.object_store().as_ref(), store);
+                    }
+                }
+            }
+        }
+
         let databases = self
             .control_plane
             .list_databases(session)

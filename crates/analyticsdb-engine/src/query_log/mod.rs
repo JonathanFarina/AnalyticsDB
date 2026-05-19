@@ -532,9 +532,7 @@ fn records_to_batch(records: &[QueryLogRecord]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(
         schema(),
         vec![
-            string_array(records, |r| Some(r.event_type.as_str())),
             timestamp_array(records, |r| r.event_time_us),
-            int64_array(records, |r| r.event_time_us),
             timestamp_array(records, |r| r.query_start_time_us),
             string_array(records, |r| Some(r.query_id.as_str())),
             string_array(records, |r| Some(r.initial_query_id.as_str())),
