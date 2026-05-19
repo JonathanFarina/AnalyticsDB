@@ -5378,7 +5378,7 @@ async fn cli_external_table_parity_with_managed() {
         managed_dir.display()
     );
 
-    let parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir.join("data"))
+    let parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(managed_dir.join("data"))
         .expect("Should read managed table data directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
