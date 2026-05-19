@@ -199,8 +199,7 @@ impl TableProvider for QueryLogListingTable {
                 datafusion::physical_plan::projection::ProjectionExec::try_new(
                     projection_exprs,
                     exec,
-                )
-                .map_err(datafusion::error::DataFusionError::from)?,
+                )?,
             ))
         } else {
             Ok(exec)
@@ -315,8 +314,7 @@ impl TableProvider for AuditLogListingTable {
                 datafusion::physical_plan::projection::ProjectionExec::try_new(
                     projection_exprs,
                     exec,
-                )
-                .map_err(datafusion::error::DataFusionError::from)?,
+                )?,
             ))
         } else {
             Ok(exec)
