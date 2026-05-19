@@ -181,23 +181,20 @@ impl TableProvider for QueryLogListingTable {
         // the scan's output schema column positions differ from the full schema.
         let exec = table.scan(_state, None, filters, limit).await?;
         if let Some(proj) = projection {
-            let projection_exprs: Vec<(
-                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                String,
-            )> = proj
-                .iter()
-                .map(|&i| {
-                    let field = self.schema.field(i);
-                    (
-                        Arc::new(datafusion::physical_expr::expressions::Column::new(
-                            field.name(),
-                            i,
-                        ))
-                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                        field.name().clone(),
-                    )
-                })
-                .collect();
+            let projection_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+                proj.iter()
+                    .map(|&i| {
+                        let field = self.schema.field(i);
+                        (
+                            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                                field.name(),
+                                i,
+                            ))
+                                as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                            field.name().clone(),
+                        )
+                    })
+                    .collect();
             Ok(Arc::new(
                 datafusion::physical_plan::projection::ProjectionExec::try_new(
                     projection_exprs,
@@ -300,23 +297,20 @@ impl TableProvider for AuditLogListingTable {
         let table = ListingTable::try_new(config)?;
         let exec = table.scan(_state, None, filters, limit).await?;
         if let Some(proj) = projection {
-            let projection_exprs: Vec<(
-                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                String,
-            )> = proj
-                .iter()
-                .map(|&i| {
-                    let field = self.schema.field(i);
-                    (
-                        Arc::new(datafusion::physical_expr::expressions::Column::new(
-                            field.name(),
-                            i,
-                        ))
-                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                        field.name().clone(),
-                    )
-                })
-                .collect();
+            let projection_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+                proj.iter()
+                    .map(|&i| {
+                        let field = self.schema.field(i);
+                        (
+                            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                                field.name(),
+                                i,
+                            ))
+                                as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                            field.name().clone(),
+                        )
+                    })
+                    .collect();
             Ok(Arc::new(
                 datafusion::physical_plan::projection::ProjectionExec::try_new(
                     projection_exprs,
