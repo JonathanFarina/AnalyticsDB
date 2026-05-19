@@ -5428,8 +5428,8 @@ async fn cli_external_table_parity_with_managed() {
             "SELECT id, name FROM parity_test_external WHERE name = 'Alice'",
         ),
         (
-            "SELECT COUNT(*), SUM(score) FROM parity_test",
-            "SELECT COUNT(*), SUM(score) FROM parity_test_external",
+            "SELECT COUNT(*), SUM(score) AS total_score FROM parity_test",
+            "SELECT COUNT(*), SUM(score) AS total_score FROM parity_test_external",
         ),
     ];
 
