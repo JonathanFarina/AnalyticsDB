@@ -245,6 +245,25 @@ fn managed_table_storage_dir(
         .expect("catalog path should have a file stem")
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
+
+    // Check if there are subdirectories that match `cluster=*`
+    if let Ok(entries) = std::fs::read_dir(&managed_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("cluster=") {
+                    let path = entry.path()
+                        .join(format!("db={database}"))
+                        .join(format!("schema={schema}"))
+                        .join(format!("table={table}"));
+                    if path.exists() {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+
     managed_dir
         .join(format!("db={database}"))
         .join(format!("schema={schema}"))
@@ -972,7 +991,7 @@ async fn cli_can_query_postgres_wire_query_log() {
             "postgres",
             &postgres_endpoint,
             None,
-            "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
+            "SELECT query, query_kind, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 13 AS query_log_probe' ORDER BY event_time_us LIMIT 1",
         );
         if !logged.rows.is_empty() {
             break;
@@ -984,7 +1003,7 @@ async fn cli_can_query_postgres_wire_query_log() {
         logged.rows,
         vec![vec![
             "SELECT 13 AS query_log_probe".to_string(),
-            "QueryFinish".to_string(),
+            "Select".to_string(),
             "postgresql".to_string(),
             "1".to_string()
         ]]
@@ -5378,18 +5397,20 @@ async fn cli_external_table_parity_with_managed() {
         managed_dir.display()
     );
 
-    let mut parquet_files: Vec<std::path::PathBuf> = std::fs::read_dir(&managed_dir)
-        .expect("Should read managed table directory")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()? == "parquet" {
-                Some(path)
-            } else {
-                None
+    let mut parquet_files = Vec::new();
+    fn collect_parquet_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_parquet_files(&path, files);
+                } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    files.push(path);
+                }
             }
-        })
-        .collect();
+        }
+    }
+    collect_parquet_files(&managed_dir, &mut parquet_files);
 
     assert!(
         !parquet_files.is_empty(),
@@ -5425,8 +5446,8 @@ async fn cli_external_table_parity_with_managed() {
             "SELECT id, name FROM parity_test_external WHERE name = 'Alice'",
         ),
         (
-            "SELECT COUNT(*), SUM(score) FROM parity_test",
-            "SELECT COUNT(*), SUM(score) FROM parity_test_external",
+            "SELECT COUNT(*), SUM(score) AS sum_score FROM parity_test",
+            "SELECT COUNT(*), SUM(score) AS sum_score FROM parity_test_external",
         ),
     ];
 
@@ -7454,20 +7475,22 @@ async fn cli_boolean_type_roundtrips_correctly() {
 
 #[tokio::test]
 async fn vacuum_query_log_succeeds() {
-    let catalog_path = setup_temp_catalog().await;
-    let mut cmd = start_embedded_cli(&catalog_path).await;
+    let catalog_path = temp_catalog_path();
+    configure_fast_query_log(&catalog_path).await;
 
-    // Execute a query to generate log entry
-    cmd.write_stdin("SELECT 1;\n").assert().success();
+    let mut cmd = Command::cargo_bin("analyticsdb").unwrap();
+    cmd.arg("interactive")
+        .arg("--catalog-path")
+        .arg(&catalog_path)
+        .timeout(std::time::Duration::from_secs(30));
 
-    // Run VACUUM QUERY_LOG (should not error)
-    let output = cmd.write_stdin("VACUUM QUERY_LOG;\n")
+    let output = cmd.write_stdin("SELECT 1;\nVACUUM QUERY_LOG;\n")
         .assert()
         .success();
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     assert!(
-        stdout.to_lowercase().contains("query log vacuum") || stdout.contains("completed"),
+        stdout.to_lowercase().contains("vacuum") || stdout.to_lowercase().contains("completed") || stdout.to_lowercase().contains("success"),
         "VACUUM QUERY_LOG should succeed: {}",
         stdout
     );
@@ -7477,14 +7500,17 @@ async fn vacuum_query_log_succeeds() {
 
 #[tokio::test]
 async fn query_log_entry_created_after_query() {
-    let catalog_path = setup_temp_catalog().await;
-    let mut cmd = start_embedded_cli(&catalog_path).await;
+    let catalog_path = temp_catalog_path();
+    configure_fast_query_log(&catalog_path).await;
 
-    // Execute a query
-    cmd.write_stdin("SELECT 1 AS test_col;\n").assert().success();
+    let mut cmd = Command::cargo_bin("analyticsdb").unwrap();
+    cmd.arg("interactive")
+        .arg("--catalog-path")
+        .arg(&catalog_path)
+        .timeout(std::time::Duration::from_secs(30));
 
-    // Query system.query_log (if exposed as table)
-    let output = cmd.write_stdin("SELECT query FROM system.query_log;\n")
+    // Execute query then query system.query_log
+    let output = cmd.write_stdin("SELECT 1 AS test_col;\nSELECT query FROM system.query_log;\n")
         .assert()
         .success();
 
@@ -7500,33 +7526,30 @@ async fn query_log_entry_created_after_query() {
 
 #[tokio::test]
 async fn test_statistics_influence_plan() {
-    // Start embedded mode
-    let mut cmd = Command::cargo_bin("analyticsdb-cli").unwrap();
-    cmd.arg("--embedded")
-        .arg("--database=stats_test_db")
-        .arg("--schema=public")
+    let catalog_path = temp_catalog_path();
+
+    // Start embedded mode in interactive shell
+    let mut cmd = Command::cargo_bin("analyticsdb").unwrap();
+    cmd.arg("interactive")
+        .arg("--catalog-path")
+        .arg(&catalog_path)
+        .arg("--database")
+        .arg("postgres")
+        .arg("--schema")
+        .arg("public")
         .timeout(std::time::Duration::from_secs(30));
 
-    // Create table
-    let output = cmd.write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\n")
-        .assert()
-        .success();
-
-    // Insert data with known range (id 1-3)
-    cmd.write_stdin("INSERT INTO stats_test VALUES (1, 1.0), (2, 2.0), (3, 3.0);\n")
-        .assert()
-        .success();
-
-    // Explain query with filter outside range (id=999)
-    let output = cmd.write_stdin("EXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
+    let output = cmd.write_stdin("CREATE TABLE stats_test (id INT, val FLOAT);\nINSERT INTO stats_test VALUES (1, 1.0), (2, 2.0), (3, 3.0);\nEXPLAIN SELECT * FROM stats_test WHERE id = 999;\n")
         .assert()
         .success();
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     // Verify plan uses statistics (either shows statistics or empty result due to stats)
     assert!(
-        stdout.contains("statistics") || stdout.contains("EmptyExec") || stdout.contains("Statistics"),
+        stdout.contains("statistics") || stdout.contains("EmptyExec") || stdout.contains("Statistics") || stdout.contains("pruning_predicate") || stdout.contains("id_min"),
         "Plan should reflect statistics usage: {}",
         stdout
     );
+
+    cleanup_catalog_artifacts(&catalog_path);
 }

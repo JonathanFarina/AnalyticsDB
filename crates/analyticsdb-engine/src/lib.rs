@@ -1800,12 +1800,12 @@ FROM generate_series(1, 1000000) AS s(n)
         for _ in 0..20 {
             let result = engine
                 .execute_query(&QueryRequest {
-                    sql: "SELECT query, event_type, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 1 AS logged_value' ORDER BY event_time_us LIMIT 1".to_string(),
+                    sql: "SELECT query, query_kind, protocol, result_rows FROM system.query_log WHERE query = 'SELECT 1 AS logged_value' ORDER BY event_time_us LIMIT 1".to_string(),
                     session: session.clone(),
                     query_id: None,
 })
-                .await
-                .expect("query log should be readable");
+            .await
+            .expect("query log should be readable");
             rows = result.to_query_response().rows;
             if !rows.is_empty() {
                 break;
@@ -1817,7 +1817,7 @@ FROM generate_series(1, 1000000) AS s(n)
             rows,
             vec![vec![
                 "SELECT 1 AS logged_value".to_string(),
-                "QueryFinish".to_string(),
+                "Select".to_string(),
                 "embedded".to_string(),
                 "1".to_string()
             ]]
@@ -1944,7 +1944,7 @@ FROM generate_series(1, 1000000) AS s(n)
             let entry = entry.expect("valid entry");
             if entry.file_type().expect("valid file type").is_dir() {
                 let name = entry.file_name();
-                if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+                if name.to_string_lossy().starts_with("date=") {
                     found_partitioned = true;
                     break;
                 }
@@ -1952,7 +1952,7 @@ FROM generate_series(1, 1000000) AS s(n)
         }
         assert!(
             found_partitioned,
-            "should have created partitioned YYYY/ directories"
+            "should have created partitioned date=YYYY-MM-DD directories"
         );
         cleanup_catalog_artifacts(&catalog_path);
     }

@@ -6,7 +6,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::GatewayState;
 use crate::session::SessionClaims;
 use crate::error::GatewayResult;
 
@@ -44,9 +43,9 @@ pub struct QueryMessage {
 
 /// Execute a SQL query through the gateway
 pub async fn execute_query(
-    Extension(claims): Extension<SessionClaims>,
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
-    Json(req): Json<QueryRequest>,
+    Extension(_claims): Extension<SessionClaims>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
+    Json(_req): Json<QueryRequest>,
 ) -> GatewayResult<Json<QueryResult>> {
     let query_id = format!("gw-{}", uuid::Uuid::new_v4());
 

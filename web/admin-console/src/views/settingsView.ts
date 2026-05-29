@@ -23,7 +23,7 @@ interface SettingsState {
   notice: string | null;
 }
 
-type FieldGroup = "ports" | "paths" | "tls" | "internal" | "query-log";
+type FieldGroup = "ports" | "paths" | "tls" | "internal" | "query-log" | "security";
 type FieldKind = "number" | "text" | "boolean";
 
 interface FieldDescriptor {
@@ -142,6 +142,15 @@ const FIELDS: readonly FieldDescriptor[] = [
     type: "number",
     hint: "How long the engine keeps stored query log entries.",
     group: "query-log",
+  },
+  {
+    key: "jwt_secret",
+    label: "JWT secret",
+    type: "text",
+    hint: "HS256 secret used to sign Flight SQL JWT bearer tokens. Leave blank to generate an ephemeral key at startup.",
+    optional: true,
+    placeholder: "change-me-in-production-jwt-secret-default-key-32-bytes",
+    group: "security",
   },
 ];
 
@@ -359,6 +368,13 @@ function renderBody(state: SettingsState): string {
         "TLS",
         "Certificate and private-key paths used for TLS-enabled protocols.",
         ["tls"],
+        draft,
+        [],
+      )}
+      ${sectionCard(
+        "Security &amp; auth",
+        "Credential and token-signing configurations for database connections.",
+        ["security"],
         draft,
         [],
       )}

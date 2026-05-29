@@ -3,14 +3,13 @@
 use axum::{extract::State, Extension, Json};
 use serde_json::json;
 
-use crate::GatewayState;
 use crate::session::SessionClaims;
 use crate::error::GatewayResult;
 
 /// Get current session info
 pub async fn get_session(
     Extension(claims): Extension<SessionClaims>,
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<serde_json::Value>> {
     Ok(Json(json!({
         "username": claims.sub,
@@ -23,8 +22,8 @@ pub async fn get_session(
 
 /// Update session (database, schema)
 pub async fn update_session(
-    Extension(claims): Extension<SessionClaims>,
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
+    Extension(_claims): Extension<SessionClaims>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
     Json(req): Json<serde_json::Value>,
 ) -> GatewayResult<Json<serde_json::Value>> {
     // In production, this would update the session in the store

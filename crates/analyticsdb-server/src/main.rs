@@ -121,6 +121,8 @@ impl tower::Service<http::Uri> for InsecureConnector {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
@@ -181,6 +183,9 @@ fn merge_config_with_cli(config: &mut Config, cli: &Cli) {
     if cli.join.is_some() {
         config.join = cli.join.clone();
     }
+    if cli.jwt_secret.is_some() {
+        config.jwt_secret = cli.jwt_secret.clone();
+    }
     // cluster_config is used to load the config file, so we don't set it here
 }
 
@@ -206,6 +211,30 @@ async fn run() -> Result<()> {
     // Merge CLI arguments (CLI takes precedence over config file)
     merge_config_with_cli(&mut config, &cli);
 
+    // Environment variable overrides (takes precedence over config file, but not CLI)
+    if cli.jwt_secret.is_none() {
+        if let Ok(env_secret) = std::env::var("ANALYTICSDB_JWT_SECRET") {
+            config.jwt_secret = Some(env_secret);
+        }
+    }
+
+    // Fallback to base ports from cluster configuration if addresses are not explicitly set or are default
+    if config.postgres_addr.is_none() || config.postgres_addr.as_deref() == Some("127.0.0.1:5432") {
+        if let Some(port) = config.base_postgres_port {
+            config.postgres_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+    if config.flight_sql_addr.is_none() || config.flight_sql_addr.as_deref() == Some("127.0.0.1:8815") {
+        if let Some(port) = config.base_flight_sql_port {
+            config.flight_sql_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+    if config.node_addr.is_none() || config.node_addr.as_deref() == Some("127.0.0.1:8816") {
+        if let Some(port) = config.base_node_port {
+            config.node_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+
     // Validate the merged configuration
     config.validate().context("Configuration validation failed")?;
 
@@ -224,7 +253,6 @@ async fn run() -> Result<()> {
         );
 
         let tls_cert = config.tls_cert.clone();
-        let tls_key = config.tls_key.clone();
         let tls_ca_cert = config.tls_ca_cert.clone();
         let tls_domain = config.tls_domain.clone();
 
@@ -315,6 +343,20 @@ async fn run() -> Result<()> {
         config.node_addr = Some(format!("0.0.0.0:{}", res.node_port));
         config.catalog_path = res.config.catalog_path.clone();
 
+        // Adjust the admin port with the same offset as other ports to avoid collision when running locally
+        if let Some(admin_addr) = &config.admin_addr {
+            if let Ok(addr) = admin_addr.parse::<SocketAddr>() {
+                let new_port = addr.port() + res.config.next_available_port_offset;
+                config.admin_addr = Some(format!("{}:{}", addr.ip(), new_port));
+            } else if let Some(pos) = admin_addr.rfind(':') {
+                let (host, port_str) = admin_addr.split_at(pos);
+                if let Ok(port) = port_str[1..].parse::<u16>() {
+                    let new_port = port + res.config.next_available_port_offset;
+                    config.admin_addr = Some(format!("{}:{}", host, new_port));
+                }
+            }
+        }
+
         // Inherit TLS cert/key from the JoinResponse so the compute node's
         // flight server also serves with TLS.
         if config.tls_cert.is_none() {
@@ -336,6 +378,13 @@ async fn run() -> Result<()> {
             tls_key_path.as_ref().and_then(|p| p.to_str().map(String::from)),
         )
         .await?;
+
+    if let Some(jwt_secret) = &config.jwt_secret {
+        engine
+            .control_plane()
+            .set_jwt_secret(Some(jwt_secret.clone()))
+            .await?;
+    }
 
     let node_id = config.node_id.clone().unwrap_or_else(|| "standalone".to_string());
 
@@ -631,6 +680,8 @@ struct Cli {
     tls_domain: Option<String>,
     #[arg(long)]
     tls_insecure: bool,
+    #[arg(long)]
+    jwt_secret: Option<String>,
 }
 
 #[cfg(test)]

@@ -86,6 +86,7 @@ function renderSystem(body: HTMLElement, model: SystemViewModel): void {
             <dt>Next port offset</dt><dd>${escapeHtml(String(config.next_available_port_offset))}</dd>
             <dt>TLS certificate</dt><dd>${renderOptionalPath(config.tls_cert_path)}</dd>
             <dt>TLS key</dt><dd>${renderOptionalPath(config.tls_key_path)}</dd>
+            <dt>JWT signing key</dt><dd>${config.jwt_secret ? "Configured (custom)" : `<span class="text-muted">Ephemeral</span>`}</dd>
           </dl>
         </div>
       </section>

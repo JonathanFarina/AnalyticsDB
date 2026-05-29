@@ -17,6 +17,7 @@ export interface ClusterConfig {
   tls_key_path?: string | null;
   next_available_port_offset: number;
   query_log?: QueryLogConfig;
+  jwt_secret?: string | null;
 }
 
 export interface ClusterConfigEnvelope {

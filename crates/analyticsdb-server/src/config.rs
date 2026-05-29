@@ -6,6 +6,7 @@ use std::path::PathBuf;
 /// Centralized configuration for AnalyticsDB server.
 /// This is the single source of truth for all configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Node role: control, compute, storage, gateway
     pub role: String,
@@ -44,12 +45,15 @@ pub struct Config {
     pub storage_root: Option<String>,
     
     /// TLS certificate path
+    #[serde(alias = "tls_cert_path")]
     pub tls_cert: Option<PathBuf>,
     
     /// TLS key path
+    #[serde(alias = "tls_key_path")]
     pub tls_key: Option<PathBuf>,
     
     /// TLS CA certificate path
+    #[serde(alias = "tls_ca_cert_path")]
     pub tls_ca_cert: Option<PathBuf>,
     
     /// TLS domain for verification
@@ -57,6 +61,21 @@ pub struct Config {
     
     /// Disable TLS verification (insecure)
     pub tls_insecure: bool,
+    
+    /// HS256 secret used to sign Flight SQL JWT bearer tokens
+    pub jwt_secret: Option<String>,
+
+    /// Base PostgreSQL port
+    #[serde(alias = "base_postgres_port")]
+    pub base_postgres_port: Option<u16>,
+
+    /// Base Flight SQL port
+    #[serde(alias = "base_flight_sql_port")]
+    pub base_flight_sql_port: Option<u16>,
+
+    /// Base Node port
+    #[serde(alias = "base_node_port")]
+    pub base_node_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -79,6 +98,10 @@ impl Default for Config {
             tls_ca_cert: None,
             tls_domain: None,
             tls_insecure: false,
+            jwt_secret: None,
+            base_postgres_port: None,
+            base_flight_sql_port: None,
+            base_node_port: None,
         }
     }
 }

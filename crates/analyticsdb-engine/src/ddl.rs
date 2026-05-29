@@ -420,7 +420,7 @@ impl PrototypeEngine {
                             crate::audit_log::AuditEventType::CreateUser,
                             &request.session.user,
                             &request.session.role,
-                            &format!("CREATE USER {user_name}"),
+                            format!("CREATE USER {user_name}"),
                             "user",
                             &user_name,
                             "embedded",
@@ -445,7 +445,7 @@ impl PrototypeEngine {
                             crate::audit_log::AuditEventType::DropUser,
                             &request.session.user,
                             &request.session.role,
-                            &format!("DROP USER {user_name}"),
+                            format!("DROP USER {user_name}"),
                             "user",
                             &user_name,
                             "embedded",
@@ -470,7 +470,7 @@ impl PrototypeEngine {
                             crate::audit_log::AuditEventType::AlterUser,
                             &request.session.user,
                             &request.session.role,
-                            &format!("ALTER USER {user_name} PASSWORD"),
+                            format!("ALTER USER {user_name} PASSWORD"),
                             "user",
                             &user_name,
                             "embedded",
@@ -1015,7 +1015,7 @@ impl PrototypeEngine {
                         crate::audit_log::AuditEventType::CreateTable,
                         &request.session.user,
                         &request.session.role,
-                        &format!("CREATE TABLE {name}"),
+                        format!("CREATE TABLE {name}"),
                         "table",
                         &name,
                         "embedded",
@@ -1550,11 +1550,14 @@ impl PrototypeEngine {
                             let (store, old_prefix) =
                                 storage::store_for_location(storage_path_str)?;
                             // Calculate new storage location by replacing the table name part.
-                            // Managed tables use names like <db>__<schema>__<table>.table.parquet
-                            let old_suffix = format!("{}.table.parquet", name);
-                            let new_suffix = format!("{}.table.parquet", new_name);
-                            let new_location_str =
-                                storage_path_str.replace(&old_suffix, &new_suffix);
+                            // Managed tables use names like <db>__<schema>__<table>.table.parquet or table=<table>
+                            let old_suffix_flat = format!("{}.table.parquet", name);
+                            let new_suffix_flat = format!("{}.table.parquet", new_name);
+                            let old_suffix_dir = format!("table={}", name);
+                            let new_suffix_dir = format!("table={}", new_name);
+                            let new_location_str = storage_path_str
+                                .replace(&old_suffix_flat, &new_suffix_flat)
+                                .replace(&old_suffix_dir, &new_suffix_dir);
                             let (_, new_prefix) = storage::store_for_location(&new_location_str)?;
                             storage::rename_prefix(&store, &old_prefix, &new_prefix).await?;
 
@@ -1820,9 +1823,13 @@ impl PrototypeEngine {
                     if let Some(storage_path_str) = &relation.storage_path {
                         let (store, old_obj_prefix) =
                             storage::store_for_location(storage_path_str)?;
-                        let old_part = format!("{}__{}__", database_name, name);
-                        let new_part = format!("{}__{}__", database_name, new_name);
-                        let new_location_str = storage_path_str.replace(&old_part, &new_part);
+                        let old_part_flat = format!("{}__{}__", database_name, name);
+                        let new_part_flat = format!("{}__{}__", database_name, new_name);
+                        let old_part_dir = format!("schema={}", name);
+                        let new_part_dir = format!("schema={}", new_name);
+                        let new_location_str = storage_path_str
+                            .replace(&old_part_flat, &new_part_flat)
+                            .replace(&old_part_dir, &new_part_dir);
                         let (_, new_obj_prefix) = storage::store_for_location(&new_location_str)?;
                         storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix).await?;
                         self.control_plane
@@ -1879,9 +1886,13 @@ impl PrototypeEngine {
                         if let Some(storage_path_str) = &relation.storage_path {
                             let (store, old_obj_prefix) =
                                 storage::store_for_location(storage_path_str)?;
-                            let old_part = format!("{}__{}__", name, relation.schema);
-                            let new_part = format!("{}__{}__", new_name, relation.schema);
-                            let new_location_str = storage_path_str.replace(&old_part, &new_part);
+                            let old_part_flat = format!("{}__{}__", name, relation.schema);
+                            let new_part_flat = format!("{}__{}__", new_name, relation.schema);
+                            let old_part_dir = format!("db={}", name);
+                            let new_part_dir = format!("db={}", new_name);
+                            let new_location_str = storage_path_str
+                                .replace(&old_part_flat, &new_part_flat)
+                                .replace(&old_part_dir, &new_part_dir);
                             let (_, new_obj_prefix) =
                                 storage::store_for_location(&new_location_str)?;
                             storage::rename_prefix(&store, &old_obj_prefix, &new_obj_prefix)
@@ -2213,7 +2224,7 @@ impl PrototypeEngine {
                         crate::audit_log::AuditEventType::DropTable,
                         &request.session.user,
                         &request.session.role,
-                        &format!("DROP TABLE {name}"),
+                        format!("DROP TABLE {name}"),
                         "table",
                         &name,
                         "embedded",
@@ -2323,7 +2334,7 @@ impl PrototypeEngine {
                         crate::audit_log::AuditEventType::GrantPrivilege,
                         &request.session.user,
                         &request.session.role,
-                        &format!("GRANT {privilege} ON {object_type} {qualified_name} TO {grantee}"),
+                        format!("GRANT {privilege} ON {object_type} {qualified_name} TO {grantee}"),
                         object_type,
                         &qualified_name,
                         "embedded",
@@ -2363,7 +2374,7 @@ impl PrototypeEngine {
                         crate::audit_log::AuditEventType::RevokePrivilege,
                         &request.session.user,
                         &request.session.role,
-                        &format!("REVOKE {privilege} ON {object_type} {qualified_name} FROM {grantee}"),
+                        format!("REVOKE {privilege} ON {object_type} {qualified_name} FROM {grantee}"),
                         object_type,
                         &qualified_name,
                         "embedded",

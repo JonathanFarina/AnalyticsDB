@@ -1,4 +1,4 @@
-use criterion::{black_box, Criterion};
+use criterion::{black_box, Criterion, criterion_group, criterion_main};
 use analyticsdb_engine::sql_rewriter;
 
 fn bench_sql_rewrite(c: &mut Criterion) {
@@ -16,7 +16,7 @@ fn bench_sql_rewrite(c: &mut Criterion) {
             for sql in &sql_cases {
                 let _ = rt.block_on(black_box(sql_rewriter::rewrite_sql_for_postgres_compatibility(
                     black_box(sql),
-                    black_box(&analyticsdb_engine::ControlPlane::new_bootstrap()),
+                    black_box(&analyticsdb_control::ControlPlane::new_bootstrap()),
                     black_box(&analyticsdb_core::SessionContext::default()),
                 )));
             }

@@ -13,8 +13,7 @@
 //   ANALYTICSDB_DB       - Database name (default: postgres)
 //   ANALYTICSDB_SCHEMA   - Schema name (default: public)
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio_postgres::{NoTls, Config};
 
@@ -113,14 +112,15 @@ async fn run_single_query(
 ) -> u64 {
     let start = Instant::now();
 
-    let mut config = Config::new()
+    let mut config = Config::new();
+    config
         .host(host)
         .port(port)
         .user(user)
         .dbname(dbname);
 
     if let Some(pwd) = password {
-        config = config.password(pwd);
+        config.password(pwd);
     }
 
     match config.connect(NoTls).await {
@@ -138,7 +138,6 @@ async fn run_single_query(
 
             let _ = client.simple_query(query).await;
 
-            let _ = client.close().await;
             let _ = connection_handle.await;
         }
         Err(e) => {

@@ -39,7 +39,29 @@ fn managed_table_storage_dir(
         .expect("catalog path should have a file stem")
         .to_string();
     managed_dir.set_file_name(format!("{stem}.managed"));
-    managed_dir.join(format!("{database}__{schema}__{table}.table.parquet"))
+
+    // Check if there are subdirectories that match `cluster=*`
+    if let Ok(entries) = std::fs::read_dir(&managed_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("cluster=") {
+                    let path = entry.path()
+                        .join(format!("db={database}"))
+                        .join(format!("schema={schema}"))
+                        .join(format!("table={table}"));
+                    if path.exists() {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+
+    managed_dir
+        .join(format!("db={database}"))
+        .join(format!("schema={schema}"))
+        .join(format!("table={table}"))
 }
 
 fn index_snapshot_root(

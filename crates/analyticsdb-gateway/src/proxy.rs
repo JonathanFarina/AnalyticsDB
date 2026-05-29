@@ -1,6 +1,5 @@
 //! Query proxy - forwards queries to AnalyticsDB engine
 
-use std::sync::Arc;
 
 use crate::error::GatewayResult;
 use crate::session::SessionClaims;

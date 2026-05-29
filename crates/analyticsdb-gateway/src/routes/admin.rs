@@ -1,10 +1,10 @@
 //! Admin routes - databases, users, grants management (placeholder implementations)
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::GatewayResult;

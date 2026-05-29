@@ -297,27 +297,31 @@ pub async fn serve_flight_sql_with_label(
     label: &'static str,
 ) -> anyhow::Result<()> {
     let control_plane = engine.control_plane();
-    // Resolve the JWT signing secret: use the configured value if present,
-    // or generate a random ephemeral key and warn that sessions won't survive restarts.
+    // Resolve the JWT signing secret: use environment variable if present,
+    // otherwise the configured value, and fallback to an ephemeral key.
     let jwt_secret = {
-        let config = control_plane.cluster_config().await;
-        match config.and_then(|c| c.jwt_secret) {
-            Some(secret) => secret,
-            None => {
-                let random_bytes: [u8; 32] = rand::random();
-                let hex_secret = random_bytes
-                    .iter()
-                    .fold(String::with_capacity(64), |mut acc, b| {
-                        use std::fmt::Write as _;
-                        let _ = write!(acc, "{b:02x}");
-                        acc
-                    });
-                warn!(
-                    "{}: jwt_secret not configured — using ephemeral key. \
-                     Flight SQL sessions will not survive a server restart.",
-                    label
-                );
-                hex_secret
+        if let Ok(secret) = std::env::var("ANALYTICSDB_JWT_SECRET") {
+            secret
+        } else {
+            let config = control_plane.cluster_config().await;
+            match config.and_then(|c| c.jwt_secret) {
+                Some(secret) => secret,
+                None => {
+                    let random_bytes: [u8; 32] = rand::random();
+                    let hex_secret = random_bytes
+                        .iter()
+                        .fold(String::with_capacity(64), |mut acc, b| {
+                            use std::fmt::Write as _;
+                            let _ = write!(acc, "{b:02x}");
+                            acc
+                        });
+                    warn!(
+                        "{}: jwt_secret not configured — using ephemeral key. \
+                         Flight SQL sessions will not survive a server restart.",
+                        label
+                    );
+                    hex_secret
+                }
             }
         }
     };

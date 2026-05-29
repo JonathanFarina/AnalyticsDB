@@ -1,4 +1,4 @@
-use criterion::{black_box, Criterion, BenchmarkId};
+use criterion::{black_box, Criterion, criterion_group, criterion_main};
 use analyticsdb_engine::query_log::QueryLog;
 use analyticsdb_core::{QueryRequest, SessionContext};
 
@@ -47,12 +47,10 @@ fn query_log_observe_and_finish_benchmark(c: &mut Criterion) {
                 &admission,
                 "SELECT 1",
             );
-            probe.observe_plan(black_box(&datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
-                    produce_one_row: false,
-                    schema: std::sync::Arc::new(datafusion::common::DFSchema::empty()),
-                },
-            )));
+            let empty_plan = datafusion::physical_plan::empty::EmptyExec::new(std::sync::Arc::new(
+                datafusion::arrow::datatypes::Schema::empty()
+            ));
+            probe.observe_plan(&empty_plan);
             probe.observe_read(black_box(100), black_box(1024));
             probe.finish_result(&Ok(analyticsdb_engine::QueryExecutionResult {
                 query_id: "test".to_string(),
