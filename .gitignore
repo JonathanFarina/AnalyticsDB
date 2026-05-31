@@ -4,6 +4,9 @@ dist/
 .DS_Store
 
 *.parquet
+# Managed table data (default storage_root) and legacy per-catalog dirs
+/data/
+*.managed/
 analyticsdb-catalog.managed/.DS_Store
 cluster-catalog.managed/.DS_Store
 docs/.DS_Store
@@ -16,3 +19,4 @@ docs/.DS_Store
 certs/*.key
 certs/*.crt
 /.antigravitycli
+cluster-catalog.managed/.DS_Store

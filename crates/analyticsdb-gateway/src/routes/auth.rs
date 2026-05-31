@@ -36,22 +36,45 @@ pub struct OidcCallbackQuery {
     pub state: String,
 }
 
-/// Local login with username/password (placeholder - accepts admin/admin)
+const DEFAULT_DATABASE: &str = "postgres";
+const DEFAULT_SCHEMA: &str = "public";
+
+/// Local login with username/password.
+///
+/// Credentials are validated by opening an authenticated pg-wire connection to
+/// the running server (the single source of truth). On success the password is
+/// cached in the session store so subsequent SQL is executed as this user, and
+/// the session role is set to `admin` when the account is an effective
+/// administrator (a member of the `Administrators` group).
 pub async fn login(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<LoginRequest>,
 ) -> GatewayResult<Json<LoginResponse>> {
-    // Placeholder implementation - accepts admin/admin
-    if req.username != "admin" || req.password != "admin" {
-        return Err(anyhow::anyhow!("Invalid credentials").into());
-    }
+    use crate::error::GatewayError;
 
-    // Create session
-    let token = state.session_store.create_session(
-        "admin",
-        "admin",
-        "default",
-        "public",
+    // Authenticate against the server over pg-wire.
+    crate::proxy::execute_sql(
+        &state.pg_endpoint(),
+        &req.username,
+        &req.password,
+        DEFAULT_DATABASE,
+        "SELECT 1",
+    )
+    .await
+    .map_err(|_| GatewayError::Unauthorized)?;
+
+    // Determine admin status from the shared catalog (group-derived).
+    let role = match state.open_catalog().await {
+        Ok(catalog) if catalog.is_admin(&req.username).await => "admin",
+        _ => "user",
+    };
+
+    let token = state.session_store.create_session_with_password(
+        &req.username,
+        role,
+        DEFAULT_DATABASE,
+        DEFAULT_SCHEMA,
+        &req.password,
     )?;
 
     let claims = state.session_store.validate_token(&token)?;
@@ -62,22 +85,33 @@ pub async fn login(
     }))
 }
 
-/// Logout (client-side token disposal, could also add token blacklisting)
-pub async fn logout() -> Json<serde_json::Value> {
+/// Logout — forget the cached pg-wire password for this session.
+pub async fn logout(
+    Extension(claims): Extension<SessionClaims>,
+    State(state): State<Arc<GatewayState>>,
+) -> Json<serde_json::Value> {
+    state.session_store.forget(&claims.session_id);
     Json(json!({ "message": "Logged out successfully" }))
 }
 
-/// Refresh session token
+/// Refresh session token, carrying the cached pg-wire password forward.
 pub async fn refresh(
     Extension(claims): Extension<SessionClaims>,
     State(state): State<Arc<GatewayState>>,
 ) -> GatewayResult<Json<LoginResponse>> {
-    let token = state.session_store.create_session(
+    let password = state
+        .session_store
+        .password_for(&claims.session_id)
+        .unwrap_or_default();
+
+    let token = state.session_store.create_session_with_password(
         &claims.sub,
         &claims.role,
         &claims.database,
         &claims.schema,
+        &password,
     )?;
+    state.session_store.forget(&claims.session_id);
 
     let new_claims = state.session_store.validate_token(&token)?;
 

@@ -106,6 +106,19 @@ impl Default for Config {
     }
 }
 
+/// Default locations to look for the cluster config when `--cluster-config` is
+/// not given, in priority order. Config lives in a `config/` directory by
+/// convention; the repo-root path is kept as a fallback for older layouts.
+pub const DEFAULT_CONFIG_PATHS: [&str; 2] = ["config/cluster-config.json", "cluster-config.json"];
+
+/// Returns the first existing default config path, if any.
+pub fn discover_config_path() -> Option<String> {
+    DEFAULT_CONFIG_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .map(|path| path.to_string())
+}
+
 impl Config {
     /// Load configuration from a file.
     pub fn from_file(path: &str) -> Result<Self> {

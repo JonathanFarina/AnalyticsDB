@@ -5,9 +5,16 @@ import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import Database from "better-sqlite3";
 
+import { existsSync } from "node:fs";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
-const CLUSTER_CONFIG_PATH = path.join(repoRoot, "cluster-config.json");
+// Config lives in a `config/` directory by convention; fall back to the repo
+// root for older layouts. Keep this in sync with the server/gateway lookup.
+const CLUSTER_CONFIG_PATH = [
+  path.join(repoRoot, "config", "cluster-config.json"),
+  path.join(repoRoot, "cluster-config.json"),
+].find((candidate) => existsSync(candidate)) ?? path.join(repoRoot, "config", "cluster-config.json");
 const LEGACY_CATALOG_JSON = path.join(repoRoot, "cluster-catalog.json");
 
 function clusterAdminPlugin(): Plugin {
@@ -93,7 +100,7 @@ async function loadCatalog(): Promise<{
     const stat = await fs.stat(sqlitePath);
     return {
       path: relativeFromRepo(sqlitePath),
-      catalog,
+      catalog: redactCatalogSecrets(catalog),
       modifiedAtEpochMs: stat.mtimeMs,
       source: "sqlite",
     };
@@ -103,7 +110,7 @@ async function loadCatalog(): Promise<{
   const stat = await fs.stat(LEGACY_CATALOG_JSON);
   return {
     path: relativeFromRepo(LEGACY_CATALOG_JSON),
-    catalog: JSON.parse(raw),
+    catalog: redactCatalogSecrets(JSON.parse(raw)),
     modifiedAtEpochMs: stat.mtimeMs,
     source: "json-legacy",
   };
@@ -169,6 +176,31 @@ interface CatalogShape {
   conversions: Record<string, unknown>;
   functions: Record<string, unknown>;
   config?: unknown;
+}
+
+/**
+ * Strips secret credential material from every user record before the catalog
+ * is sent to the browser. The catalog store persists Argon2 password hashes and
+ * SCRAM verifiers; none of these should ever reach the client, which only needs
+ * names, admin flags, and group memberships.
+ */
+function redactCatalogSecrets<T>(catalog: T): T {
+  const SENSITIVE_USER_KEYS = [
+    "password",
+    "scram_salt_b64",
+    "scram_salted_password_b64",
+  ];
+  const users = (catalog as { users?: Record<string, unknown> })?.users;
+  if (users && typeof users === "object") {
+    for (const user of Object.values(users)) {
+      if (user && typeof user === "object") {
+        for (const key of SENSITIVE_USER_KEYS) {
+          delete (user as Record<string, unknown>)[key];
+        }
+      }
+    }
+  }
+  return catalog;
 }
 
 function readSqliteCatalog(sqlitePath: string): CatalogShape {

@@ -8,6 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -797,6 +798,46 @@ pub enum MetadataStatement {
 
 pub const DEFAULT_CATALOG_PATH: &str = "analyticsdb-catalog.db";
 
+/// Name of the built-in group whose members are granted administrator rights.
+/// Membership in this group is the canonical source of admin authority; the
+/// per-user `is_admin` flag is honoured as well for internal/system accounts.
+pub const ADMINISTRATORS_GROUP: &str = "Administrators";
+
+/// Name of the primary administrator account created by `--init-cluster`.
+pub const PRIMARY_ADMIN_USER: &str = "analyticsdb_admin";
+
+/// Returns whether `user_name` has effective administrator privileges.
+///
+/// A user is an administrator if either their `is_admin` flag is set (used for
+/// internal accounts such as `postgres`) or they are a member of the
+/// [`ADMINISTRATORS_GROUP`].
+fn user_is_admin(state: &CatalogState, user_name: &str) -> bool {
+    if state
+        .users
+        .get(user_name)
+        .map(|u| u.is_admin)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    state
+        .users
+        .get(ADMINISTRATORS_GROUP)
+        .map(|g| g.members.contains(user_name))
+        .unwrap_or(false)
+}
+
+/// Generates a cryptographically random, URL-safe password.
+///
+/// Uses the OS CSPRNG (`OsRng`) and base64url-encodes 24 random bytes, yielding
+/// a 32-character token with ~192 bits of entropy.
+pub fn generate_random_password() -> String {
+    use argon2::password_hash::rand_core::RngCore;
+    let mut bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64_URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// Ephemeral, in-memory liveness tracking for cluster nodes.
 ///
 /// Keeping this separate from `CatalogState` ensures that frequent heartbeat
@@ -862,6 +903,99 @@ impl ControlPlane {
         Ok(control_plane)
     }
 
+    /// Reports whether a catalogue already exists at `path` and, if so, whether
+    /// it already contains any user or group accounts. Used by `--init-cluster`
+    /// to decide whether the destructive flush-and-warn flow is required.
+    pub async fn catalog_has_accounts(path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        if !path.exists() {
+            // A legacy JSON sibling counts as an existing catalogue too.
+            if catalog_store::is_sqlite_path(path) && path.with_extension("json").exists() {
+                // fall through to load below via the JSON path
+            } else {
+                return Ok(false);
+            }
+        }
+        let store = catalog_store::open_store(path)?;
+        let state = match store.load().await {
+            Ok(state) => state,
+            // An unreadable/empty file is treated as "no accounts".
+            Err(_) => return Ok(false),
+        };
+        Ok(!state.users.is_empty())
+    }
+
+    /// Initializes a brand-new cluster catalogue at `path`, **overwriting** any
+    /// existing state. Creates the internal `postgres` superuser and the primary
+    /// [`PRIMARY_ADMIN_USER`] administrator (with a freshly generated random
+    /// password) as a member of the [`ADMINISTRATORS_GROUP`].
+    ///
+    /// Returns the control plane and the generated plaintext password, which the
+    /// caller must surface to the operator exactly once — it is not recoverable.
+    pub async fn init_fresh_cluster(path: impl AsRef<Path>) -> Result<(Self, String)> {
+        let password = generate_random_password();
+        let state = fresh_init_state(&password)?;
+        let control_plane = Self::from_state(Some(path.as_ref().to_path_buf()), state);
+        control_plane.persist().await?;
+        Ok((control_plane, password))
+    }
+
+    /// Verifies that `user`/`password` authenticate successfully and that the
+    /// account has effective administrator privileges (member of the
+    /// [`ADMINISTRATORS_GROUP`] or flagged `is_admin`). Errors otherwise.
+    pub async fn verify_admin_credentials(&self, user: &str, password: &str) -> Result<()> {
+        let state = self.state.read().await;
+        let catalog_user = state
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow::anyhow!("Authentication failed: unknown user '{}'", user))?;
+        let stored = catalog_user
+            .password
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("User '{}' has no password set", user))?;
+        if !verify_password(password, stored) {
+            bail!("Authentication failed: incorrect password for '{}'", user);
+        }
+        if !user_is_admin(&state, user) {
+            bail!(
+                "User '{}' is not a member of the '{}' group",
+                user,
+                ADMINISTRATORS_GROUP
+            );
+        }
+        Ok(())
+    }
+
+    /// Resets the primary administrator's password to a freshly generated random
+    /// value, after authenticating `authenticating_user`/`authenticating_password`
+    /// as a member of the [`ADMINISTRATORS_GROUP`]. Returns the new plaintext
+    /// password, which must be surfaced to the operator exactly once.
+    pub async fn reset_admin_password(
+        &self,
+        authenticating_user: &str,
+        authenticating_password: &str,
+    ) -> Result<String> {
+        self.verify_admin_credentials(authenticating_user, authenticating_password)
+            .await?;
+
+        let new_password = generate_random_password();
+        let hashed = hash_password(&new_password)?;
+        let (scram_salt_b64, scram_salted_password_b64) = compute_scram_verifier(&new_password)?;
+        {
+            let mut state = self.state.write().await;
+            let user = state.users.get_mut(PRIMARY_ADMIN_USER).ok_or_else(|| {
+                anyhow::anyhow!("Primary admin '{}' does not exist", PRIMARY_ADMIN_USER)
+            })?;
+            user.password = Some(hashed);
+            user.password_version += 1;
+            user.password_rotated_at_epoch_ms = Some(current_epoch_millis());
+            user.scram_salt_b64 = Some(scram_salt_b64);
+            user.scram_salted_password_b64 = Some(scram_salted_password_b64);
+        }
+        self.persist().await?;
+        Ok(new_password)
+    }
+
     fn from_state(catalog_path: Option<PathBuf>, state: CatalogState) -> Self {
         let coordinator_node_id = "control-1".to_string();
         let (version_tx, _) = watch::channel(state.catalogue_version);
@@ -880,6 +1014,86 @@ impl ControlPlane {
     /// this against their cached value to decide whether to refetch.
     pub async fn catalogue_version(&self) -> u64 {
         self.state.read().await.catalogue_version
+    }
+
+    /// Returns whether `user` has effective administrator privileges (member of
+    /// the [`ADMINISTRATORS_GROUP`] or flagged `is_admin`).
+    pub async fn is_admin(&self, user: &str) -> bool {
+        user_is_admin(&*self.state.read().await, user)
+    }
+
+    /// Builds a session context for an administrative action performed by
+    /// `actor` against the internal `postgres` database. Used by the admin API
+    /// wrappers below so callers don't have to assemble a full session.
+    fn admin_session(actor: &str) -> SessionContext {
+        SessionContext {
+            user: actor.to_string(),
+            role: actor.to_string(),
+            database: "postgres".to_string(),
+            schema: "public".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Creates a user on behalf of administrator `actor`.
+    pub async fn admin_create_user(
+        &self,
+        actor: &str,
+        name: &str,
+        password: Option<String>,
+    ) -> Result<String> {
+        self.create_user(&Self::admin_session(actor), name, password)
+            .await
+    }
+
+    /// Drops a user on behalf of administrator `actor`.
+    pub async fn admin_drop_user(&self, actor: &str, name: &str, if_exists: bool) -> Result<String> {
+        self.drop_user(&Self::admin_session(actor), name, if_exists)
+            .await
+    }
+
+    /// Creates a group on behalf of administrator `actor`.
+    pub async fn admin_create_group(&self, actor: &str, name: &str) -> Result<String> {
+        self.create_group(&Self::admin_session(actor), name).await
+    }
+
+    /// Drops a group on behalf of administrator `actor`.
+    pub async fn admin_drop_group(
+        &self,
+        actor: &str,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        self.drop_group(&Self::admin_session(actor), name, if_exists)
+            .await
+    }
+
+    /// Adds or removes a user from a group on behalf of administrator `actor`.
+    pub async fn admin_set_group_membership(
+        &self,
+        actor: &str,
+        group: &str,
+        user: &str,
+        add: bool,
+    ) -> Result<String> {
+        let op = if add {
+            AlterGroupOperation::AddUser(user.to_string())
+        } else {
+            AlterGroupOperation::DropUser(user.to_string())
+        };
+        self.alter_group(&Self::admin_session(actor), group, &op)
+            .await
+    }
+
+    /// Rotates an arbitrary user's password on behalf of administrator `actor`.
+    pub async fn admin_set_user_password(
+        &self,
+        actor: &str,
+        name: &str,
+        password: &str,
+    ) -> Result<String> {
+        self.rotate_user_password(&Self::admin_session(actor), name, password)
+            .await
     }
 
     /// Subscribe to catalogue version changes. Each `Receiver` observes only
@@ -923,6 +1137,17 @@ impl ControlPlane {
     }
 
     pub fn managed_data_root(&self) -> PathBuf {
+        // A node sets `ANALYTICSDB_DATA_DIR` (default `data`) so all managed
+        // data — user table data and the system query/audit logs — lives under
+        // one local directory. When unset (e.g. in tests), fall back to the
+        // legacy per-catalog `<catalog>.managed` layout, which keeps each test's
+        // catalog isolated.
+        if let Ok(dir) = std::env::var("ANALYTICSDB_DATA_DIR") {
+            let dir = dir.strip_prefix("file://").unwrap_or(&dir);
+            if !dir.is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
         let catalog_path_buf = self
             .catalog_path
             .clone()
@@ -983,7 +1208,7 @@ impl ControlPlane {
                 .get(&session.role)
                 .ok_or_else(|| anyhow::anyhow!("Unknown role '{}'", session.role))?;
 
-            if !user.is_admin && role.name != user.name {
+            if !user_is_admin(state, &user.name) && role.name != user.name {
                 bail!(
                     "User '{}' is not authorized to assume role '{}'",
                     session.user,
@@ -1253,11 +1478,10 @@ impl ControlPlane {
             } => {
                 {
                     let state = self.state.read().await;
-                    let user = state
-                        .users
-                        .get(&session.user)
-                        .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", session.user))?;
-                    if !user.is_admin {
+                    if !state.users.contains_key(&session.user) {
+                        bail!("Unknown user '{}'", session.user);
+                    }
+                    if !user_is_admin(&state, &session.user) {
                         bail!("permission denied: only admin can grant privileges");
                     }
                 }
@@ -1273,11 +1497,10 @@ impl ControlPlane {
             } => {
                 {
                     let state = self.state.read().await;
-                    let user = state
-                        .users
-                        .get(&session.user)
-                        .ok_or_else(|| anyhow::anyhow!("Unknown user '{}'", session.user))?;
-                    if !user.is_admin {
+                    if !state.users.contains_key(&session.user) {
+                        bail!("Unknown user '{}'", session.user);
+                    }
+                    if !user_is_admin(&state, &session.user) {
                         bail!("permission denied: only admin can revoke privileges");
                     }
                 }
@@ -1573,6 +1796,20 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Updates only the storage root in the in-memory cluster config.
+    ///
+    /// Not persisted — set at node startup so managed table data is written
+    /// under the configured root (defaulting to a local `data/` directory).
+    /// Leaving it unset preserves the legacy `<catalog>.managed` layout used by
+    /// tests for per-catalog isolation.
+    pub async fn set_storage_root(&self, storage_root: Option<String>) -> Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(ref mut config) = state.config {
+            config.storage_root = storage_root;
+        }
+        Ok(())
+    }
+
     pub async fn update_cluster_config(&self, config: ClusterConfig) -> Result<()> {
         {
             let mut state = self.state.write().await;
@@ -1685,7 +1922,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can create databases");
             }
 
@@ -1720,7 +1957,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can alter databases");
             }
 
@@ -3352,7 +3589,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can drop databases");
             }
 
@@ -3622,7 +3859,7 @@ impl ControlPlane {
             .get(role)
             .ok_or_else(|| anyhow::anyhow!("Unknown role '{}'", role))?;
 
-        if !catalog_user.is_admin && catalog_user.name != catalog_role.name {
+        if !user_is_admin(&state, &catalog_user.name) && catalog_user.name != catalog_role.name {
             bail!(
                 "User '{}' is not authorized to assume role '{}'",
                 user,
@@ -3671,7 +3908,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!(
                     "User '{}' is not allowed to rotate credentials",
                     session.user
@@ -3720,7 +3957,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can create users");
             }
 
@@ -3760,7 +3997,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can drop users");
             }
 
@@ -3792,7 +4029,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can create groups");
             }
 
@@ -3824,11 +4061,11 @@ impl ControlPlane {
         name: &str,
         operation: &AlterGroupOperation,
     ) -> Result<String> {
-        {
+        let message = {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can alter groups");
             }
 
@@ -3843,17 +4080,14 @@ impl ControlPlane {
                     }
                     let group = state.users.get_mut(name).unwrap();
                     group.members.insert(user_name.clone());
-                    Ok(format!("User '{}' added to group '{}'.", user_name, name))
+                    format!("User '{}' added to group '{}'.", user_name, name)
                 }
                 AlterGroupOperation::DropUser(user_name) => {
                     let group = state.users.get_mut(name).unwrap();
                     if !group.members.remove(user_name) {
                         bail!("User '{}' is not a member of group '{}'", user_name, name);
                     }
-                    Ok(format!(
-                        "User '{}' removed from group '{}'.",
-                        user_name, name
-                    ))
+                    format!("User '{}' removed from group '{}'.", user_name, name)
                 }
                 AlterGroupOperation::Rename(new_name) => {
                     validate_identifier(new_name)?;
@@ -3863,10 +4097,13 @@ impl ControlPlane {
                     let mut group = state.users.remove(name).unwrap();
                     group.name = new_name.clone();
                     state.users.insert(new_name.clone(), group);
-                    Ok(format!("Group '{}' renamed to '{}'.", name, new_name))
+                    format!("Group '{}' renamed to '{}'.", name, new_name)
                 }
             }
-        }
+        };
+
+        self.persist().await?;
+        Ok(message)
     }
 
     async fn drop_group(
@@ -3879,7 +4116,7 @@ impl ControlPlane {
             let mut state = self.state.write().await;
             self._validate_session(&state, session)?;
 
-            if !state.users.get(&session.user).unwrap().is_admin {
+            if !user_is_admin(&state, &session.user) {
                 bail!("Only administrators can drop groups");
             }
 
@@ -4017,6 +4254,113 @@ fn bootstrap_state() -> CatalogState {
         catalogue_version: 0,
         storage_policies: BTreeMap::new(),
     }
+}
+
+/// Builds the catalogue state for a freshly initialized cluster
+/// (`--init-cluster`). Contains the internal `postgres` superuser and the
+/// primary [`PRIMARY_ADMIN_USER`] administrator — created with the supplied
+/// random `admin_password` and enrolled in the [`ADMINISTRATORS_GROUP`].
+fn fresh_init_state(admin_password: &str) -> Result<CatalogState> {
+    let mut databases = BTreeMap::new();
+    databases.insert(
+        "postgres".to_string(),
+        CatalogDatabase {
+            name: "postgres".to_string(),
+            schemas: BTreeSet::from(["public".to_string()]),
+            owner: "postgres".to_string(),
+            parameters: BTreeMap::new(),
+        },
+    );
+
+    let mut users = BTreeMap::new();
+
+    // Internal `postgres` superuser. Required by the pg-wire layer; its password
+    // is randomized rather than fixed so a fresh cluster ships no known secret.
+    let pg_password = generate_random_password();
+    let (pg_hash, pg_salt, pg_sp) = {
+        let argon = hash_password(&pg_password)?;
+        let (salt, sp) = compute_scram_verifier(&pg_password)?;
+        (Some(argon), Some(salt), Some(sp))
+    };
+    users.insert(
+        "postgres".to_string(),
+        CatalogUser {
+            name: "postgres".to_string(),
+            is_admin: true,
+            password: pg_hash,
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
+            scram_salt_b64: pg_salt,
+            scram_salted_password_b64: pg_sp,
+        },
+    );
+
+    // Primary administrator with the operator-facing random password.
+    let (admin_hash, admin_salt, admin_sp) = {
+        let argon = hash_password(admin_password)?;
+        let (salt, sp) = compute_scram_verifier(admin_password)?;
+        (Some(argon), Some(salt), Some(sp))
+    };
+    users.insert(
+        PRIMARY_ADMIN_USER.to_string(),
+        CatalogUser {
+            name: PRIMARY_ADMIN_USER.to_string(),
+            is_admin: false,
+            password: admin_hash,
+            password_version: 1,
+            password_rotated_at_epoch_ms: Some(current_epoch_millis()),
+            members: BTreeSet::new(),
+            scram_salt_b64: admin_salt,
+            scram_salted_password_b64: admin_sp,
+        },
+    );
+
+    // Administrators group — membership is what grants admin authority.
+    users.insert(
+        ADMINISTRATORS_GROUP.to_string(),
+        CatalogUser {
+            name: ADMINISTRATORS_GROUP.to_string(),
+            is_admin: false,
+            password: None,
+            password_version: 1,
+            password_rotated_at_epoch_ms: None,
+            members: BTreeSet::from([PRIMARY_ADMIN_USER.to_string()]),
+            scram_salt_b64: None,
+            scram_salted_password_b64: None,
+        },
+    );
+
+    let config = Some(ClusterConfig {
+        base_postgres_port: 5432,
+        base_flight_sql_port: 50051,
+        base_node_port: default_base_node_port(),
+        catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_cert_path: None,
+        next_available_port_offset: 0,
+        query_log: QueryLogConfig::default(),
+        storage_root: None,
+        cluster_id: None,
+        s3_sse: None,
+        s3_sse_kms_key_id: None,
+        jwt_secret: None,
+    });
+
+    Ok(CatalogState {
+        databases,
+        users,
+        nodes: BTreeMap::new(),
+        relations: BTreeMap::new(),
+        aggregates: BTreeMap::new(),
+        collations: BTreeMap::new(),
+        conversions: BTreeMap::new(),
+        functions: BTreeMap::new(),
+        config,
+        catalogue_version: 0,
+        storage_policies: BTreeMap::new(),
+    })
 }
 
 fn validate_identifier(value: &str) -> Result<()> {
@@ -6611,5 +6955,197 @@ mod tests {
             config.s3_sse_kms_key_id.as_ref().map(|k| k.starts_with("arn:")).unwrap_or(false),
             "KMS key ID should look like an ARN"
         );
+    }
+
+    #[test]
+    fn init_fresh_cluster_creates_admin_in_administrators_group() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-init-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("cluster-catalog.db");
+
+            let (cp, password) = ControlPlane::init_fresh_cluster(&db_path)
+                .await
+                .expect("init fresh cluster");
+
+            assert!(!password.is_empty(), "a password must be generated");
+
+            let snap = cp.cluster_snapshot().await;
+            // Exactly postgres + analyticsdb_admin + Administrators group.
+            assert!(snap.users.iter().any(|u| u.name == "postgres"));
+            assert!(snap.users.iter().any(|u| u.name == PRIMARY_ADMIN_USER));
+            let group = snap
+                .users
+                .iter()
+                .find(|u| u.name == ADMINISTRATORS_GROUP)
+                .expect("administrators group exists");
+            assert!(group.members.contains(PRIMARY_ADMIN_USER));
+            // No leftover demo accounts.
+            assert!(!snap.users.iter().any(|u| u.name == "admin"));
+            assert!(!snap.users.iter().any(|u| u.name == "analytics_reader"));
+
+            // Group membership confers admin; the generated password authenticates.
+            assert!(cp.is_admin(PRIMARY_ADMIN_USER).await);
+            cp.verify_admin_credentials(PRIMARY_ADMIN_USER, &password)
+                .await
+                .expect("generated password should authenticate as admin");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn catalog_has_accounts_detects_existing_state() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-has-accts-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("cluster-catalog.db");
+
+            assert!(
+                !ControlPlane::catalog_has_accounts(&db_path)
+                    .await
+                    .expect("check"),
+                "no file → no accounts"
+            );
+
+            ControlPlane::init_fresh_cluster(&db_path)
+                .await
+                .expect("init");
+
+            assert!(
+                ControlPlane::catalog_has_accounts(&db_path)
+                    .await
+                    .expect("check"),
+                "after init → accounts present"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn verify_admin_credentials_rejects_bad_password_and_non_admin() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-verify-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("cluster-catalog.db");
+
+            let (cp, password) = ControlPlane::init_fresh_cluster(&db_path)
+                .await
+                .expect("init");
+
+            // Wrong password is rejected.
+            assert!(
+                cp.verify_admin_credentials(PRIMARY_ADMIN_USER, "wrong")
+                    .await
+                    .is_err()
+            );
+
+            // A standard (non-admin) user is rejected even with the right password.
+            cp.admin_create_user(PRIMARY_ADMIN_USER, "alice", Some("pw123".to_string()))
+                .await
+                .expect("create alice");
+            assert!(
+                cp.verify_admin_credentials("alice", "pw123").await.is_err(),
+                "non-admin user must not pass admin verification"
+            );
+
+            // Promote alice into Administrators → now she is an admin.
+            cp.admin_set_group_membership(PRIMARY_ADMIN_USER, ADMINISTRATORS_GROUP, "alice", true)
+                .await
+                .expect("add alice to administrators");
+            cp.verify_admin_credentials("alice", "pw123")
+                .await
+                .expect("alice is now an admin");
+
+            // Sanity: the primary admin still authenticates with its real password.
+            cp.verify_admin_credentials(PRIMARY_ADMIN_USER, &password)
+                .await
+                .expect("primary admin authenticates");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn group_membership_changes_persist_across_reload() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-grp-persist-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("cluster-catalog.db");
+
+            {
+                let (cp, _pw) = ControlPlane::init_fresh_cluster(&db_path)
+                    .await
+                    .expect("init");
+                cp.admin_create_user(PRIMARY_ADMIN_USER, "carol", Some("pw".to_string()))
+                    .await
+                    .expect("create carol");
+                cp.admin_set_group_membership(
+                    PRIMARY_ADMIN_USER,
+                    ADMINISTRATORS_GROUP,
+                    "carol",
+                    true,
+                )
+                .await
+                .expect("add carol");
+            }
+
+            // Reload from disk in a fresh control plane.
+            let reloaded = ControlPlane::from_catalog_path(&db_path)
+                .await
+                .expect("reload");
+            assert!(
+                reloaded.is_admin("carol").await,
+                "group membership must survive a reload"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn reset_admin_password_requires_admin_and_changes_password() {
+        run_async_test(async {
+            let dir = std::env::temp_dir().join(format!("adb-reset-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let db_path = dir.join("cluster-catalog.db");
+
+            let (cp, original) = ControlPlane::init_fresh_cluster(&db_path)
+                .await
+                .expect("init");
+
+            // Create a second admin who will perform the reset.
+            cp.admin_create_user(PRIMARY_ADMIN_USER, "ops", Some("ops-pw".to_string()))
+                .await
+                .expect("create ops");
+            cp.admin_set_group_membership(PRIMARY_ADMIN_USER, ADMINISTRATORS_GROUP, "ops", true)
+                .await
+                .expect("promote ops");
+
+            // A non-admin cannot reset.
+            cp.admin_create_user(PRIMARY_ADMIN_USER, "bob", Some("bob-pw".to_string()))
+                .await
+                .expect("create bob");
+            assert!(cp.reset_admin_password("bob", "bob-pw").await.is_err());
+
+            // An admin can; the new password differs and authenticates.
+            let new_password = cp
+                .reset_admin_password("ops", "ops-pw")
+                .await
+                .expect("ops resets primary admin password");
+            assert_ne!(new_password, original);
+            assert!(
+                cp.verify_admin_credentials(PRIMARY_ADMIN_USER, &original)
+                    .await
+                    .is_err(),
+                "old password must no longer work"
+            );
+            cp.verify_admin_credentials(PRIMARY_ADMIN_USER, &new_password)
+                .await
+                .expect("new password authenticates");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
     }
 }

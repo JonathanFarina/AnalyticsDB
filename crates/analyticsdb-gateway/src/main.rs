@@ -26,6 +26,25 @@ pub struct GatewayState {
     pub session_store: Arc<session::SessionStore>,
 }
 
+impl GatewayState {
+    /// Opens a fresh control plane over the shared catalog file for read-only
+    /// metadata (explorer, user/group listings, admin checks). Opening per
+    /// request — rather than caching an engine — means the gateway always
+    /// reflects the server's latest persisted catalog state, with no divergent
+    /// in-memory cache. All execution and mutation is proxied to the server.
+    pub async fn open_catalog(
+        &self,
+    ) -> anyhow::Result<analyticsdb_control::ControlPlane> {
+        let path = self.config.resolve_catalog_path();
+        analyticsdb_control::ControlPlane::from_catalog_path(&path).await
+    }
+
+    /// The server's pg-wire endpoint that SQL is proxied to.
+    pub fn pg_endpoint(&self) -> String {
+        self.config.resolve_pg_endpoint()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -40,8 +59,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting AnalyticsDB Gateway on {}", config.bind_addr);
     tracing::info!("OIDC enabled: {}", config.oidc.is_enabled());
 
-    // Initialize session store
-    let session_store = Arc::new(session::SessionStore::new(config.session_timeout_seconds));
+    // Initialize session store with the real config (jwt secret, timeout).
+    let session_store = Arc::new(session::SessionStore::with_config(config.clone()));
+
+    tracing::info!(
+        "Config: {} · Proxying SQL to server at {} (pg-wire) · catalog metadata from {}",
+        config.control_plane_config_path,
+        config.resolve_pg_endpoint(),
+        config.resolve_catalog_path(),
+    );
 
     // Create shared state
     let state = Arc::new(GatewayState {
@@ -60,8 +86,9 @@ async fn main() -> anyhow::Result<()> {
         // Session
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session", post(routes::session::update_session))
-        // Auth refresh (needs valid token)
+        // Auth refresh + logout (need a valid token / session)
         .route("/api/auth/refresh", post(routes::auth::refresh))
+        .route("/api/auth/logout", post(routes::auth::logout))
         // Explorer (live metadata)
         .route("/api/explorer", get(routes::explorer::get_explorer_snapshot))
         .route("/api/explorer/databases", get(routes::explorer::list_databases))
@@ -76,6 +103,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/databases/:name", delete(routes::admin::drop_database))
         .route("/api/admin/users", get(routes::admin::list_users).post(routes::admin::create_user))
         .route("/api/admin/users/:name", delete(routes::admin::drop_user))
+        .route("/api/admin/users/:name/reset-password", post(routes::admin::reset_user_password))
+        .route("/api/admin/groups", get(routes::admin::list_groups).post(routes::admin::create_group))
+        .route("/api/admin/groups/:name", delete(routes::admin::drop_group))
+        .route("/api/admin/groups/:name/members", post(routes::admin::add_group_member))
+        .route("/api/admin/groups/:name/members/:user", delete(routes::admin::remove_group_member))
         // System
         .route("/api/system/metrics", get(routes::system::get_metrics))
         .route("/api/system/query-log", get(routes::system::get_query_log))
@@ -91,7 +123,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(routes::health::liveness))
         .route("/readyz", get(routes::health::readiness))
         .route("/api/auth/login", post(routes::auth::login))
-        .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/oidc/authorize", get(routes::auth::oidc_authorize))
         .route("/api/auth/oidc/callback", get(routes::auth::oidc_callback))
         .with_state(Arc::clone(&state));

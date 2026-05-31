@@ -1,6 +1,7 @@
 //! Session management for the gateway
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -23,29 +24,42 @@ pub struct SessionClaims {
     pub session_id: String,   // unique session ID
 }
 
-/// Session store for managing active sessions
+/// Session store for managing active sessions.
+///
+/// In addition to issuing/validating JWTs, it caches each session's password in
+/// memory so the gateway can open authenticated pg-wire connections to the
+/// server on behalf of the user. Passwords are never written to the JWT or to
+/// disk; if the gateway restarts, the cache is empty and the user must sign in
+/// again (their token is rejected with 401, prompting re-login).
 pub struct SessionStore {
     config: Arc<GatewayConfig>,
+    credentials: Mutex<HashMap<String, String>>,
 }
 
 impl SessionStore {
     pub fn new(_session_timeout_seconds: u64) -> Self {
         Self {
             config: Arc::new(crate::config::GatewayConfig::default()),
+            credentials: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_config(config: Arc<GatewayConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            credentials: Mutex::new(HashMap::new()),
+        }
     }
 
-    /// Create a new session and return a JWT token
-    pub fn create_session(
+    /// Create a new session, cache the password for pg-wire proxying, and return
+    /// a JWT token.
+    pub fn create_session_with_password(
         &self,
         username: &str,
         role: &str,
         database: &str,
         schema: &str,
+        password: &str,
     ) -> GatewayResult<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -62,7 +76,7 @@ impl SessionStore {
             schema: schema.to_string(),
             exp,
             iat: now,
-            session_id,
+            session_id: session_id.clone(),
         };
 
         let token = encode(
@@ -71,7 +85,37 @@ impl SessionStore {
             &EncodingKey::from_secret(self.config.jwt_secret.as_bytes()),
         )?;
 
+        if let Ok(mut creds) = self.credentials.lock() {
+            creds.insert(session_id, password.to_string());
+        }
+
         Ok(token)
+    }
+
+    /// Returns the cached password for a session, if present.
+    pub fn password_for(&self, session_id: &str) -> Option<String> {
+        self.credentials
+            .lock()
+            .ok()
+            .and_then(|creds| creds.get(session_id).cloned())
+    }
+
+    /// Forgets a session's cached password (called on logout).
+    pub fn forget(&self, session_id: &str) {
+        if let Ok(mut creds) = self.credentials.lock() {
+            creds.remove(session_id);
+        }
+    }
+
+    /// Create a new session and return a JWT token (no cached password).
+    pub fn create_session(
+        &self,
+        username: &str,
+        role: &str,
+        database: &str,
+        schema: &str,
+    ) -> GatewayResult<String> {
+        self.create_session_with_password(username, role, database, schema, "")
     }
 
     /// Validate and decode a JWT token

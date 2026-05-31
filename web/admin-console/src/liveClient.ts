@@ -18,6 +18,20 @@ interface LoginRequest {
   password: string;
 }
 
+export interface AdminUser {
+  readonly name: string;
+  readonly is_admin: boolean;
+  readonly groups: readonly string[];
+  readonly password_version?: number;
+  readonly password_rotated_at_epoch_ms?: number | null;
+}
+
+export interface AdminGroup {
+  readonly name: string;
+  readonly members: readonly string[];
+  readonly member_count: number;
+}
+
 interface LoginResponse {
   token: string;
   session: {
@@ -31,10 +45,16 @@ interface LoginResponse {
 
 export class LiveConsoleClient implements AnalyticsConsoleClient {
   private token: string | null = null;
+  private user: string | null = null;
+  private role: string | null = null;
+  /** Invoked when a request is rejected as unauthorized (expired/invalid token). */
+  onSessionExpired: (() => void) | null = null;
 
   constructor() {
-    // Try to load token from localStorage
+    // Restore any persisted session from localStorage.
     this.token = localStorage.getItem("analyticsdb_token");
+    this.user = localStorage.getItem("analyticsdb_user");
+    this.role = localStorage.getItem("analyticsdb_role");
   }
 
   setToken(token: string): void {
@@ -44,11 +64,29 @@ export class LiveConsoleClient implements AnalyticsConsoleClient {
 
   clearToken(): void {
     this.token = null;
+    this.user = null;
+    this.role = null;
     localStorage.removeItem("analyticsdb_token");
+    localStorage.removeItem("analyticsdb_user");
+    localStorage.removeItem("analyticsdb_role");
   }
 
   isAuthenticated(): boolean {
     return this.token !== null;
+  }
+
+  /** The username of the signed-in account, or null when signed out. */
+  currentUser(): string | null {
+    return this.user;
+  }
+
+  /** The session role (e.g. "admin"), or null when signed out. */
+  currentRole(): string | null {
+    return this.role;
+  }
+
+  isAdmin(): boolean {
+    return this.role === "admin";
   }
 
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -67,6 +105,12 @@ export class LiveConsoleClient implements AnalyticsConsoleClient {
     });
 
     if (!response.ok) {
+      // A 401 on an authenticated request means the session is no longer valid;
+      // clear it and notify the app so it can route back to the login screen.
+      if (response.status === 401 && path !== "/auth/login") {
+        this.clearToken();
+        this.onSessionExpired?.();
+      }
       const error = await response.json().catch(() => ({
         error: `HTTP ${response.status}: ${response.statusText}`,
       }));
@@ -83,6 +127,12 @@ export class LiveConsoleClient implements AnalyticsConsoleClient {
     });
 
     this.setToken(response.token);
+    this.user = response.session?.sub ?? username;
+    this.role = response.session?.role ?? null;
+    localStorage.setItem("analyticsdb_user", this.user);
+    if (this.role) {
+      localStorage.setItem("analyticsdb_role", this.role);
+    }
     return response;
   }
 
@@ -141,6 +191,83 @@ export class LiveConsoleClient implements AnalyticsConsoleClient {
 
   async listUsers(): Promise<Array<{ name: string; role: string }>> {
     return this.request("/admin/users");
+  }
+
+  // --- Admin: users ---
+
+  async listAdminUsers(): Promise<AdminUser[]> {
+    return this.request<AdminUser[]>("/admin/users");
+  }
+
+  async createUser(
+    name: string,
+    password: string,
+    groups: string[] = [],
+  ): Promise<{ message: string }> {
+    return this.request("/admin/users", {
+      method: "POST",
+      body: JSON.stringify({ name, password, groups }),
+    });
+  }
+
+  async dropUser(name: string): Promise<{ message: string }> {
+    return this.request(`/admin/users/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Resets a user's password. Pass an explicit `password` to set it directly,
+   * or omit it to have the server generate a strong random one. When generated,
+   * the plaintext is returned in `password`.
+   */
+  async resetUserPassword(
+    name: string,
+    password?: string,
+  ): Promise<{ name: string; message: string; generated: boolean; password?: string }> {
+    return this.request(
+      `/admin/users/${encodeURIComponent(name)}/reset-password`,
+      { method: "POST", body: JSON.stringify({ password: password ?? null }) },
+    );
+  }
+
+  // --- Admin: groups ---
+
+  async listGroups(): Promise<AdminGroup[]> {
+    return this.request<AdminGroup[]>("/admin/groups");
+  }
+
+  async createGroup(name: string): Promise<{ message: string }> {
+    return this.request("/admin/groups", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  async dropGroup(name: string): Promise<{ message: string }> {
+    return this.request(`/admin/groups/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async addGroupMember(
+    group: string,
+    user: string,
+  ): Promise<{ message: string }> {
+    return this.request(
+      `/admin/groups/${encodeURIComponent(group)}/members`,
+      { method: "POST", body: JSON.stringify({ user }) },
+    );
+  }
+
+  async removeGroupMember(
+    group: string,
+    user: string,
+  ): Promise<{ message: string }> {
+    return this.request(
+      `/admin/groups/${encodeURIComponent(group)}/members/${encodeURIComponent(user)}`,
+      { method: "DELETE" },
+    );
   }
 
   async getSystemMetrics(): Promise<{

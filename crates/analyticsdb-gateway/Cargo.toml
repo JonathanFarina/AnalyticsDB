@@ -6,14 +6,17 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Catalog metadata reads (explorer, user/group listings, admin checks). All SQL
+# execution and catalog mutations are proxied to the running server over pg-wire.
 analyticsdb-control = { path = "../analyticsdb-control" }
-analyticsdb-engine = { path = "../analyticsdb-engine" }
-analyticsdb-protocol = { path = "../analyticsdb-protocol" }
-analyticsdb-server = { path = "../analyticsdb-server" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
+
+# PostgreSQL client — the gateway proxies SQL to the running server's pg-wire
+# endpoint so the server's engine is the single source of truth.
+tokio-postgres = { workspace = true }
 
 # Web framework
 axum = { version = "0.7", features = ["json"] }

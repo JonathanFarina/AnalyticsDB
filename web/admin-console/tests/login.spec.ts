@@ -19,19 +19,25 @@ test.describe("Login", () => {
     await page.fill('input[type="password"]', "wrong");
     await page.click('button[type="submit"]');
 
-    // Check for error message
-    await expect(page.locator(".error-message")).toBeVisible();
+    // Check for the login error message
+    await expect(page.locator(".login-error")).toBeVisible();
   });
 
-  test("should login with valid credentials", async ({ page }) => {
+  // Valid credentials are environment-specific: a freshly initialized cluster
+  // has only `analyticsdb_admin` with a random password (printed once at
+  // `--init-cluster`). Set ADMIN_USER / ADMIN_PASSWORD to run this end-to-end
+  // against a live gateway.
+  const adminUser = process.env.ADMIN_USER;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  test(adminUser && adminPassword ? "should login with valid credentials" : "should login with valid credentials [skipped: set ADMIN_USER/ADMIN_PASSWORD]", async ({ page }) => {
+    test.skip(!adminUser || !adminPassword, "ADMIN_USER/ADMIN_PASSWORD not set");
     await page.goto("/");
 
-    // Fill in valid credentials (assumes test user exists)
-    await page.fill('input[type="text"]', "admin");
-    await page.fill('input[type="password"]', "admin");
+    await page.fill('input[type="text"]', adminUser!);
+    await page.fill('input[type="password"]', adminPassword!);
     await page.click('button[type="submit"]');
 
-    // Should redirect to main app
+    // Should render the authenticated shell.
     await expect(page.locator(".sidebar")).toBeVisible();
     await expect(page.locator(".view-outlet")).toBeVisible();
   });

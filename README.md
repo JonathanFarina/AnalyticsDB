@@ -172,6 +172,96 @@ In interactive mode, enter SQL terminated by `;`. The shell supports keyboard li
 - `\conninfo` prints the current protocol/session target
 - `\timing [on|off]` toggles detailed timing after each statement
 
+## First-Time Initialization (`--init-cluster`)
+
+Before serving traffic, initialize the system once. This creates the catalog and
+a primary administrator account named **`analyticsdb_admin`** with a randomly
+generated password that is printed to the console **exactly once** (it is not
+recoverable). The account is placed in the built-in **`Administrators`** group;
+membership in that group is what grants administrator privileges.
+
+```bash
+cargo run -p analyticsdb-server -- --init-cluster --catalog-path cluster-catalog.db
+```
+
+If an existing catalog (or any users/groups) is detected at the target path, you
+are warned that re-initializing **permanently deletes** all databases, tables,
+users, and groups, and you must authenticate with an existing administrator's
+credentials before the flush proceeds. Authentication failure aborts without
+changing anything. `--init-cluster` exits when done; start the server normally
+afterwards.
+
+### Resetting the primary administrator password
+
+If the `analyticsdb_admin` password is lost, either re-run `--init-cluster`
+(which flushes everything) or reset just the password using **another
+`Administrators`-group member's** credentials:
+
+```bash
+cargo run -p analyticsdb-server -- --reset-admin-password --catalog-path cluster-catalog.db
+```
+
+A new random password is generated and printed once. Administrators can also
+reset user passwords from the **Users** page of the admin console.
+
+If **all** administrator credentials are lost (so neither the reset path nor the
+authenticated re-init can proceed), use the recovery-of-last-resort flag, which
+skips authentication and flushes the catalog unconditionally — **this destroys
+all data**:
+
+```bash
+cargo run -p analyticsdb-server -- --init-cluster --force --catalog-path cluster-catalog.db
+```
+
+### Signing in to the admin console
+
+Start the AnalyticsDB **server** (it owns the engine and serves the PostgreSQL
+wire protocol), then start the **gateway** and the web console. Sign in with
+`analyticsdb_admin` and the password from initialization. Administrator
+privileges (and the Users/Groups pages) come from membership in the
+`Administrators` group. Use the **Sign out** button in the top bar to end the
+session.
+
+#### Gateway ↔ server: single source of truth
+
+The gateway does **not** run its own engine. It proxies all SQL execution and
+catalog mutations (queries, `CREATE USER`, group changes, password resets) to
+the running server over the PostgreSQL wire protocol, authenticated as the
+signed-in user. The server is therefore the single source of truth — anything
+done in the web console is immediately visible to `psql`/DBeaver and vice versa.
+Login itself is validated by opening a pg-wire connection to the server, so the
+console and external clients can never disagree about credentials.
+
+By default the gateway reads the **same config file as the server** to discover
+the pg-wire endpoint and catalog path, so a plain `cargo run -p analyticsdb-gateway`
+already points at the right server — no extra flags needed.
+
+Environment variables still override per-setting when you need them:
+
+```bash
+ANALYTICSDB_CONTROL_PLANE_CONFIG=config/cluster-config.json \  # config file (default)
+ANALYTICSDB_PG_ENDPOINT=127.0.0.1:5432 \                       # override pg-wire endpoint
+ANALYTICSDB_CATALOG_PATH=analyticsdb-catalog.db \              # override catalog file
+  cargo run -p analyticsdb-gateway
+```
+
+The gateway logs the resolved config file, endpoint, and catalog at startup (run
+with `RUST_LOG=info`). The user's password is held only in the gateway's
+in-memory session cache for proxying — never written to the JWT or to disk — so
+after a gateway restart users must sign in again.
+
+### Configuration & data layout
+
+Both the server and gateway look for configuration in a **`config/`** directory
+(`config/cluster-config.json`) when no `--cluster-config` is given, falling back
+to a repo-root `cluster-config.json`. A starter `config/cluster-config.json` is
+included.
+
+Managed table data is written under a **`data/`** directory by default
+(`data/db=<db>/schema=<schema>/table=<table>/…`). Override it with the
+`storage_root` field in the config file (any `file://`, `s3://`, `gs://`, or
+`az://` URI, or a local path).
+
 ## Multi-Node Cluster with Dynamic Scaling
 
 AnalyticsDB supports a distributed coordination layer for dynamic cluster scaling.

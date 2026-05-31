@@ -609,15 +609,9 @@ impl PrototypeEngine {
         table_name: &str,
         privilege: &str,
     ) -> Result<()> {
-        // Fetch the user record to determine admin status.
-        let is_admin = self
-            .control_plane
-            .catalog_user(&session.user)
-            .await
-            .map(|u| u.is_admin)
-            .unwrap_or(false);
-
-        if is_admin {
+        // Administrators (via the `is_admin` flag or `Administrators` group
+        // membership) bypass per-object privilege checks.
+        if self.control_plane.is_admin(&session.user).await {
             return Ok(());
         }
 
