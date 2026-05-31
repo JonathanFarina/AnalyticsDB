@@ -23,6 +23,11 @@ pub struct GatewayConfig {
     /// AnalyticsDB server endpoint (for proxying queries)
     pub analyticsdb_pg_endpoint: Option<String>,
     pub analyticsdb_flight_endpoint: Option<String>,
+
+    /// Path to the catalog store (SQLite). Used by the admin API to read and
+    /// mutate users/groups directly. When `None`, it is resolved from the
+    /// control-plane config file (`catalog_path`) with sensible fallbacks.
+    pub catalog_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +68,13 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: "0.0.0.0:8080".to_string(),
-            control_plane_config_path: "cluster-config.json".to_string(),
+            control_plane_config_path: discover_config_path(),
             session_timeout_seconds: 3600,
             jwt_secret: "change-me-in-production".to_string(),
             oidc: OidcConfig::default(),
-            analyticsdb_pg_endpoint: Some("127.0.0.1:5432".to_string()),
+            analyticsdb_pg_endpoint: None,
             analyticsdb_flight_endpoint: Some("127.0.0.1:8081".to_string()),
+            catalog_path: None,
         }
     }
 }
@@ -140,6 +146,80 @@ impl GatewayConfig {
             config.analyticsdb_flight_endpoint = Some(endpoint);
         }
 
+        if let Ok(path) = env::var("ANALYTICSDB_CATALOG_PATH") {
+            config.catalog_path = Some(path);
+        }
+
         Ok(config)
     }
+
+    /// The server's default catalog file (its `--catalog-path` default).
+    pub const DEFAULT_CATALOG_PATH: &'static str = "analyticsdb-catalog.db";
+    /// The server's default pg-wire endpoint.
+    pub const DEFAULT_PG_ENDPOINT: &'static str = "127.0.0.1:5432";
+
+    /// Reads the server's config file (e.g. `config/cluster-config.json`) so the
+    /// gateway can pick up the catalog path and pg-wire endpoint the server is
+    /// using. Returns `None` if the file is missing or unparseable.
+    fn server_config(&self) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(&self.control_plane_config_path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Resolves the catalog store path the gateway reads metadata from.
+    ///
+    /// Order: `ANALYTICSDB_CATALOG_PATH` env → `catalog_path` from the server's
+    /// config file → the server's default catalog file.
+    pub fn resolve_catalog_path(&self) -> String {
+        if let Some(path) = &self.catalog_path {
+            return path.clone();
+        }
+        if let Some(path) = self
+            .server_config()
+            .as_ref()
+            .and_then(|c| c.get("catalog_path"))
+            .and_then(|v| v.as_str())
+        {
+            return path.to_string();
+        }
+        Self::DEFAULT_CATALOG_PATH.to_string()
+    }
+
+    /// Resolves the server pg-wire endpoint SQL is proxied to.
+    ///
+    /// Order: `ANALYTICSDB_PG_ENDPOINT` env → `postgres_addr` from the server's
+    /// config file → `host:base_postgres_port` derived from the config file →
+    /// the server's default endpoint.
+    pub fn resolve_pg_endpoint(&self) -> String {
+        if let Some(endpoint) = &self.analyticsdb_pg_endpoint {
+            return endpoint.clone();
+        }
+        if let Some(config) = self.server_config() {
+            if let Some(addr) = config.get("postgres_addr").and_then(|v| v.as_str()) {
+                return addr.to_string();
+            }
+            if let Some(port) = config.get("base_postgres_port").and_then(|v| v.as_u64()) {
+                let host = config
+                    .get("advertise_host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("127.0.0.1");
+                return format!("{host}:{port}");
+            }
+        }
+        Self::DEFAULT_PG_ENDPOINT.to_string()
+    }
+}
+
+/// Default locations to look for the server config, in priority order. Config
+/// lives in a `config/` directory by convention.
+pub const DEFAULT_CONFIG_PATHS: [&str; 2] = ["config/cluster-config.json", "cluster-config.json"];
+
+/// Returns the first existing default config path, or the preferred default
+/// (`config/cluster-config.json`) when none exist yet.
+pub fn discover_config_path() -> String {
+    DEFAULT_CONFIG_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .unwrap_or(&DEFAULT_CONFIG_PATHS[0])
+        .to_string()
 }

@@ -7,7 +7,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::GatewayState;
 use crate::error::GatewayResult;
 
 #[derive(Debug, Deserialize)]
@@ -28,7 +27,7 @@ pub struct SystemMetrics {
 
 /// Get system metrics
 pub async fn get_metrics(
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<SystemMetrics>> {
     // In production, this would read from the query log and system tables
     // For now, return placeholder metrics
@@ -44,10 +43,10 @@ pub async fn get_metrics(
 /// Get query log
 pub async fn get_query_log(
     Query(query): Query<LogQuery>,
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
     let limit = query.limit.unwrap_or(100);
-    let offset = query.offset.unwrap_or(0);
+    let _offset = query.offset.unwrap_or(0);
 
     // In production, query system.query_log table
     // For now, return placeholder data
@@ -73,7 +72,7 @@ pub async fn get_query_log(
 /// Get audit log
 pub async fn get_audit_log(
     Query(query): Query<LogQuery>,
-    State(state): State<std::sync::Arc<crate::GatewayState>>,
+    State(_state): State<std::sync::Arc<crate::GatewayState>>,
 ) -> GatewayResult<Json<Vec<serde_json::Value>>> {
     let limit = query.limit.unwrap_or(100);
 

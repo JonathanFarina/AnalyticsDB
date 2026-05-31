@@ -121,6 +121,8 @@ impl tower::Service<http::Uri> for InsecureConnector {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
@@ -181,7 +183,152 @@ fn merge_config_with_cli(config: &mut Config, cli: &Cli) {
     if cli.join.is_some() {
         config.join = cli.join.clone();
     }
+    if cli.jwt_secret.is_some() {
+        config.jwt_secret = cli.jwt_secret.clone();
+    }
     // cluster_config is used to load the config file, so we don't set it here
+}
+
+/// Prints a generated credential inside a highlighted, one-time-only box.
+fn print_credential_box(title: &str, user: &str, password: &str) {
+    let border = "═".repeat(64);
+    println!("\n\x1b[1;33m╔{border}╗\x1b[0m");
+    println!("\x1b[1;33m║\x1b[0m  \x1b[1;32m{title}\x1b[0m");
+    println!("\x1b[1;33m║\x1b[0m");
+    println!("\x1b[1;33m║\x1b[0m    username: \x1b[1;36m{user}\x1b[0m");
+    println!("\x1b[1;33m║\x1b[0m    password: \x1b[1;36m{password}\x1b[0m");
+    println!("\x1b[1;33m║\x1b[0m");
+    println!(
+        "\x1b[1;33m║\x1b[0m  \x1b[1;31mStore this now — it is shown ONCE and cannot be recovered.\x1b[0m"
+    );
+    println!("\x1b[1;33m╚{border}╝\x1b[0m\n");
+}
+
+/// `--init-cluster`: set up a fresh catalog and primary administrator account.
+/// If an existing catalog with accounts is detected, the operator is warned and
+/// must authenticate with an administrator password before everything is flushed.
+async fn init_cluster(catalog_path: &str, force: bool) -> Result<()> {
+    use analyticsdb_control::{ControlPlane, PRIMARY_ADMIN_USER};
+
+    let has_accounts = ControlPlane::catalog_has_accounts(catalog_path)
+        .await
+        .context("Failed to inspect existing catalog")?;
+
+    if has_accounts {
+        println!(
+            "\n\x1b[1;31m⚠  WARNING: An existing catalog was found at '{catalog_path}'.\x1b[0m"
+        );
+        println!(
+            "\x1b[1;31m   Re-initializing will PERMANENTLY DELETE all databases, tables,\x1b[0m"
+        );
+        println!("\x1b[1;31m   users, and groups in this catalog. This cannot be undone.\x1b[0m\n");
+
+        if force {
+            println!(
+                "\x1b[1;31m   --force supplied: skipping authentication and flushing now.\x1b[0m\n"
+            );
+        } else {
+            let existing = ControlPlane::from_catalog_path(catalog_path)
+                .await
+                .context("Failed to open existing catalog for authentication")?;
+
+            let user = prompt_line("Administrator username to confirm flush: ")?;
+            let password = prompt_password("Administrator password: ")?;
+
+            existing
+                .verify_admin_credentials(user.trim(), &password)
+                .await
+                .context("Administrator authentication failed — aborting without changes")?;
+
+            println!(
+                "\n\x1b[1;33mAuthentication accepted. Flushing and re-initializing...\x1b[0m"
+            );
+        }
+    } else {
+        println!("\n\x1b[1;32mNo existing catalog found. Initializing a fresh cluster...\x1b[0m");
+    }
+
+    let (_control_plane, password) = ControlPlane::init_fresh_cluster(catalog_path)
+        .await
+        .context("Failed to initialize cluster")?;
+
+    println!("\x1b[1;32m✓ Catalog initialized at '{catalog_path}'.\x1b[0m");
+    print_credential_box(
+        "Primary administrator account created",
+        PRIMARY_ADMIN_USER,
+        &password,
+    );
+    println!("Start the server normally to begin serving requests.");
+    Ok(())
+}
+
+/// `--reset-admin-password`: reset the primary admin password using another
+/// Administrators-group member's credentials.
+async fn reset_admin_password(catalog_path: &str) -> Result<()> {
+    use analyticsdb_control::{ControlPlane, PRIMARY_ADMIN_USER};
+
+    if !std::path::Path::new(catalog_path).exists() {
+        anyhow::bail!(
+            "No catalog found at '{catalog_path}'. Run with --init-cluster first."
+        );
+    }
+
+    let control_plane = ControlPlane::from_catalog_path(catalog_path)
+        .await
+        .context("Failed to open catalog")?;
+
+    println!(
+        "\nAuthenticate with another '{}'-group member to reset the '{}' password.",
+        analyticsdb_control::ADMINISTRATORS_GROUP,
+        PRIMARY_ADMIN_USER
+    );
+    let user = prompt_line("Administrator username: ")?;
+    let password = prompt_password("Administrator password: ")?;
+
+    let new_password = control_plane
+        .reset_admin_password(user.trim(), &password)
+        .await
+        .context("Failed to reset administrator password")?;
+
+    println!("\n\x1b[1;32m✓ Password reset successfully.\x1b[0m");
+    print_credential_box(
+        "New primary administrator password",
+        PRIMARY_ADMIN_USER,
+        &new_password,
+    );
+    Ok(())
+}
+
+/// Reads a line of plain (echoed) input from stdin.
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("Failed to read input")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Whether a `storage_root` refers to the local filesystem (a plain path or a
+/// `file://` URI) rather than a remote object store (`s3://`, `gs://`, `az://`).
+fn is_local_storage_root(root: &str) -> bool {
+    let lower = root.to_ascii_lowercase();
+    lower.starts_with("file://") || !lower.contains("://")
+}
+
+/// Reads a password from the terminal without echoing it. When no interactive
+/// terminal is attached (e.g. input is piped, as in automated provisioning),
+/// falls back to reading a plain line from stdin.
+fn prompt_password(prompt: &str) -> Result<String> {
+    match rpassword::prompt_password(prompt) {
+        Ok(password) => Ok(password),
+        Err(_) => {
+            warn!("No interactive terminal detected; reading password from stdin (input may be echoed).");
+            prompt_line(prompt)
+        }
+    }
 }
 
 async fn run() -> Result<()> {
@@ -189,8 +336,14 @@ async fn run() -> Result<()> {
 
     println!("{}", BANNER);
 
-    // Load config from file if provided, otherwise use defaults
-    let mut config: Config = if let Some(config_path) = &cli.cluster_config {
+    // Load config: explicit --cluster-config, else a discovered default in the
+    // `config/` directory, else built-in defaults.
+    let discovered = if cli.cluster_config.is_none() {
+        config::discover_config_path()
+    } else {
+        None
+    };
+    let mut config: Config = if let Some(config_path) = cli.cluster_config.as_ref().or(discovered.as_ref()) {
         if !std::path::Path::new(config_path).exists() {
             anyhow::bail!("Cluster configuration file not found: {}", config_path);
         }
@@ -198,7 +351,7 @@ async fn run() -> Result<()> {
         Config::from_file(config_path)?
     } else {
         if cli.role == NodeRole::Control && cli.join.is_none() && !cli.init_cluster {
-            warn!("\x1b[1;31mNo cluster configuration provided for control node. Using bootstrap defaults.\x1b[0m");
+            warn!("\x1b[1;31mNo cluster configuration found (looked in config/). Using bootstrap defaults.\x1b[0m");
         }
         Config::default()
     };
@@ -206,8 +359,41 @@ async fn run() -> Result<()> {
     // Merge CLI arguments (CLI takes precedence over config file)
     merge_config_with_cli(&mut config, &cli);
 
+    // Environment variable overrides (takes precedence over config file, but not CLI)
+    if cli.jwt_secret.is_none() {
+        if let Ok(env_secret) = std::env::var("ANALYTICSDB_JWT_SECRET") {
+            config.jwt_secret = Some(env_secret);
+        }
+    }
+
+    // Fallback to base ports from cluster configuration if addresses are not explicitly set or are default
+    if config.postgres_addr.is_none() || config.postgres_addr.as_deref() == Some("127.0.0.1:5432") {
+        if let Some(port) = config.base_postgres_port {
+            config.postgres_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+    if config.flight_sql_addr.is_none() || config.flight_sql_addr.as_deref() == Some("127.0.0.1:8815") {
+        if let Some(port) = config.base_flight_sql_port {
+            config.flight_sql_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+    if config.node_addr.is_none() || config.node_addr.as_deref() == Some("127.0.0.1:8816") {
+        if let Some(port) = config.base_node_port {
+            config.node_addr = Some(format!("127.0.0.1:{}", port));
+        }
+    }
+
     // Validate the merged configuration
     config.validate().context("Configuration validation failed")?;
+
+    // One-shot administrative commands. These run before normal startup and
+    // exit the process when complete.
+    if cli.reset_admin_password {
+        return reset_admin_password(&config.catalog_path).await;
+    }
+    if cli.init_cluster {
+        return init_cluster(&config.catalog_path, cli.force).await;
+    }
 
     // If joining a cluster, request configuration from the coordinator
     if let Some(coordinator_endpoint) = &config.join {
@@ -224,7 +410,6 @@ async fn run() -> Result<()> {
         );
 
         let tls_cert = config.tls_cert.clone();
-        let tls_key = config.tls_key.clone();
         let tls_ca_cert = config.tls_ca_cert.clone();
         let tls_domain = config.tls_domain.clone();
 
@@ -315,6 +500,20 @@ async fn run() -> Result<()> {
         config.node_addr = Some(format!("0.0.0.0:{}", res.node_port));
         config.catalog_path = res.config.catalog_path.clone();
 
+        // Adjust the admin port with the same offset as other ports to avoid collision when running locally
+        if let Some(admin_addr) = &config.admin_addr {
+            if let Ok(addr) = admin_addr.parse::<SocketAddr>() {
+                let new_port = addr.port() + res.config.next_available_port_offset;
+                config.admin_addr = Some(format!("{}:{}", addr.ip(), new_port));
+            } else if let Some(pos) = admin_addr.rfind(':') {
+                let (host, port_str) = admin_addr.split_at(pos);
+                if let Ok(port) = port_str[1..].parse::<u16>() {
+                    let new_port = port + res.config.next_available_port_offset;
+                    config.admin_addr = Some(format!("{}:{}", host, new_port));
+                }
+            }
+        }
+
         // Inherit TLS cert/key from the JoinResponse so the compute node's
         // flight server also serves with TLS.
         if config.tls_cert.is_none() {
@@ -323,6 +522,25 @@ async fn run() -> Result<()> {
         if config.tls_key.is_none() {
             config.tls_key = res.config.tls_key_path.map(std::path::PathBuf::from);
         }
+    }
+
+    // Choose the local data directory (system query/audit logs + the local
+    // managed-table fallback) BEFORE constructing the engine, since the engine
+    // resolves its log roots at construction. Defaults to `data/`; a local
+    // `storage_root` from config overrides it. Remote roots (s3://, gs://, …)
+    // keep system logs in the local `data/` directory. Joining nodes inherit
+    // storage from the coordinator and don't set this.
+    if config.join.is_none() {
+        let data_dir = match config.storage_root.as_deref() {
+            Some(root) if is_local_storage_root(root) => {
+                root.strip_prefix("file://").unwrap_or(root).to_string()
+            }
+            _ => "data".to_string(),
+        };
+        info!("Managed data directory: {}", data_dir);
+        // Safety: set during single-threaded startup before the engine (and any
+        // other thread) reads it.
+        unsafe { std::env::set_var("ANALYTICSDB_DATA_DIR", &data_dir) };
     }
 
     let engine = Arc::new(PrototypeEngine::from_catalog_path(&config.catalog_path).await?);
@@ -336,6 +554,25 @@ async fn run() -> Result<()> {
             tls_key_path.as_ref().and_then(|p| p.to_str().map(String::from)),
         )
         .await?;
+
+    if let Some(jwt_secret) = &config.jwt_secret {
+        engine
+            .control_plane()
+            .set_jwt_secret(Some(jwt_secret.clone()))
+            .await?;
+    }
+
+    // Propagate an explicit `storage_root` (local or remote, e.g. s3://) from
+    // config into the catalog so managed table URIs use it. When unset, table
+    // data falls back to the local data directory configured above.
+    if config.join.is_none() {
+        if let Some(storage_root) = &config.storage_root {
+            engine
+                .control_plane()
+                .set_storage_root(Some(storage_root.clone()))
+                .await?;
+        }
+    }
 
     let node_id = config.node_id.clone().unwrap_or_else(|| "standalone".to_string());
 
@@ -589,8 +826,22 @@ struct Cli {
     node_id: Option<String>,
     #[arg(long, value_enum, default_value = "control")]
     role: NodeRole,
+    /// Initialize the system for first use: create the catalog and a primary
+    /// `analyticsdb_admin` account (random password, printed once) in the
+    /// `Administrators` group. If an existing catalog/users are found, you are
+    /// warned and must enter an administrator password before they are flushed.
     #[arg(long)]
     init_cluster: bool,
+    /// Reset the `analyticsdb_admin` password. Authenticates with another
+    /// `Administrators`-group member's credentials and prints a new random
+    /// password once. Use this if the primary admin password is lost.
+    #[arg(long)]
+    reset_admin_password: bool,
+    /// With `--init-cluster`, skip the administrator-password confirmation and
+    /// flush the existing catalog unconditionally. Recovery of last resort when
+    /// all administrator credentials are lost — this DESTROYS all data.
+    #[arg(long)]
+    force: bool,
     #[arg(long)]
     join: Option<String>,
     #[arg(long)]
@@ -631,6 +882,8 @@ struct Cli {
     tls_domain: Option<String>,
     #[arg(long)]
     tls_insecure: bool,
+    #[arg(long)]
+    jwt_secret: Option<String>,
 }
 
 #[cfg(test)]

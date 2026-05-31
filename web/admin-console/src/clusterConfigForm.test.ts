@@ -95,6 +95,30 @@ describe("buildSavePayload", () => {
     expect(payload.tls_key_path).toBeNull();
   });
 
+  it("sends optional jwt_secret as null when the user clears it", () => {
+    const customConfig: ClusterConfig = {
+      ...MINIMAL_CONFIG,
+      jwt_secret: "secret-key",
+    };
+    const draft = withDisplayDefaults(customConfig);
+    draft.jwt_secret = "";
+    const payload = buildSavePayload(draft, customConfig);
+    expect(payload.jwt_secret).toBeNull();
+  });
+
+  it("does not introduce jwt_secret when neither file nor draft had a value", () => {
+    const sparse: ClusterConfig = {
+      base_postgres_port: 5432,
+      base_flight_sql_port: 50051,
+      catalog_path: "cluster-catalog.db",
+      next_available_port_offset: 0,
+    };
+    const draft = withDisplayDefaults(sparse);
+    const payload = buildSavePayload(draft, sparse);
+    expect(payload.jwt_secret).toBeUndefined();
+    expect(configsEqual(sparse, payload)).toBe(true);
+  });
+
   it("does not introduce TLS keys when neither file nor draft had a value", () => {
     const sparse: ClusterConfig = {
       base_postgres_port: 5432,

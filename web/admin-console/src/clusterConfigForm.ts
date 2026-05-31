@@ -55,6 +55,11 @@ export function buildSavePayload(
     payload.tls_key_path = tlsKey;
   }
 
+  const jwtSecret = emptyToNull(draft.jwt_secret);
+  if (jwtSecret !== null || baseline.jwt_secret !== undefined) {
+    payload.jwt_secret = jwtSecret;
+  }
+
   const baselineHadQueryLog = baseline.query_log !== undefined;
   const draftQueryLog = draft.query_log;
   if (baselineHadQueryLog) {

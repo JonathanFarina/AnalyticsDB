@@ -1322,7 +1322,7 @@ impl TableProvider for PgTypeTable {
             typname.push(name.to_string());
             typnamespace.push(11_u32); // pg_catalog
             typowner.push(10_u32);
-            typlen.push(len as i16);
+            typlen.push(len);
             typbyval.push(byval);
             typtype.push(t.to_string());
             typcategory.push(cat.to_string());

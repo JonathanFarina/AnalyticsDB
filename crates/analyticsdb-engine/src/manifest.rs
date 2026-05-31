@@ -2,11 +2,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
-use datafusion::scalar::ScalarValue;
-use datafusion_common::{ColumnStatistics, Statistics};
-use datafusion_common::stats::Precision;
 use futures::StreamExt;
 use object_store::path::Path as OPath;
 use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
@@ -496,119 +493,6 @@ pub async fn compact_table(
     Ok(written)
 }
 
-/// Converts a Manifest to DataFusion Statistics for query planning.
-pub fn manifest_to_statistics(manifest: &Manifest, schema: &SchemaRef) -> Statistics {
-    let num_rows: usize = manifest.files.iter().map(|e| e.row_count as usize).sum();
-    let total_byte_size: usize = manifest.files.iter().map(|e| e.size as usize).sum();
-
-    let mut column_statistics = Vec::new();
-
-    for field in schema.fields() {
-        let col_name = field.name();
-        let data_type = field.data_type();
-
-        let mut total_null_count = 0i64;
-        let mut min_values: Vec<String> = Vec::new();
-        let mut max_values: Vec<String> = Vec::new();
-        let mut total_ndv = 0f64;
-
-        for entry in &manifest.files {
-            for cs in &entry.column_stats {
-                if cs.name == *col_name {
-                    total_null_count += cs.null_count;
-                    if let Some(ref min) = cs.min_value {
-                        min_values.push(min.clone());
-                    }
-                    if let Some(ref max) = cs.max_value {
-                        max_values.push(max.clone());
-                    }
-                    if let Some(ndv) = cs.ndv_estimate {
-                        total_ndv += ndv;
-                    }
-                    break;
-                }
-            }
-        }
-
-        let null_count = Some(total_null_count as usize);
-
-        // Parse min values into ScalarValue and find the minimum
-        let mut min_scalars: Vec<ScalarValue> = min_values
-            .iter()
-            .filter_map(|s| parse_scalar_value(data_type, s))
-            .collect();
-        let min_value = if !min_scalars.is_empty() {
-            min_scalars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            min_scalars.into_iter().next()
-        } else {
-            None
-        };
-
-        // Parse max values into ScalarValue and find the maximum
-        let mut max_scalars: Vec<ScalarValue> = max_values
-            .iter()
-            .filter_map(|s| parse_scalar_value(data_type, s))
-            .collect();
-        let max_value = if !max_scalars.is_empty() {
-            max_scalars.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // sort descending
-            max_scalars.into_iter().next()
-        } else {
-            None
-        };
-
-        let distinct_count = if total_ndv > 0.0 {
-            Some(total_ndv as usize)
-        } else {
-            None
-        };
-
-        let to_precision = |opt: Option<usize>| -> Precision<usize> {
-            match opt {
-                Some(v) => Precision::Exact(v),
-                None => Precision::Absent,
-            }
-        };
-
-        let to_precision_scalar = |opt: Option<ScalarValue>| -> Precision<ScalarValue> {
-            match opt {
-                Some(v) => Precision::Exact(v),
-                None => Precision::Absent,
-            }
-        };
-
-        column_statistics.push(ColumnStatistics {
-            null_count: to_precision(null_count),
-            min_value: to_precision_scalar(min_value),
-            max_value: to_precision_scalar(max_value),
-            distinct_count: to_precision(distinct_count),
-            ..Default::default()
-        });
-    }
-
-    Statistics {
-        num_rows: Precision::Exact(num_rows),
-        total_byte_size: Precision::Exact(total_byte_size),
-        column_statistics,
-    }
-}
-
-/// Parse a string into ScalarValue based on the target data type.
-fn parse_scalar_value(data_type: &DataType, s: &str) -> Option<ScalarValue> {
-    match data_type {
-        DataType::Int8 => s.parse::<i8>().ok().map(|v| ScalarValue::Int8(Some(v))),
-        DataType::Int16 => s.parse::<i16>().ok().map(|v| ScalarValue::Int16(Some(v))),
-        DataType::Int32 => s.parse::<i32>().ok().map(|v| ScalarValue::Int32(Some(v))),
-        DataType::Int64 => s.parse::<i64>().ok().map(|v| ScalarValue::Int64(Some(v))),
-        DataType::UInt8 => s.parse::<u8>().ok().map(|v| ScalarValue::UInt8(Some(v))),
-        DataType::UInt16 => s.parse::<u16>().ok().map(|v| ScalarValue::UInt16(Some(v))),
-        DataType::UInt32 => s.parse::<u32>().ok().map(|v| ScalarValue::UInt32(Some(v))),
-        DataType::UInt64 => s.parse::<u64>().ok().map(|v| ScalarValue::UInt64(Some(v))),
-        DataType::Float32 => s.parse::<f32>().ok().map(|v| ScalarValue::Float32(Some(v))),
-        DataType::Float64 => s.parse::<f64>().ok().map(|v| ScalarValue::Float64(Some(v))),
-        DataType::Utf8 => Some(ScalarValue::Utf8(Some(s.to_string()))),
-        _ => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

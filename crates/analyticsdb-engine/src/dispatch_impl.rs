@@ -50,10 +50,8 @@ impl PrototypeEngine {
                 Some(plan)
             } else if let Some(plan) = distributed_distinct_plan(&request.sql, &table_name) {
                 Some(plan)
-            } else if let Some(plan) = distributed_order_limit_plan(&request.sql, &table_name) {
-                Some(plan)
             } else {
-                None
+                distributed_order_limit_plan(&request.sql, &table_name)
             }
         };
         // Block distribution for window functions or other unsupported function patterns.

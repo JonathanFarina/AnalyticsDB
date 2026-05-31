@@ -1,5 +1,6 @@
-import { PrototypeConsoleClient } from "../consoleClient";
+import { liveClient } from "../liveClient";
 import type {
+  AnalyticsConsoleClient,
   CellValue,
   DatabaseMetadata,
   ExplorerSnapshot,
@@ -12,6 +13,7 @@ import type {
   SchemaMetadata,
 } from "../domain";
 import { icon } from "../icons";
+import { highlightSql } from "../sqlHighlight";
 import {
   countQuery,
   describeQuery,
@@ -20,7 +22,7 @@ import {
 } from "../queryTemplates";
 
 interface QueryViewState {
-  readonly client: PrototypeConsoleClient;
+  readonly client: AnalyticsConsoleClient;
   snapshot?: ExplorerSnapshot;
   selectedDatabase: string;
   selectedSchema: string;
@@ -28,9 +30,9 @@ interface QueryViewState {
   protocol: Protocol;
   queryText: string;
   filter: string;
+  expanded: Set<string>;
   isRunning: boolean;
   latestResult?: QueryResult;
-  history: readonly QueryResult[];
   streamingRows: readonly (readonly CellValue[])[];
   streamingColumns: readonly string[];
   streamingTimings?: QueryTiming;
@@ -40,15 +42,15 @@ interface QueryViewState {
 
 export function mountQueryView(container: HTMLElement): void {
   const state: QueryViewState = {
-    client: new PrototypeConsoleClient(),
+    client: liveClient,
     selectedDatabase: "postgres",
     selectedSchema: "public",
     protocol: "postgres",
     queryText:
-      'SELECT *\nFROM "postgres"."public"."fact_metrics"\nLIMIT 100;',
+      "-- Run with ⌘/Ctrl+Enter. Pick a table in the Explorer to query it.\nSELECT 1 AS hello;",
     filter: "",
+    expanded: new Set<string>(),
     isRunning: false,
-    history: [],
     streamingRows: [],
     streamingColumns: [],
     streamingMessages: [],
@@ -62,6 +64,7 @@ export function mountQueryView(container: HTMLElement): void {
         <h2 class="page-title">SQL Query</h2>
       </div>
       <div class="page-header-actions">
+        <span class="text-muted query-hint">Run with ${cmdKeyLabel()}+Enter</span>
         <span class="status-pill status-pill-success">
           <span class="status-dot"></span>
           Engine online
@@ -69,51 +72,25 @@ export function mountQueryView(container: HTMLElement): void {
       </div>
     </div>
 
-    <div class="page-body">
-      <div class="row-cards row-cards-3">
-        <div class="card metric-card">
-          <div class="card-body">
-            <div class="metric-label">Active database</div>
-            <div class="metric-value" id="metric-database">postgres</div>
-          </div>
-        </div>
-        <div class="card metric-card">
-          <div class="card-body">
-            <div class="metric-label">Active schema</div>
-            <div class="metric-value" id="metric-schema">public</div>
-          </div>
-        </div>
-        <div class="card metric-card">
-          <div class="card-body">
-            <div class="metric-label">Client mode</div>
-            <div class="metric-value">Prototype</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="workspace-grid">
+    <div class="page-body sql-page">
+      <div class="sql-workspace">
         <aside class="card explorer-card" aria-labelledby="explorer-heading">
           <div class="card-header">
             <h3 id="explorer-heading" class="card-title">Explorer</h3>
             <span class="badge badge-soft">Catalog</span>
           </div>
-          <div class="card-body">
+          <div class="explorer-search">
             <div class="input-icon">
               ${icon("search", 16)}
-              <input
-                id="explorer-filter"
-                class="form-control"
-                type="search"
-                placeholder="Filter objects…"
-                aria-label="Filter catalog objects"
-              />
+              <input id="explorer-filter" class="form-control" type="search"
+                placeholder="Filter objects…" aria-label="Filter catalog objects" />
             </div>
-            <div id="explorer-tree" class="explorer-tree" aria-live="polite"></div>
           </div>
+          <div id="explorer-tree" class="explorer-tree" aria-live="polite"></div>
         </aside>
 
-        <section class="editor-stack">
-          <div class="card query-card" aria-labelledby="query-heading">
+        <section class="sql-main">
+          <div class="card editor-card" aria-labelledby="query-heading">
             <div class="card-header">
               <h3 id="query-heading" class="card-title">Query editor</h3>
               <div class="session-controls">
@@ -134,61 +111,53 @@ export function mountQueryView(container: HTMLElement): void {
                 </label>
               </div>
             </div>
-            <div class="card-body">
-              <div class="editor-frame">
-                <div class="line-rail" aria-hidden="true">1<br />2<br />3<br />4<br />5<br />6<br />7<br />8<br />9<br />10</div>
-                <textarea id="query-input" spellcheck="false" aria-label="SQL query editor"></textarea>
+            <div class="card-body editor-body">
+              <div class="code-editor" id="code-editor">
+                <div class="code-gutter" aria-hidden="true"><div class="code-gutter-inner" id="code-gutter"></div></div>
+                <div class="code-scroll">
+                  <pre class="code-pre" aria-hidden="true"><code class="code-hl" id="code-hl"></code></pre>
+                  <textarea id="query-input" class="code-input" spellcheck="false"
+                    autocomplete="off" autocapitalize="off" wrap="off"
+                    aria-label="SQL query editor"></textarea>
+                </div>
               </div>
               <div class="query-actions">
                 <button id="run-query" class="btn btn-primary" type="button">
-                  ${icon("play", 14)}
-                  <span>Run query</span>
+                  ${icon("play", 14)}<span>Run query</span>
                 </button>
-                <button id="preview-relation" class="btn" type="button">Preview</button>
-                <button id="describe-relation" class="btn" type="button">Describe</button>
-                <button id="count-relation" class="btn" type="button">Count rows</button>
+                <div class="query-actions-spacer"></div>
+                <button id="preview-relation" class="btn btn-sm" type="button">Preview</button>
+                <button id="describe-relation" class="btn btn-sm" type="button">Describe</button>
+                <button id="count-relation" class="btn btn-sm" type="button">Count rows</button>
               </div>
             </div>
           </div>
 
-          <div class="card result-card" aria-labelledby="results-heading">
+          <div class="card results-card" aria-labelledby="results-heading">
             <div class="card-header result-header">
               <h3 id="results-heading" class="card-title">Results</h3>
               <div class="result-header-right">
+                <span id="result-rows" class="text-muted result-rows"></span>
                 <span id="result-state" class="badge">Idle</span>
                 <div id="result-timing-header" class="result-timing-header"></div>
               </div>
             </div>
-            <div class="card-body">
+            <div class="card-body results-body">
               <div id="result-messages" class="message-list"></div>
-              <div id="result-summary" class="result-summary"></div>
               <div id="result-grid" class="result-grid" aria-live="polite"></div>
-              <div id="result-timing-footer" class="result-timing-footer"></div>
             </div>
           </div>
         </section>
-
-        <aside class="card inspector-card" aria-labelledby="inspector-heading">
-          <div class="card-header">
-            <h3 id="inspector-heading" class="card-title">Inspector</h3>
-          </div>
-          <div class="card-body">
-            <div id="relation-inspector"></div>
-            <div class="history-block">
-              <h4 class="subheader">Recent runs</h4>
-              <div id="query-history"></div>
-            </div>
-          </div>
-        </aside>
       </div>
     </div>
   `;
 
-  const metricDatabase = mustQuery<HTMLElement>(container, "#metric-database");
-  const metricSchema = mustQuery<HTMLElement>(container, "#metric-schema");
   const explorerFilter = mustQuery<HTMLInputElement>(container, "#explorer-filter");
   const explorerTree = mustQuery<HTMLDivElement>(container, "#explorer-tree");
   const queryInput = mustQuery<HTMLTextAreaElement>(container, "#query-input");
+  const codeHighlight = mustQuery<HTMLElement>(container, "#code-hl");
+  const codeGutter = mustQuery<HTMLElement>(container, "#code-gutter");
+  const codeScroll = mustQuery<HTMLElement>(container, ".code-scroll");
   const protocolSelect = mustQuery<HTMLSelectElement>(container, "#protocol-select");
   const databaseSelect = mustQuery<HTMLSelectElement>(container, "#database-select");
   const schemaSelect = mustQuery<HTMLSelectElement>(container, "#schema-select");
@@ -197,19 +166,67 @@ export function mountQueryView(container: HTMLElement): void {
   const describeButton = mustQuery<HTMLButtonElement>(container, "#describe-relation");
   const countButton = mustQuery<HTMLButtonElement>(container, "#count-relation");
   const resultState = mustQuery<HTMLSpanElement>(container, "#result-state");
-  const resultSummary = mustQuery<HTMLDivElement>(container, "#result-summary");
+  const resultRows = mustQuery<HTMLSpanElement>(container, "#result-rows");
   const resultGrid = mustQuery<HTMLDivElement>(container, "#result-grid");
   const resultMessages = mustQuery<HTMLDivElement>(container, "#result-messages");
-  const relationInspector = mustQuery<HTMLDivElement>(container, "#relation-inspector");
-  const queryHistory = mustQuery<HTMLDivElement>(container, "#query-history");
 
   void bootstrap();
 
   async function bootstrap(): Promise<void> {
     state.snapshot = await state.client.getExplorerSnapshot();
-    state.selectedRelation = state.snapshot.databases[0].schemas[0].relations[0];
+    const firstDb = state.snapshot.databases[0];
+    const firstSchema = firstDb?.schemas[0];
+    state.selectedRelation = firstSchema?.relations[0];
+    // Expand the active database, its first schema, and the Tables folder.
+    if (firstDb) state.expanded.add(dbKey(firstDb.name));
+    if (firstDb && firstSchema) {
+      state.expanded.add(schemaKey(firstDb.name, firstSchema.name));
+      state.expanded.add(folderKey(firstDb.name, firstSchema.name, "table"));
+    }
     bindEvents();
     renderAll();
+  }
+
+  // Node keys for the expand/collapse set.
+  function dbKey(db: string): string {
+    return `db:${db}`;
+  }
+  function schemaKey(db: string, schema: string): string {
+    return `db:${db}/schema:${schema}`;
+  }
+  function folderKey(db: string, schema: string, kind: "table" | "view"): string {
+    return `db:${db}/schema:${schema}/folder:${kind}`;
+  }
+  function isExpanded(key: string): boolean {
+    // While filtering, expand everything so matches are always visible.
+    return state.filter.trim().length > 0 || state.expanded.has(key);
+  }
+  function toggleExpanded(key: string): void {
+    if (state.expanded.has(key)) {
+      state.expanded.delete(key);
+    } else {
+      state.expanded.add(key);
+    }
+    renderExplorer();
+  }
+
+  // ── Code editor (highlight overlay + gutter) ──────────────────────────────
+
+  function syncEditor(): void {
+    codeHighlight.innerHTML = highlightSql(state.queryText);
+    const lineCount = Math.max(1, state.queryText.split("\n").length);
+    let gutter = "";
+    for (let line = 1; line <= lineCount; line += 1) {
+      gutter += `${line}\n`;
+    }
+    codeGutter.textContent = gutter;
+  }
+
+  function syncScroll(): void {
+    const top = -queryInput.scrollTop;
+    const left = -queryInput.scrollLeft;
+    codeHighlight.style.transform = `translate(${left}px, ${top}px)`;
+    codeGutter.style.transform = `translateY(${top}px)`;
   }
 
   function bindEvents(): void {
@@ -220,6 +237,20 @@ export function mountQueryView(container: HTMLElement): void {
 
     queryInput.addEventListener("input", () => {
       state.queryText = queryInput.value;
+      syncEditor();
+      syncScroll();
+    });
+    queryInput.addEventListener("scroll", syncScroll);
+
+    // Tab inserts two spaces instead of leaving the editor.
+    queryInput.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") {
+        event.preventDefault();
+        insertAtCursor("  ");
+      } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        void runCurrentQuery();
+      }
     });
 
     protocolSelect.addEventListener("change", () => {
@@ -227,50 +258,81 @@ export function mountQueryView(container: HTMLElement): void {
     });
 
     databaseSelect.addEventListener("change", () => {
-      const snapshot = requireSnapshot();
-      const database =
-        snapshot.databases.find((candidate) => candidate.name === databaseSelect.value) ??
-        snapshot.databases[0];
-      state.selectedDatabase = database.name;
-      state.selectedSchema = database.schemas[0]?.name ?? "public";
-      state.selectedRelation = database.schemas[0]?.relations[0];
-      renderAll();
+      selectDatabase(databaseSelect.value);
     });
 
     schemaSelect.addEventListener("change", () => {
-      const database = selectedDatabase();
-      const schema =
-        database.schemas.find((candidate) => candidate.name === schemaSelect.value) ??
-        database.schemas[0];
-      state.selectedSchema = schema.name;
-      state.selectedRelation = schema.relations[0];
-      state.queryText = showSchemaTablesQuery(schema.database, schema.name);
-      renderAll();
+      selectSchema(schemaSelect.value, { loadTemplate: true });
     });
 
-    runQueryButton.addEventListener("click", () => {
-      void runCurrentQuery();
-    });
-
+    runQueryButton.addEventListener("click", () => void runCurrentQuery());
     previewButton.addEventListener("click", () => applySelectedRelationTemplate(previewQuery));
     describeButton.addEventListener("click", () => applySelectedRelationTemplate(describeQuery));
     countButton.addEventListener("click", () => applySelectedRelationTemplate(countQuery));
   }
 
+  function insertAtCursor(text: string): void {
+    const start = queryInput.selectionStart;
+    const end = queryInput.selectionEnd;
+    queryInput.setRangeText(text, start, end, "end");
+    state.queryText = queryInput.value;
+    syncEditor();
+    syncScroll();
+  }
+
+  // ── Explorer selection ────────────────────────────────────────────────────
+
+  function selectDatabase(name: string): void {
+    const snapshot = requireSnapshot();
+    const database =
+      snapshot.databases.find((candidate) => candidate.name === name) ?? snapshot.databases[0];
+    if (!database) return;
+    state.selectedDatabase = database.name;
+    state.selectedSchema = database.schemas[0]?.name ?? "public";
+    state.selectedRelation = database.schemas[0]?.relations[0];
+    renderAll();
+  }
+
+  function selectSchema(name: string, options?: { loadTemplate?: boolean }): void {
+    const database = selectedDatabase();
+    const schema =
+      database.schemas.find((candidate) => candidate.name === name) ?? database.schemas[0];
+    if (!schema) return;
+    state.selectedSchema = schema.name;
+    state.selectedRelation = schema.relations[0];
+    if (options?.loadTemplate) {
+      setQueryText(showSchemaTablesQuery(schema.database, schema.name));
+    }
+    renderAll();
+  }
+
+  function selectRelation(relation: RelationMetadata): void {
+    state.selectedDatabase = relation.database;
+    state.selectedSchema = relation.schema;
+    state.selectedRelation = relation;
+    setQueryText(previewQuery(relation));
+    renderAll();
+  }
+
+  function setQueryText(text: string): void {
+    state.queryText = text;
+    queryInput.value = text;
+    syncEditor();
+    syncScroll();
+  }
+
+  // ── Rendering ─────────────────────────────────────────────────────────────
+
   function renderAll(): void {
     renderSessionControls();
     renderExplorer();
     renderEditor();
-    renderInspector();
     renderResult();
-    renderHistory();
   }
 
   function renderSessionControls(): void {
     const snapshot = requireSnapshot();
     protocolSelect.value = state.protocol;
-    metricDatabase.textContent = state.selectedDatabase;
-    metricSchema.textContent = state.selectedSchema;
     renderOptions(
       databaseSelect,
       snapshot.databases.map((database) => database.name),
@@ -289,66 +351,89 @@ export function mountQueryView(container: HTMLElement): void {
 
     for (const database of snapshot.databases) {
       const matchingSchemas = database.schemas
-        .map((schema) => ({
-          schema,
-          relations: filteredRelations(schema),
-        }))
+        .map((schema) => ({ schema, relations: filteredRelations(schema) }))
         .filter(
           ({ schema, relations }) =>
-            matchesFilter(schema.name) ||
-            relations.length > 0 ||
-            matchesFilter(database.name),
+            matchesFilter(schema.name) || relations.length > 0 || matchesFilter(database.name),
         );
 
       if (matchingSchemas.length === 0) {
         continue;
       }
 
-      const databaseNode = element("section", "database-node");
-      databaseNode.append(
-        metadataHeader(
-          database.name,
-          `${database.schemas.length} schemas`,
-          database.name === state.selectedDatabase,
-          "database",
-        ),
+      const dKey = dbKey(database.name);
+      const dbOpen = isExpanded(dKey);
+      explorerTree.append(
+        treeRow({
+          depth: 0,
+          twisty: true,
+          open: dbOpen,
+          iconName: "database",
+          label: database.name,
+          active: database.name === state.selectedDatabase,
+          onClick: () => toggleExpanded(dKey),
+        }),
       );
+      if (!dbOpen) continue;
 
       for (const { schema, relations } of matchingSchemas) {
-        const schemaNode = element("section", "schema-node");
-        schemaNode.append(
-          metadataHeader(
-            schema.name,
-            `${schema.relations.length} relations`,
-            schema.name === state.selectedSchema,
-            "chevron",
-          ),
+        const sKey = schemaKey(database.name, schema.name);
+        const schemaOpen = isExpanded(sKey);
+        explorerTree.append(
+          treeRow({
+            depth: 1,
+            twisty: true,
+            open: schemaOpen,
+            iconName: "folder",
+            iconClass: "tree-icon-schema",
+            label: schema.name,
+            active:
+              schema.name === state.selectedSchema &&
+              database.name === state.selectedDatabase,
+            onClick: () => toggleExpanded(sKey),
+          }),
         );
+        if (!schemaOpen) continue;
 
-        const relationList = element("div", "relation-list");
-        for (const relation of relations) {
-          const relationButton = element("button", "relation-row");
-          if (isSelectedRelation(relation)) {
-            relationButton.classList.add("is-selected");
-          }
-          relationButton.type = "button";
-          relationButton.addEventListener("click", () => selectRelation(relation));
-          const iconWrap = document.createElement("span");
-          iconWrap.className = "relation-icon";
-          iconWrap.innerHTML = icon(relation.kind === "view" ? "view" : "table", 14);
-          relationButton.append(iconWrap);
-          relationButton.append(
-            textBlock(relation.name, `${relation.kind} · ${relation.storage}`),
+        const tables = relations.filter((relation) => relation.kind !== "view");
+        const views = relations.filter((relation) => relation.kind === "view");
+
+        for (const group of [
+          { kind: "table" as const, label: "Tables", items: tables },
+          { kind: "view" as const, label: "Views", items: views },
+        ]) {
+          if (group.items.length === 0) continue;
+          const fKey = folderKey(database.name, schema.name, group.kind);
+          const folderOpen = isExpanded(fKey);
+          explorerTree.append(
+            treeRow({
+              depth: 2,
+              twisty: true,
+              open: folderOpen,
+              iconName: "folder",
+              iconClass: "tree-icon-folder",
+              label: group.label,
+              count: group.items.length,
+              onClick: () => toggleExpanded(fKey),
+            }),
           );
-          relationButton.append(countPill(relation.rowEstimate));
-          relationList.append(relationButton);
+          if (!folderOpen) continue;
+
+          for (const relation of group.items) {
+            explorerTree.append(
+              treeRow({
+                depth: 3,
+                twisty: false,
+                iconName: relation.kind === "view" ? "view" : "table",
+                iconClass: relation.kind === "view" ? "tree-icon-view" : "tree-icon-table",
+                label: relation.name,
+                selected: isSelectedRelation(relation),
+                onClick: () => selectRelation(relation),
+              }),
+            );
+          }
         }
-
-        schemaNode.append(relationList);
-        databaseNode.append(schemaNode);
       }
-
-      explorerTree.append(databaseNode);
     }
 
     if (explorerTree.children.length === 0) {
@@ -356,8 +441,56 @@ export function mountQueryView(container: HTMLElement): void {
     }
   }
 
+  interface TreeRowOptions {
+    depth: number;
+    twisty: boolean;
+    open?: boolean;
+    iconName: Parameters<typeof icon>[0];
+    iconClass?: string;
+    label: string;
+    count?: number;
+    active?: boolean;
+    selected?: boolean;
+    onClick: () => void;
+  }
+
+  function treeRow(options: TreeRowOptions): HTMLElement {
+    const row = element("button", "tree-row");
+    row.type = "button";
+    if (options.selected) row.classList.add("is-selected");
+    if (options.active) row.classList.add("is-active");
+    // Indent by depth; the twisty column is a fixed width so labels align.
+    row.style.paddingLeft = `${6 + options.depth * 14}px`;
+    row.addEventListener("click", options.onClick);
+
+    const twisty = element("span", "tree-twisty");
+    if (options.twisty) {
+      if (options.open) twisty.classList.add("is-open");
+      twisty.innerHTML = icon("chevron-right", 12);
+    }
+
+    const iconWrap = element("span", `tree-icon ${options.iconClass ?? ""}`.trim());
+    iconWrap.innerHTML = icon(options.iconName, 14);
+
+    const label = element("span", "tree-label");
+    label.textContent = options.label;
+
+    row.append(twisty, iconWrap, label);
+
+    if (options.count !== undefined) {
+      const count = element("span", "tree-count");
+      count.textContent = String(options.count);
+      row.append(count);
+    }
+    return row;
+  }
+
   function renderEditor(): void {
-    queryInput.value = state.queryText;
+    if (queryInput.value !== state.queryText) {
+      queryInput.value = state.queryText;
+    }
+    syncEditor();
+    syncScroll();
     runQueryButton.disabled = state.isRunning;
     previewButton.disabled = !state.selectedRelation;
     describeButton.disabled = !state.selectedRelation;
@@ -369,41 +502,8 @@ export function mountQueryView(container: HTMLElement): void {
     }
   }
 
-  function renderInspector(): void {
-    relationInspector.replaceChildren();
-
-    const relation = state.selectedRelation;
-    if (!relation) {
-      relationInspector.append(
-        emptyState("Select a table or view to inspect its columns."),
-      );
-      return;
-    }
-
-    const summary = element("div", "relation-summary");
-    summary.append(textBlock(relation.name, relation.description));
-    summary.append(
-      detailGrid([
-        ["Database", relation.database],
-        ["Schema", relation.schema],
-        ["Kind", relation.kind],
-        ["Storage", relation.storage],
-        ["Rows", formatCount(relation.rowEstimate)],
-      ]),
-    );
-
-    const columnList = element("div", "column-list");
-    for (const column of relation.columns) {
-      const row = element("div", "column-row");
-      row.append(textBlock(column.name, column.type));
-      row.append(badge(column.nullable ? "nullable" : "required"));
-      columnList.append(row);
-    }
-
-    relationInspector.append(summary, subheader("Columns"), columnList);
-  }
-
   function renderResult(): void {
+    const running = state.isRunning || state.isStreaming;
     resultState.textContent = state.isRunning
       ? "Running"
       : state.isStreaming
@@ -411,60 +511,43 @@ export function mountQueryView(container: HTMLElement): void {
         : state.latestResult
           ? state.latestResult.statementType
           : "Idle";
-    resultState.classList.toggle("badge-running", state.isRunning || state.isStreaming);
+    resultState.classList.toggle("badge-running", running);
 
-    resultSummary.replaceChildren();
     resultGrid.replaceChildren();
     resultMessages.replaceChildren();
+    resultRows.textContent = "";
 
     const timingHeader = mustQuery<HTMLDivElement>(container, "#result-timing-header");
-    const timingFooter = mustQuery<HTMLDivElement>(container, "#result-timing-footer");
     timingHeader.replaceChildren();
-    timingFooter.replaceChildren();
 
-    if (state.isRunning || state.isStreaming) {
-      resultSummary.append(loadingCard());
-
+    if (running) {
       if (state.isStreaming && state.streamingColumns.length > 0) {
         resultGrid.append(renderGridFromState());
-
-        if (state.streamingMessages.length > 0) {
-          renderMessages(state.streamingMessages);
-        }
-
-        if (state.streamingTimings) {
-          renderTimingDisplay(state.streamingTimings, timingHeader, timingFooter);
-        }
+        resultRows.textContent = `${state.streamingRows.length} rows`;
+        if (state.streamingMessages.length > 0) renderMessages(state.streamingMessages);
+        if (state.streamingTimings) renderTiming(state.streamingTimings, timingHeader);
+      } else {
+        resultGrid.append(loadingCard());
       }
       return;
     }
 
     const result = state.latestResult;
     if (!result) {
-      resultSummary.append(
-        emptyState("Run SQL from the editor to inspect rows, messages, query id, and timings."),
+      resultGrid.append(
+        emptyState("Run a query to see rows, messages, and timings here."),
       );
       return;
     }
 
     renderMessages(result.messages);
-
-    resultSummary.append(
-      statCard("Query id", result.queryId),
-      statCard("Rows", String(result.rows.length)),
-    );
-
-    renderTimingDisplay(result.timings, timingHeader, timingFooter);
-
+    resultRows.textContent = `${result.rows.length} rows`;
+    renderTiming(result.timings, timingHeader);
     resultGrid.append(renderGrid(result));
   }
 
   function renderMessages(messages: readonly QueryMessage[]): void {
     resultMessages.replaceChildren();
-    if (messages.length === 0) {
-      return;
-    }
-
     for (const message of messages) {
       const messageNode = element("div", `message message-${message.level}`);
       const iconName =
@@ -478,57 +561,18 @@ export function mountQueryView(container: HTMLElement): void {
     }
   }
 
-  function renderTimingDisplay(
-    timings: QueryTiming,
-    header: HTMLElement,
-    footer: HTMLElement,
-  ): void {
-    const timingHtml = `
-      <span class="timing-item" title="Query execution time">Execute: ${timings.executeMs}ms</span>
-      <span class="timing-item" title="Data fetch time">Fetch: ${timings.fetchMs}ms</span>
-      <span class="timing-item" title="Total time">Total: ${timings.totalMs}ms</span>
+  function renderTiming(timings: QueryTiming, header: HTMLElement): void {
+    const block = element("div", "timing-inline");
+    block.innerHTML = `
+      <span class="timing-item" title="Execution time">Execute: ${timings.executeMs}ms</span>
+      <span class="timing-item" title="Fetch time">Fetch: ${timings.fetchMs}ms</span>
+      <span class="timing-item timing-total" title="Total time">Total: ${timings.totalMs}ms</span>
     `;
-
-    const headerBlock = element("div", "timing-inline");
-    headerBlock.innerHTML = timingHtml;
-    header.append(headerBlock);
-
-    const footerBlock = element("div", "timing-detail");
-    footerBlock.innerHTML = `
-      <div class="timing-grid">
-        <span>Queue: ${timings.queueMs}ms</span>
-        <span>Plan: ${timings.planMs}ms</span>
-        <span>Execute: ${timings.executeMs}ms</span>
-        <span>Fetch: ${timings.fetchMs}ms</span>
-        <span class="timing-total">Total: ${timings.totalMs}ms</span>
-      </div>
-    `;
-    footer.append(footerBlock);
-  }
-
-  function renderHistory(): void {
-    queryHistory.replaceChildren();
-
-    if (state.history.length === 0) {
-      queryHistory.append(emptyState("No queries have run in this browser session."));
-      return;
-    }
-
-    for (const result of state.history) {
-      const item = element("button", "history-item");
-      item.type = "button";
-      item.addEventListener("click", () => {
-        state.latestResult = result;
-        renderResult();
-      });
-      item.append(
-        textBlock(result.queryId, `${result.statementType} · ${result.timings.totalMs} ms`),
-      );
-      queryHistory.append(item);
-    }
+    header.append(block);
   }
 
   async function runCurrentQuery(): Promise<void> {
+    if (state.isRunning || state.isStreaming) return;
     state.queryText = queryInput.value;
     state.isRunning = true;
     state.isStreaming = false;
@@ -552,54 +596,34 @@ export function mountQueryView(container: HTMLElement): void {
     renderResult();
 
     streamingResult.onChunk(async (chunk: QueryResultChunk) => {
-      if (chunk.columns) {
-        state.streamingColumns = chunk.columns;
-      }
+      if (chunk.columns) state.streamingColumns = chunk.columns;
       state.streamingRows = [...state.streamingRows, ...chunk.rows];
-
-      if (chunk.messages) {
-        state.streamingMessages = chunk.messages;
-      }
-      if (chunk.timings) {
-        state.streamingTimings = chunk.timings;
-      }
-
+      if (chunk.messages) state.streamingMessages = chunk.messages;
+      if (chunk.timings) state.streamingTimings = chunk.timings;
       renderResult();
 
       if (chunk.isLast) {
         state.isStreaming = false;
         const finalResult = await streamingResult.onComplete();
         state.latestResult = finalResult;
-        state.history = [finalResult, ...state.history].slice(0, 6);
         state.streamingRows = [];
         state.streamingColumns = [];
         state.streamingMessages = [];
         state.streamingTimings = undefined;
         renderEditor();
         renderResult();
-        renderHistory();
       }
     });
-  }
-
-  function selectRelation(relation: RelationMetadata): void {
-    state.selectedDatabase = relation.database;
-    state.selectedSchema = relation.schema;
-    state.selectedRelation = relation;
-    state.queryText = previewQuery(relation);
-    renderAll();
   }
 
   function applySelectedRelationTemplate(
     template: (relation: RelationMetadata) => string,
   ): void {
-    if (!state.selectedRelation) {
-      return;
-    }
-
-    state.queryText = template(state.selectedRelation);
-    renderEditor();
+    if (!state.selectedRelation) return;
+    setQueryText(template(state.selectedRelation));
   }
+
+  // ── Small helpers ───────────────────────────────────────────────────────
 
   function renderOptions(
     select: HTMLSelectElement,
@@ -620,41 +644,36 @@ export function mountQueryView(container: HTMLElement): void {
     if (result.columns.length === 0) {
       return emptyState("This statement returned no result columns.");
     }
-
-    const table = element("table", "data-grid");
-    const thead = document.createElement("thead");
-    const headRow = document.createElement("tr");
-    for (const column of result.columns) {
-      const th = document.createElement("th");
-      th.textContent = column;
-      headRow.append(th);
-    }
-    thead.append(headRow);
-
-    const tbody = document.createElement("tbody");
-    for (const row of result.rows) {
-      const tr = document.createElement("tr");
-      for (const cell of row) {
-        const td = document.createElement("td");
-        td.textContent = formatCell(cell);
-        tr.append(td);
-      }
-      tbody.append(tr);
-    }
-
-    table.append(thead, tbody);
-    return table;
+    return buildTable(result.columns, result.rows);
   }
 
   function renderGridFromState(): HTMLElement {
     if (state.streamingColumns.length === 0) {
-      return emptyState("Waiting for column information...");
+      return emptyState("Waiting for column information…");
     }
+    const table = buildTable(state.streamingColumns, state.streamingRows, "streaming");
+    if (state.isStreaming) {
+      const tbody = table.querySelector("tbody")!;
+      const progressRow = document.createElement("tr");
+      const progressCell = document.createElement("td");
+      progressCell.colSpan = state.streamingColumns.length;
+      progressCell.className = "streaming-progress";
+      progressCell.textContent = `Loading… (${state.streamingRows.length} rows)`;
+      progressRow.append(progressCell);
+      tbody.append(progressRow);
+    }
+    return table;
+  }
 
-    const table = element("table", "data-grid streaming");
+  function buildTable(
+    columns: readonly string[],
+    rows: readonly (readonly CellValue[])[],
+    extraClass = "",
+  ): HTMLElement {
+    const table = element("table", `data-grid${extraClass ? ` ${extraClass}` : ""}`);
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    for (const column of state.streamingColumns) {
+    for (const column of columns) {
       const th = document.createElement("th");
       th.textContent = column;
       headRow.append(th);
@@ -662,36 +681,26 @@ export function mountQueryView(container: HTMLElement): void {
     thead.append(headRow);
 
     const tbody = document.createElement("tbody");
-    for (const row of state.streamingRows) {
+    for (const row of rows) {
       const tr = document.createElement("tr");
       for (const cell of row) {
         const td = document.createElement("td");
-        td.textContent = formatCell(cell);
+        if (cell === null) {
+          td.textContent = "NULL";
+          td.classList.add("cell-null");
+        } else {
+          td.textContent = String(cell);
+        }
         tr.append(td);
       }
       tbody.append(tr);
     }
-
     table.append(thead, tbody);
-
-    if (state.isStreaming) {
-      const progressRow = document.createElement("tr");
-      const progressCell = document.createElement("td");
-      progressCell.colSpan = state.streamingColumns.length;
-      progressCell.className = "streaming-progress";
-      progressCell.textContent = `Loading... (${state.streamingRows.length} rows loaded)`;
-      progressRow.append(progressCell);
-      tbody.append(progressRow);
-    }
-
     return table;
   }
 
   function filteredRelations(schema: SchemaMetadata): readonly RelationMetadata[] {
-    if (!state.filter.trim()) {
-      return schema.relations;
-    }
-
+    if (!state.filter.trim()) return schema.relations;
     return schema.relations.filter(
       (relation) =>
         matchesFilter(relation.name) ||
@@ -717,57 +726,7 @@ export function mountQueryView(container: HTMLElement): void {
     if (!state.snapshot) {
       throw new Error("Explorer metadata has not loaded yet");
     }
-
     return state.snapshot;
-  }
-
-  function metadataHeader(
-    title: string,
-    detail: string,
-    isActive: boolean,
-    leadingIcon: "database" | "chevron",
-  ): HTMLElement {
-    const header = element("div", "metadata-header");
-    if (isActive) {
-      header.classList.add("is-active");
-    }
-    const iconWrap = document.createElement("span");
-    iconWrap.className = "metadata-icon";
-    iconWrap.innerHTML = icon(leadingIcon === "database" ? "database" : "chevron-right", 14);
-    header.append(iconWrap, textBlock(title, detail));
-    return header;
-  }
-
-  function textBlock(title: string, detail: string): HTMLElement {
-    const block = element("span", "text-block");
-    const titleNode = document.createElement("strong");
-    titleNode.textContent = title;
-    const detailNode = document.createElement("small");
-    detailNode.textContent = detail;
-    block.append(titleNode, detailNode);
-    return block;
-  }
-
-  function detailGrid(items: readonly (readonly [string, string])[]): HTMLElement {
-    const grid = element("dl", "detail-grid");
-    for (const [label, value] of items) {
-      const dt = document.createElement("dt");
-      dt.textContent = label;
-      const dd = document.createElement("dd");
-      dd.textContent = value;
-      grid.append(dt, dd);
-    }
-    return grid;
-  }
-
-  function statCard(label: string, value: string): HTMLElement {
-    const card = element("div", "stat-card");
-    const span = document.createElement("span");
-    span.textContent = label;
-    const strong = document.createElement("strong");
-    strong.textContent = value;
-    card.append(span, strong);
-    return card;
   }
 
   function loadingCard(): HTMLElement {
@@ -782,41 +741,12 @@ export function mountQueryView(container: HTMLElement): void {
     return empty;
   }
 
-  function subheader(label: string): HTMLElement {
-    const heading = document.createElement("h4");
-    heading.className = "subheader";
-    heading.textContent = label;
-    return heading;
-  }
-
-  function countPill(count: number | undefined): HTMLElement {
-    return badge(formatCount(count));
-  }
-
-  function badge(label: string): HTMLElement {
-    const span = element("span", "badge badge-soft");
-    span.textContent = label;
-    return span;
-  }
-
   function isSelectedRelation(relation: RelationMetadata): boolean {
     return (
       state.selectedRelation?.database === relation.database &&
       state.selectedRelation.schema === relation.schema &&
       state.selectedRelation.name === relation.name
     );
-  }
-
-  function formatCell(value: CellValue): string {
-    if (value === null) {
-      return "NULL";
-    }
-
-    return String(value);
-  }
-
-  function formatCount(value: number | undefined): string {
-    return value === undefined ? "unknown" : new Intl.NumberFormat("en-US").format(value);
   }
 
   function element<TagName extends keyof HTMLElementTagNameMap>(
@@ -836,15 +766,18 @@ export function mountQueryView(container: HTMLElement): void {
       .replace(/"/g, "&quot;");
   }
 
+  function cmdKeyLabel(): string {
+    return navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl";
+  }
+
   function mustQuery<ElementType extends Element>(
-    root: ParentNode,
+    rootNode: ParentNode,
     selector: string,
   ): ElementType {
-    const node = root.querySelector<ElementType>(selector);
+    const node = rootNode.querySelector<ElementType>(selector);
     if (!node) {
       throw new Error(`Missing required element: ${selector}`);
     }
-
     return node;
   }
 }
